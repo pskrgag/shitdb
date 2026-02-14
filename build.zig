@@ -26,11 +26,19 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    const memtable = b.addModule("memtable", .{
-        .root_source_file = b.path("src/memtable/memtable.zig"),
+    const storage = b.addModule("storage", .{
+        .root_source_file = b.path("src/storage/memtable.zig"),
         .target = target,
         .imports = &.{
             .{ .name = "skiplist", .module = skiplist },
+        },
+    });
+
+    const db = b.addModule("db", .{
+        .root_source_file = b.path("src/db.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "storage", .module = storage },
         },
     });
 
@@ -71,8 +79,7 @@ pub fn build(b: *std.Build) void {
                 // repeated because you are allowed to rename your imports, which
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
-                .{ .name = "skiplist", .module = skiplist },
-                .{ .name = "memtable", .module = memtable },
+                .{ .name = "db", .module = db },
             },
         }),
     });
@@ -115,9 +122,14 @@ pub fn build(b: *std.Build) void {
     const run_skiplist_tests = b.addRunArtifact(skiplist_tests);
 
     const memtable_tests = b.addTest(.{
-        .root_module = memtable,
+        .root_module = storage,
     });
     const run_memtable_tests = b.addRunArtifact(memtable_tests);
+
+    const db_tests = b.addTest(.{
+        .root_module = db,
+    });
+    const run_db_tests = b.addRunArtifact(db_tests);
 
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
@@ -136,6 +148,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_skiplist_tests.step);
     test_step.dependOn(&run_memtable_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_db_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

@@ -99,6 +99,29 @@ fn Node(Key: type) type {
     };
 }
 
+pub fn Iterator(Key: type) type {
+    return struct {
+        current: ?*Node(Key),
+
+        const Self = @This();
+
+        fn new(root: ?*Node(Key)) Self {
+            return .{ .current = root };
+        }
+
+        pub fn next(self: *Self) ?*const Key {
+            if (self.current) |cur| {
+                const res = &cur.key;
+
+                self.current = cur.next.items[0];
+                return res;
+            } else {
+                return null;
+            }
+        }
+    };
+}
+
 pub fn SkipList(Key: type) type {
     return struct {
         head: ArrayList(NodeRef),
@@ -165,20 +188,29 @@ pub fn SkipList(Key: type) type {
             };
         }
 
-        /// Inserts key value pair into Skiplist. If specified key is already present, value will be updated and old
+        /// Iterator over keys
+        pub fn iterator(self: *const Self) Iterator(Key) {
+            return Iterator(Key).new(self.head.items[0]);
+        }
+
+        /// Inserts key value pair into Skiplist. If specified key is already present, key will be updated and old
         /// one will be returned
-        pub fn insert(self: *Self, key: Key) !bool {
+        pub fn insert(self: *Self, key: Key) !?Key {
             const cur = try self.cursor(Key, key);
 
-            if (cur.node) |_| {
-                return false;
+            if (cur.node) |*node| {
+                const old = node.*.key;
+
+                // If node was found, update it with new value
+                node.*.key = key;
+                return old;
             } else {
                 // ... Otherwise allocate new one and wire it at iterator
                 const new_node = try Node(Key).new_random(self.prng.random(), key, self.alloc);
 
                 try cur.insert(new_node);
                 self.size += 1;
-                return true;
+                return null;
             }
         }
 
@@ -306,29 +338,29 @@ test "Insert stuff" {
     var list = try SkipList(u8).new(allocator);
 
     // Try in order
-    try std.testing.expectEqual(try list.insert(1), true);
-    try std.testing.expectEqual(try list.insert(1), false);
+    try std.testing.expectEqual(try list.insert(1), null);
+    try std.testing.expectEqual(try list.insert(1), 1);
     list.debug_check_sanity();
 
-    try std.testing.expectEqual(try list.insert(2), true);
-    try std.testing.expectEqual(try list.insert(2), false);
+    try std.testing.expectEqual(try list.insert(2), null);
+    try std.testing.expectEqual(try list.insert(2), 2);
     list.debug_check_sanity();
 
-    try std.testing.expectEqual(try list.insert(3), true);
-    try std.testing.expectEqual(try list.insert(3), false);
+    try std.testing.expectEqual(try list.insert(3), null);
+    try std.testing.expectEqual(try list.insert(3), 3);
     list.debug_check_sanity();
 
     // Try out of order
-    try std.testing.expectEqual(try list.insert(10), true);
-    try std.testing.expectEqual(try list.insert(10), false);
+    try std.testing.expectEqual(try list.insert(10), null);
+    try std.testing.expectEqual(try list.insert(10), 10);
     list.debug_check_sanity();
 
-    try std.testing.expectEqual(try list.insert(5), true);
-    try std.testing.expectEqual(try list.insert(5), false);
+    try std.testing.expectEqual(try list.insert(5), null);
+    try std.testing.expectEqual(try list.insert(5), 5);
     list.debug_check_sanity();
 
-    try std.testing.expectEqual(try list.insert(0), true);
-    try std.testing.expectEqual(try list.insert(0), false);
+    try std.testing.expectEqual(try list.insert(0), null);
+    try std.testing.expectEqual(try list.insert(0), 0);
     list.debug_check_sanity();
 
     const arr = try list.as_sorted_array(allocator);
@@ -342,14 +374,14 @@ test "Insert remove stuff" {
 
     var list = try SkipList(u8).new(allocator);
 
-    try std.testing.expectEqual(try list.insert(1), true);
-    try std.testing.expectEqual(try list.insert(1), false);
+    try std.testing.expectEqual(try list.insert(1), null);
+    try std.testing.expectEqual(try list.insert(1), 1);
     try std.testing.expectEqual(try list.contains(1), true);
     list.debug_check_sanity();
 
     for (0..2) |_| {
-        try std.testing.expectEqual(try list.insert(2), true);
-        try std.testing.expectEqual(try list.insert(2), false);
+        try std.testing.expectEqual(try list.insert(2), null);
+        try std.testing.expectEqual(try list.insert(2), 2);
         try std.testing.expectEqual(try list.contains(2), true);
         list.debug_check_sanity();
 
@@ -361,8 +393,8 @@ test "Insert remove stuff" {
 
     try std.testing.expectEqual(try list.remove(1), true);
 
-    try std.testing.expectEqual(try list.insert(1), true);
-    try std.testing.expectEqual(try list.insert(1), false);
+    try std.testing.expectEqual(try list.insert(1), null);
+    try std.testing.expectEqual(try list.insert(1), 1);
     try std.testing.expectEqual(try list.contains(1), true);
     // try std.testing.expectEqualDeep((try list.find_by_other(u8, 1)), &1);
     list.debug_check_sanity();
