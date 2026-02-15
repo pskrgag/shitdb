@@ -214,7 +214,7 @@ test "Simple find and create" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var tb = try MemTable.new(allocator);
+    var tb = try MemTable.new(allocator, null);
 
     inline for (1..200) |i| {
         try tb.put("a" ** i, "a" ** i);

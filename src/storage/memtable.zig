@@ -1,10 +1,11 @@
 const std = @import("std");
 const skiplist = @import("skiplist");
+const Arena = skiplist.Arena;
 const sstable = @import("sstable.zig");
 const utils = @import("utils.zig");
 const Allocator = std.mem.Allocator;
 
-var SeqCounter: u64 = 0;
+var SeqCounter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 const Type = enum(u1) {
     Delete = 0,
@@ -13,8 +14,8 @@ const Type = enum(u1) {
 
 /// Key and Value packed together.
 ///
-///    8b      key len bytes      8b          value len bytes      7b         1b
-/// [key len] [     key     ] [value len] [      value       ] [seq-number] [type]
+///    8b      key len bytes      8b          value len bytes    1b        7b
+/// [key len] [     key     ] [value len] [      value       ] [type] [seq-number]
 pub const KeyValue = struct {
     data: [*]const u8,
 
@@ -54,6 +55,13 @@ pub const KeyValue = struct {
         return @enumFromInt((self.data[size - 1] & (1 << 7)) >> 7);
     }
 
+    pub fn as_seq(self: *const KeyValue) usize {
+        const size = self.full_size();
+        const last_u64: [*]const u64 = @ptrCast(@alignCast(self.data + (size - 8)));
+
+        return last_u64[0] & ((1 << 63) - 1);
+    }
+
     fn is_tombstone(self: *const KeyValue) bool {
         return self.as_type() == .Delete;
     }
@@ -68,7 +76,7 @@ pub const KeyValue = struct {
             return error.TooBig;
 
         const ptr = try alloc.alignedAlloc(u8, std.mem.Alignment.@"8", size);
-        const seq = @atomicRmw(u64, &SeqCounter, .Add, 1, .monotonic);
+        const seq = SeqCounter.fetchAdd(1, .monotonic);
         const seq_type = (seq & ~(@as(u64, 1) << 63)) | (@as(u64, @intFromEnum(tp)) << 63);
 
         @memmove(ptr.ptr + 0, @as(*const [8]u8, @ptrCast(&key.len)));
@@ -87,33 +95,56 @@ pub const KeyValue = struct {
     pub fn cmp(self: *const KeyValue, other: *const KeyValue) std.math.Order {
         const res = std.mem.order(u8, self.as_key(), other.as_key());
 
-        // Removal should be first
         if (res == .eq) {
-            return std.math.order(@intFromEnum(self.as_type()), @intFromEnum(other.as_type()));
+            return std.math.order(self.as_seq(), other.as_seq());
+        } else {
+            return res;
         }
-
-        return res;
     }
 
-    pub fn cmp_with_slice_u8(self: *const KeyValue, other: *const []const u8) std.math.Order {
-        return std.mem.order(u8, self.as_key(), other.*);
+    pub fn cmp_with_memtable_FindKey(self: *const KeyValue, other: *const FindKey) std.math.Order {
+        const res = std.mem.order(u8, self.as_key(), other.key);
+
+        if (res == .eq) {
+            return std.math.order(self.as_seq(), other.seq);
+        } else {
+            return res;
+        }
+    }
+};
+
+const FindKey = struct {
+    key: []const u8,
+    seq: usize,
+};
+
+pub const MemTableOpts = struct {
+    memtable_size: usize,
+
+    fn default() MemTableOpts {
+        return .{ .memtable_size = 1 << 20 };
     }
 };
 
 /// MemTable that holds newly added key-value pairs
 pub const MemTable = struct {
     table: skiplist.SkipList(KeyValue),
-    arena: std.heap.ArenaAllocator,
+    arena: Arena,
 
     const Self = @This();
 
-    pub fn new(alloc: Allocator) !*Self {
+    pub fn new(alloc: Allocator, user_opts: ?MemTableOpts) !*Self {
+        const opts = user_opts orelse MemTableOpts.default();
         var self = try alloc.create(Self);
-        const arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-        self.arena = arena;
-        self.table = try skiplist.SkipList(KeyValue).new(self.arena.allocator());
+        self.arena = try Arena.new(alloc, opts.memtable_size);
 
+        // TODO: oh, this is weird place. Actually it would be cool to reuse self.arena. However, it's not
+        // really fair, since skiplist is utility memory and should not really count. Node itself can take a lot
+        // of memory.
+        //
+        // So here I just try to guess enough memory for skiplist itself.
+        self.table = try skiplist.SkipList(KeyValue).new(alloc, opts.memtable_size * 10);
         return self;
     }
 
@@ -135,10 +166,10 @@ pub const MemTable = struct {
 
     /// Retries value from MemTable
     pub fn get(self: *Self, key: []const u8) !?[]const u8 {
-        const found = try self.table.find_by_other([]const u8, key);
+        const found = self.table.find_greater_or_eq(FindKey, FindKey{ .seq = SeqCounter.load(.monotonic), .key = key });
 
         if (found) |value| {
-            return if (!value.is_tombstone()) value.as_value() else null;
+            return if (std.mem.eql(u8, value.as_key(), key) and !value.is_tombstone()) value.as_value() else null;
         } else {
             return null;
         }
@@ -150,13 +181,13 @@ test "Basic test" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var tb = try MemTable.new(allocator);
+    var tb = try MemTable.new(allocator, null);
 
     try tb.put("hello", "world");
     try std.testing.expectEqualSlices(u8, try tb.get("hello") orelse @panic(""), "world");
-    try std.testing.expectEqual(try tb.get("world"), null);
+    try std.testing.expectEqual(null, try tb.get("world"));
     try tb.remove("hello");
-    try std.testing.expectEqual(try tb.get("hello"), null);
+    try std.testing.expectEqual(null, try tb.get("hello"));
 }
 
 test {

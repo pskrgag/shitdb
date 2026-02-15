@@ -1,6 +1,8 @@
 const std = @import("std");
-const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
+const MaxHeigth = 12;
+
+pub const Arena = @import("arena.zig").ThreadSafeArena;
 
 fn is_primitive_type(Key: type) bool {
     return switch (@typeInfo(Key)) {
@@ -11,7 +13,9 @@ fn is_primitive_type(Key: type) bool {
 
 fn compare_same(Key: type, lhs: Key, rhs: Key) std.math.Order {
     return switch (@typeInfo(Key)) {
-        .int, .float, .bool => std.math.order(lhs, rhs),
+        .int, .float, .bool => {
+            return std.math.order(lhs, rhs);
+        },
         .pointer => |ptr| {
             if (ptr.size == .slice and is_primitive_type(ptr.child)) {
                 return std.mem.order(ptr.child, lhs, rhs);
@@ -30,6 +34,18 @@ fn compare_same(Key: type, lhs: Key, rhs: Key) std.math.Order {
     };
 }
 
+fn transform_struct_name(comptime input: []const u8) [input.len]u8 {
+    comptime {
+        var result: [input.len]u8 = undefined;
+
+        for (input, 0..) |c, i| {
+            result[i] = if (c == '.') '_' else c;
+        }
+
+        return result;
+    }
+}
+
 fn compare_keys(Key: type, Other: type, lhs: Key, rhs: Other) std.math.Order {
     if (Key == Other) {
         return compare_same(Key, lhs, rhs);
@@ -45,14 +61,14 @@ fn compare_keys(Key: type, Other: type, lhs: Key, rhs: Other) std.math.Order {
                                 @compileError("todo");
                             }
                         },
-                        else => break :blk @typeInfo(Other),
+                        else => break :blk @typeName(Other),
                     }
                 };
 
-                if (@hasDecl(Key, "cmp_with_" ++ suffix)) {
-                    return @field(Key, "cmp_with_" ++ suffix)(&lhs, &rhs);
+                if (@hasDecl(Key, "cmp_with_" ++ &transform_struct_name(suffix))) {
+                    return @field(Key, "cmp_with_" ++ &transform_struct_name(suffix))(&lhs, &rhs);
                 } else {
-                    @compileError("Custom structs must implement 'cmp_with_" ++ suffix ++ "' method" ++ @typeName(Key));
+                    @compileError("Custom structs must implement 'cmp_with_" ++ &transform_struct_name(suffix) ++ "' method. Type name is " ++ @typeName(Key));
                 }
             },
             else => @compileError("Unsupported type for comparison: " ++ @typeName(Key)),
@@ -60,60 +76,80 @@ fn compare_keys(Key: type, Other: type, lhs: Key, rhs: Other) std.math.Order {
     }
 }
 
-fn Node(Key: type) type {
-    return struct {
-        next: ArrayList(NodeRef),
-        key: Key,
+fn NodeRef(T: type) type {
+    return packed struct {
+        ptr: usize,
 
-        const NodeRef = ?*Node(Key);
-        const NodePtr = *Node(Key);
-        const Self = @This();
-
-        fn heigth(self: *const Self) usize {
-            return self.next.items.len;
+        pub fn new(p: ?*Node(T)) NodeRef(T) {
+            return .{ .ptr = if (p) |pp| @intFromPtr(pp) else 0 };
         }
 
-        fn random_lvl(rng: std.Random) usize {
-            const FACTOR: usize = 25;
+        pub fn nul() NodeRef(T) {
+            return .{ .ptr = 0 };
+        }
 
-            var h: usize = 1;
+        pub fn is_null(self: *const NodeRef(T)) bool {
+            return self.ptr == 0;
+        }
 
-            while (rng.int(u8) % 100 < FACTOR) {
-                h += 1;
+        pub fn as_ptr(self: *NodeRef(T)) ?*Node(T) {
+            if (self.ptr == 0) {
+                return null;
+            } else {
+                return @ptrFromInt(self.ptr);
             }
-
-            return h;
-        }
-
-        fn new_random(rng: std.Random, key: Key, alloc: Allocator) !NodePtr {
-            const lvl = Self.random_lvl(rng);
-            var next = try std.ArrayList(NodeRef).initCapacity(alloc, lvl);
-            try next.appendNTimes(alloc, null, lvl);
-
-            const new_ptr = try alloc.create(Self);
-            const new = Self{ .key = key, .next = next };
-
-            new_ptr.* = new;
-            return new_ptr;
         }
     };
 }
 
-pub fn Iterator(Key: type) type {
+fn Node(T: type) type {
     return struct {
-        current: ?*Node(Key),
+        key: T,
+        next: std.ArrayList(std.atomic.Value(NodeRef(T))),
+
+        fn new(h: usize, val: T, alloc: Allocator) !Node(T) {
+            var nxt = try std.ArrayList(std.atomic.Value(NodeRef(T))).initCapacity(alloc, h);
+
+            nxt.appendNTimesAssumeCapacity(std.atomic.Value(NodeRef(T)).init(NodeRef(T).nul()), h);
+            return .{ .key = val, .next = nxt };
+        }
+
+        fn next_at_lvl(self: *const Node(T), lvl: usize) NodeRef(T) {
+            return self.next.items[lvl].load(.monotonic);
+        }
+
+        fn change_next_at_lvl_unsafe(self: *Node(T), lvl: usize, n: ?*Node(T)) void {
+            self.next.items[lvl].store(NodeRef(T).new(n), .release);
+        }
+
+        fn try_change_next_at_lvl(self: *Node(T), lvl: usize, expected: ?*Node(T), n: *Node(T)) bool {
+            return self.next.items[lvl].cmpxchgStrong(NodeRef(T).new(expected), NodeRef(T).new(n), .release, .monotonic) == null;
+        }
+
+        fn heigth(self: *Node(T)) usize {
+            // Height is constant, so it's possible to read it w/o locks
+            return self.next.items.len;
+        }
+    };
+}
+
+pub fn Iterator(T: type) type {
+    return struct {
+        cur: ?*Node(T),
 
         const Self = @This();
 
-        fn new(root: ?*Node(Key)) Self {
-            return .{ .current = root };
+        fn new(h: NodeRef(T)) Self {
+            var head = h;
+            return .{ .cur = head.as_ptr() };
         }
 
-        pub fn next(self: *Self) ?*const Key {
-            if (self.current) |cur| {
-                const res = &cur.key;
+        pub fn next(self: *Self) ?*T {
+            if (self.cur) |node| {
+                const res = &node.key;
+                var nxt = node.next_at_lvl(0);
 
-                self.current = cur.next.items[0];
+                self.cur = nxt.as_ptr();
                 return res;
             } else {
                 return null;
@@ -122,280 +158,249 @@ pub fn Iterator(Key: type) type {
     };
 }
 
-pub fn SkipList(Key: type) type {
+pub fn SkipList(T: type) type {
     return struct {
-        head: ArrayList(NodeRef),
-        size: usize,
-        alloc: Allocator,
+        head: Node(T),
+        arena: Arena,
+        heigth: std.atomic.Value(usize),
         prng: std.Random.DefaultPrng,
 
         const Self = @This();
-        const NodeRef = ?NodePtr;
-        const NodePtr = *Node(Key);
 
-        const Cursor = struct {
-            list: *SkipList(Key),
-            node: NodeRef,
-            parents: ArrayList(?*NodeRef),
+        fn max_heigth(self: *Self) usize {
+            return self.heigth.load(.monotonic);
+        }
 
-            fn insert(self: *const Cursor, node: NodePtr) !void {
-                // Wire node at parents
-                for (0..@min(self.list.heigth(), node.heigth())) |h| {
-                    const prev_node = self.parents.items[h].?;
+        fn random_lvl(self: *Self) usize {
+            const FACTOR: usize = 25;
 
-                    node.next.items[h] = prev_node.*;
-                    prev_node.* = node;
-                }
+            var h: usize = 1;
 
-                // If node's height is bigger than head, wire it to the head
-                if (node.heigth() > self.list.heigth()) {
-                    const diff = node.heigth() - self.list.heigth();
-                    const old_head = self.list.heigth();
-
-                    try self.list.head.appendNTimes(self.list.alloc, null, diff);
-
-                    for (old_head..node.heigth()) |h| {
-                        self.list.head.items[h] = node;
-                    }
-                }
+            while (self.prng.random().int(u8) % 100 < FACTOR and h < MaxHeigth - 1) {
+                h += 1;
             }
 
-            fn remove(self: *const Cursor) bool {
-                if (self.node) |node| {
-                    std.debug.assert(node.heigth() <= self.list.heigth());
+            return h;
+        }
 
-                    for (0..node.heigth()) |h| {
-                        const prev_node = self.parents.items[h].?;
+        fn find_insert_spot(self: *Self, K: type, val: K, h: usize, prev: []*Node(T), succ: []?*Node(T), to_lvl: usize) ?*Node(T) {
+            var lvl: usize = h - 1;
+            var node = &self.head;
 
-                        prev_node.* = node.next.items[h];
+            while (true) {
+                var next = node.next_at_lvl(lvl);
+
+                if (next.as_ptr()) |nxt| {
+                    const cmp_res = compare_keys(T, K, nxt.key, val);
+                    switch (cmp_res) {
+                        .lt => {
+                            // val > node::key. Move forward to the right
+                            node = nxt;
+                        },
+                        .gt => {
+                            prev[lvl] = node;
+                            succ[lvl] = nxt;
+
+                            if (lvl == to_lvl)
+                                return null;
+
+                            lvl -= 1;
+                        },
+                        .eq => {
+                            for (0..lvl + 1) |i| {
+                                var cur_next = nxt.next_at_lvl(i);
+
+                                prev[i] = nxt;
+                                succ[i] = cur_next.as_ptr();
+                            }
+
+                            return nxt;
+                        },
                     }
-
-                    self.list.alloc.destroy(node);
-                    return true;
                 } else {
-                    return false;
+                    prev[lvl] = node;
+                    succ[lvl] = null;
+
+                    if (lvl == to_lvl)
+                        return null;
+
+                    lvl -= 1;
                 }
             }
-        };
+        }
 
-        /// Constructs empty Skiplist
-        pub fn new(alloc: Allocator) !Self {
+        /// Constructs new SkipList with `bound` memory usage.
+        pub fn new(alloc: Allocator, bound: usize) !Self {
+            var arena = try Arena.new(alloc, bound);
+            const node = try Node(T).new(MaxHeigth, undefined, arena.allocator());
+
             return .{
-                .head = try ArrayList(NodeRef).initCapacity(alloc, 0),
-                .size = 0,
-                .alloc = alloc,
+                .head = node,
+                .arena = arena,
+                .heigth = std.atomic.Value(usize).init(1),
                 .prng = std.Random.DefaultPrng.init(@bitCast(std.time.timestamp())),
             };
         }
 
-        /// Iterator over keys
-        pub fn iterator(self: *const Self) Iterator(Key) {
-            return Iterator(Key).new(self.head.items[0]);
+        /// Inserts new value into the SkipList
+        pub fn insert(self: *Self, val: T) !void {
+            const lvl = self.random_lvl();
+            const node = try self.arena.allocator().create(Node(T));
+            node.* = try Node(T).new(lvl, val, self.arena.allocator());
+
+            var linked_lvl: usize = 0;
+
+            std.debug.assert(lvl > 0);
+            std.debug.assert(lvl < MaxHeigth);
+            std.debug.assert(node.heigth() > 0);
+
+            outer: while (true) {
+                var prev: [MaxHeigth]*Node(T) = undefined;
+                var succ: [MaxHeigth]?*Node(T) = undefined;
+                const max_h = @max(self.max_heigth(), lvl);
+
+                std.debug.assert(max_h < MaxHeigth);
+
+                const found = self.find_insert_spot(T, val, max_h, prev[0..], succ[0..], linked_lvl);
+                std.debug.assert(found == null);
+
+                for (linked_lvl..lvl) |h| {
+                    // If this fails, just retry the search. Even if h != 0, it's fine, since node can
+                    // be found using 0th level. It only affects O(logN) for the search.
+                    if (!prev[h].try_change_next_at_lvl(h, succ[h], node)) {
+                        continue :outer;
+                    }
+
+                    node.change_next_at_lvl_unsafe(h, succ[h]);
+                    linked_lvl += 1;
+                }
+
+                break;
+            }
+
+            // Try to update the maximum length.
+            while (lvl > self.max_heigth()) {
+                const cur = self.max_heigth();
+
+                if (self.heigth.cmpxchgWeak(cur, lvl, .monotonic, .monotonic) == null)
+                    break;
+            }
         }
 
-        /// Inserts key value pair into Skiplist. If specified key is already present, key will be updated and old
-        /// one will be returned
-        pub fn insert(self: *Self, key: Key) !?Key {
-            const cur = try self.cursor(Key, key);
+        /// Finds a key by `val`. K and T must be comparable and should have strict ordering
+        pub fn find(self: *Self, K: type, val: K) ?*T {
+            var prev: [MaxHeigth]*Node(T) = undefined;
+            var succ: [MaxHeigth]?*Node(T) = undefined;
 
-            if (cur.node) |*node| {
-                const old = node.*.key;
+            const node = self.find_insert_spot(K, val, self.max_heigth(), prev[0..], succ[0..], 0);
+            return if (node) |n| &n.key else null;
+        }
 
-                // If node was found, update it with new value
-                node.*.key = key;
-                return old;
-            } else {
-                // ... Otherwise allocate new one and wire it at iterator
-                const new_node = try Node(Key).new_random(self.prng.random(), key, self.alloc);
+        /// Finds a key by `val`. K and T must be comparable and should have strict ordering
+        pub fn find_greater_or_eq(self: *Self, K: type, val: K) ?*T {
+            var prev: [MaxHeigth]*Node(T) = undefined;
+            var succ: [MaxHeigth]?*Node(T) = undefined;
 
-                try cur.insert(new_node);
-                self.size += 1;
+            _ = self.find_insert_spot(K, val, self.max_heigth(), prev[0..], succ[0..], 0);
+
+            if (prev[0] == &self.head) {
                 return null;
-            }
-        }
-
-        /// Removes node from the list and returns value associated with it
-        pub fn remove(self: *Self, key: Key) !bool {
-            const cur = try self.cursor(Key, key);
-
-            if (cur.remove()) {
-                self.size -= 1;
-                return true;
             } else {
-                return false;
+                return &prev[0].key;
             }
         }
 
-        /// Finds key in the skiplist
-        pub fn contains(self: *Self, key: Key) !bool {
-            const cur = try self.cursor(Key, key);
-
-            return cur.node != null;
-        }
-
-        /// Finds key in the skiplist
-        pub fn find_by_other(self: *Self, Other: type, key: Other) !?*const Key {
-            const cur = try self.cursor(Other, key);
-
-            if (cur.node) |node| {
-                return &node.key;
-            } else {
-                return null;
-            }
-        }
-
-        fn heigth(self: *const Self) usize {
-            return self.head.items.len;
-        }
-
-        fn cursor(self: *Self, Other: type, key: Other) !Cursor {
-            var iter = &self.head;
-            var parents = try ArrayList(?*NodeRef).initCapacity(self.alloc, self.heigth());
-            var node: NodeRef = null;
-            var lvl = self.heigth();
-
-            // It has enough capacity
-            parents.appendNTimes(self.alloc, null, self.heigth()) catch unreachable;
-
-            while (lvl > 0) {
-                lvl -= 1;
-
-                while (iter.items[lvl]) |next| {
-                    const cmp = compare_keys(Key, Other, next.key, key);
-
-                    // Key is greater. Stop search at this level
-                    if (cmp != .eq and cmp != .lt) {
-                        break;
-                    }
-
-                    // The exact node was found.
-                    if (cmp == .eq) {
-                        for (0..lvl) |i| {
-                            parents.items[i] = &iter.items[i];
-                        }
-
-                        node = next;
-                        break;
-                    }
-
-                    iter = &next.next;
-                }
-
-                parents.items[lvl] = &iter.items[lvl];
-            }
-
-            return Cursor{ .node = node, .parents = parents, .list = self };
-        }
-
-        fn debug_check_sanity(self: *const Self) void {
-            const head_heigth = self.heigth();
-
-            for (0..head_heigth) |h| {
-                // Check sanity at each lvl. Each node must be less than its next.
-                if (self.head.items[h]) |lvl_head| {
-                    var iter: NodeRef = lvl_head;
-
-                    while (iter) |current| {
-                        if (current.next.items[h]) |next| {
-                            std.debug.assert(compare_keys(Key, Key, current.key, next.key) == .lt);
-                        }
-
-                        iter = current.next.items[h];
-                    }
-                }
-            }
-        }
-
-        pub fn as_sorted_array(self: *const Self, alloc: Allocator) !ArrayList(Key) {
-            var res = try ArrayList(Key).initCapacity(alloc, 0);
-
-            if (self.head.items[0]) |lvl_head| {
-                var iter: NodeRef = lvl_head;
-
-                while (iter) |current| {
-                    try res.append(alloc, current.key);
-                    iter = current.next.items[0];
-                }
-            }
-
-            return res;
+        /// Returns an iterator over values. It's safe to use concurrently with writers. It must not
+        /// be used after SkipList is de-initialized.
+        pub fn iterator(self: *const Self) Iterator(T) {
+            return Iterator(T).new(self.head.next_at_lvl(0));
         }
     };
 }
 
-test "Comparator" {
-    _ = compare_keys(u8, u8, 1, 2);
-
-    // TODO: fix comparator
-    // _ = compare_keys([]const u8, []const u8, "ab", "cd");
-}
-
-test "Insert stuff" {
+test "Basic" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var list = try SkipList(u8).new(allocator);
+    var list = try SkipList(usize).new(allocator, 1000);
+    try list.insert(40);
+    try list.insert(20);
+    try list.insert(10);
+    try list.insert(30);
 
-    // Try in order
-    try std.testing.expectEqual(try list.insert(1), null);
-    try std.testing.expectEqual(try list.insert(1), 1);
-    list.debug_check_sanity();
+    var iter = list.iterator();
 
-    try std.testing.expectEqual(try list.insert(2), null);
-    try std.testing.expectEqual(try list.insert(2), 2);
-    list.debug_check_sanity();
-
-    try std.testing.expectEqual(try list.insert(3), null);
-    try std.testing.expectEqual(try list.insert(3), 3);
-    list.debug_check_sanity();
-
-    // Try out of order
-    try std.testing.expectEqual(try list.insert(10), null);
-    try std.testing.expectEqual(try list.insert(10), 10);
-    list.debug_check_sanity();
-
-    try std.testing.expectEqual(try list.insert(5), null);
-    try std.testing.expectEqual(try list.insert(5), 5);
-    list.debug_check_sanity();
-
-    try std.testing.expectEqual(try list.insert(0), null);
-    try std.testing.expectEqual(try list.insert(0), 0);
-    list.debug_check_sanity();
-
-    const arr = try list.as_sorted_array(allocator);
-    try std.testing.expectEqualSlices(u8, arr.items, &[_]u8{ 0, 1, 2, 3, 5, 10 });
+    try std.testing.expectEqual(iter.next().?.*, 10);
+    try std.testing.expectEqual(iter.next().?.*, 20);
+    try std.testing.expectEqual(iter.next().?.*, 30);
+    try std.testing.expectEqual(iter.next().?.*, 40);
+    try std.testing.expectEqual(iter.next(), null);
 }
 
-test "Insert remove stuff" {
+fn producer(list: *SkipList(usize), vals: []const usize) !void {
+    for (vals) |i| {
+        try list.insert(i);
+    }
+}
+
+fn consumer(list: *SkipList(usize), finish: *bool) !void {
+    while (@atomicLoad(bool, finish, .monotonic) == false) {
+        var iter = list.iterator();
+        var prev = iter.next() orelse continue;
+
+        while (iter.next()) |val| {
+            std.debug.assert(val.* > prev.*);
+            prev = val;
+        }
+    }
+}
+
+const NumPush = 10000;
+
+test "Test MT" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    const rand = std.crypto.random;
 
-    var list = try SkipList(u8).new(allocator);
+    var list = try SkipList(usize).new(allocator, NumPush * NumPush);
+    var list1 = try std.ArrayList(usize).initCapacity(allocator, NumPush);
+    var list2 = try std.ArrayList(usize).initCapacity(allocator, NumPush);
 
-    try std.testing.expectEqual(try list.insert(1), null);
-    try std.testing.expectEqual(try list.insert(1), 1);
-    try std.testing.expectEqual(try list.contains(1), true);
-    list.debug_check_sanity();
-
-    for (0..2) |_| {
-        try std.testing.expectEqual(try list.insert(2), null);
-        try std.testing.expectEqual(try list.insert(2), 2);
-        try std.testing.expectEqual(try list.contains(2), true);
-        list.debug_check_sanity();
-
-        try std.testing.expectEqual(try list.remove(2), true);
-        try std.testing.expectEqual(try list.remove(2), false);
-        try std.testing.expectEqual(try list.contains(2), false);
-        list.debug_check_sanity();
+    for (0..NumPush) |i| {
+        try list1.append(allocator, i);
     }
 
-    try std.testing.expectEqual(try list.remove(1), true);
+    rand.shuffle(usize, list1.items);
 
-    try std.testing.expectEqual(try list.insert(1), null);
-    try std.testing.expectEqual(try list.insert(1), 1);
-    try std.testing.expectEqual(try list.contains(1), true);
-    // try std.testing.expectEqualDeep((try list.find_by_other(u8, 1)), &1);
-    list.debug_check_sanity();
+    for (NumPush..NumPush * 2) |i| {
+        try list2.append(allocator, i);
+    }
+
+    rand.shuffle(usize, list2.items);
+
+    var finish = false;
+    const prod = try std.Thread.spawn(.{}, producer, .{ &list, list1.items });
+    const prod1 = try std.Thread.spawn(.{}, producer, .{ &list, list2.items });
+    const cons = try std.Thread.spawn(.{}, consumer, .{ &list, &finish });
+
+    prod.join();
+    prod1.join();
+
+    @atomicStore(bool, &finish, true, .monotonic);
+    cons.join();
+
+    // Check that all values are present
+    for (0..NumPush * 2) |i| {
+        const key = list.find(usize, i);
+        try std.testing.expect(key != null);
+        try std.testing.expectEqual(key.?.*, i);
+    }
+
+    // Check that other values are not present
+    for (NumPush * 2..NumPush * 3) |i| {
+        const key = list.find(usize, i);
+        try std.testing.expect(key == null);
+    }
 }

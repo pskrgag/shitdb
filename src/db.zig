@@ -11,7 +11,7 @@ const KeyValue = struct {
     const Self = @This();
 
     pub fn new(path: []const u8, alloc: Allocator) !Self {
-        return .{ .active = try MemTable.new(alloc), .path = path };
+        return .{ .active = try MemTable.new(alloc, null), .path = path };
     }
 };
 
