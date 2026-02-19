@@ -190,6 +190,121 @@ test "Basic test" {
     try std.testing.expectEqual(null, try tb.get("hello"));
 }
 
-test {
-    _ = @import("sstable.zig");
+const Step = union(enum) {
+    Insert: struct {
+        key: std.ArrayList(u8),
+        value: std.ArrayList(u8),
+    },
+    Remove: struct {
+        key: std.ArrayList(u8),
+    },
+
+    fn dump(self: *const Step) void {
+        // TODO
+        _ = self;
+    }
+};
+
+fn random_step(rng: std.Random, alloc: Allocator, values: *InsertedValues) !Step {
+    const enum_info = @typeInfo(Step).@"union";
+    const count = enum_info.fields.len;
+    const step = rng.int(u8) % count;
+    const remove_exisiting = rng.int(u8) % 2;
+
+    const random_key = try generate_random_text(rng, 0, 30, alloc);
+    const value = try generate_random_text(rng, 0, 30, alloc);
+
+    try values.append(alloc, .{ .key = random_key.items, .value = value.items });
+
+    return switch (step) {
+        0 => Step{
+            .Insert = .{
+                .key = random_key,
+                .value = value,
+            },
+        },
+        1 => Step{
+            .Remove = .{
+                .key = blk: {
+                    if (remove_exisiting == 1) {
+                        const idx = rng.int(usize) % values.items.len;
+                        var new_arr = try std.ArrayList(u8).initCapacity(alloc, 0);
+
+                        try new_arr.appendSlice(alloc, values.items[idx].key);
+                        break :blk new_arr;
+                    } else {
+                        break :blk random_key;
+                    }
+                },
+            },
+        },
+        else => @panic(""),
+    };
+}
+
+fn random_size(rng: std.Random, start: usize, end: usize) usize {
+    const random = rng.int(usize);
+    const range_len = end - start;
+
+    return start + (random % range_len);
+}
+
+fn generate_random_text(rng: std.Random, start: usize, end: usize, alloc: Allocator) !std.ArrayList(u8) {
+    const size = random_size(rng, start, end);
+    var res = try std.ArrayList(u8).initCapacity(alloc, size);
+
+    for (0..size) |_| {
+        // Take lower-case ascii chars: a-z. The range is 97 - 122.
+        const range_len = 122 - 97 + 1;
+        try res.append(alloc, rng.int(u8) % range_len + 97);
+    }
+
+    return res;
+}
+
+const InsertedValues = std.ArrayList(struct { key: []const u8, value: []const u8 });
+
+test "HashTable equivalence" {
+    const debug = false;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const seed = std.time.timestamp();
+    var prng = std.Random.DefaultPrng.init(@bitCast(seed));
+    const rng = prng.random();
+
+    var tb = try MemTable.new(allocator, null);
+    var table = std.StringArrayHashMap([]const u8).init(allocator);
+    var inserted_pairs = try InsertedValues.initCapacity(allocator, 0);
+
+    if (debug) {
+        std.debug.print("Seed = {}\n", .{seed});
+    }
+
+    for (0..1000) |_| {
+        const step = try random_step(rng, allocator, &inserted_pairs);
+
+        if (debug) {
+            step.dump();
+        }
+
+        switch (step) {
+            .Insert => |i| {
+                try tb.put(i.key.items, i.value.items);
+                try table.put(i.key.items, i.value.items);
+            },
+            .Remove => |rm| {
+                try tb.remove(rm.key.items);
+                _ = table.swapRemove(rm.key.items);
+            },
+        }
+
+        var iter = table.iterator();
+        while (iter.next()) |next| {
+            const value = try tb.get(next.key_ptr.*);
+            try std.testing.expectEqualSlices(u8, value.?, next.value_ptr.*);
+        }
+    }
 }
