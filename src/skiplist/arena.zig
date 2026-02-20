@@ -74,6 +74,10 @@ pub const ThreadSafeArena = struct {
             .remap = Self.remap,
         } };
     }
+
+    pub fn deinit(self: *Self, child_alloc: Allocator) void {
+        child_alloc.free(self.ptr[0..self.size]);
+    }
 };
 
 // TODO: more tests

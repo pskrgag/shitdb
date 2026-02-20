@@ -315,6 +315,10 @@ pub fn SkipList(T: type) type {
         pub fn iterator(self: *const Self) Iterator(T) {
             return Iterator(T).new(self.head.next_at_lvl(0));
         }
+
+        pub fn deinit(self: *Self, alloc: Allocator) void {
+            self.arena.deinit(alloc);
+        }
     };
 }
 

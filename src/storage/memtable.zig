@@ -174,14 +174,23 @@ pub const MemTable = struct {
             return null;
         }
     }
+
+    pub fn deinit(self: *Self, alloc: Allocator) void {
+        self.table.deinit(alloc);
+        self.arena.deinit(alloc);
+        alloc.destroy(self);
+    }
 };
 
 test "Basic test" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
+    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
     const allocator = arena.allocator();
 
     var tb = try MemTable.new(allocator, null);
+    defer tb.deinit(allocator);
 
     try tb.put("hello", "world");
     try std.testing.expectEqualSlices(u8, try tb.get("hello") orelse @panic(""), "world");
