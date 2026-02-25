@@ -4,6 +4,8 @@ const Arena = skiplist.Arena;
 const sstable = @import("sstable.zig");
 const utils = @import("utils.zig");
 const Allocator = std.mem.Allocator;
+const Node = std.DoublyLinkedList.Node;
+const test_utils = @import("test_utils");
 
 var SeqCounter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
@@ -126,10 +128,17 @@ pub const MemTableOpts = struct {
     }
 };
 
+pub const GetResult = union(enum) {
+    Found: []const u8,
+    Removed: void,
+    NotFound: void,
+};
+
 /// MemTable that holds newly added key-value pairs
 pub const MemTable = struct {
     table: skiplist.SkipList(KeyValue),
     arena: Arena,
+    node: Node,
 
     const Self = @This();
 
@@ -138,6 +147,7 @@ pub const MemTable = struct {
         var self = try alloc.create(Self);
 
         self.arena = try Arena.new(alloc, opts.memtable_size);
+        self.node = Node{ .next = null, .prev = null };
 
         // TODO: oh, this is weird place. Actually it would be cool to reuse self.arena. However, it's not
         // really fair, since skiplist is utility memory and should not really count. Node itself can take a lot
@@ -165,14 +175,22 @@ pub const MemTable = struct {
     }
 
     /// Retries value from MemTable
-    pub fn get(self: *Self, key: []const u8) !?[]const u8 {
+    pub fn get(self: *Self, key: []const u8) !GetResult {
         const found = self.table.find_greater_or_eq(FindKey, FindKey{ .seq = SeqCounter.load(.monotonic), .key = key });
 
         if (found) |value| {
-            return if (std.mem.eql(u8, value.as_key(), key) and !value.is_tombstone()) value.as_value() else null;
-        } else {
-            return null;
+            const the_same_key = std.mem.eql(u8, value.as_key(), key);
+
+            if (the_same_key) {
+                if (value.is_tombstone()) {
+                    return .Removed;
+                } else {
+                    return GetResult{ .Found = value.as_value().? };
+                }
+            }
         }
+
+        return .NotFound;
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
@@ -193,10 +211,46 @@ test "Basic test" {
     defer tb.deinit(allocator);
 
     try tb.put("hello", "world");
-    try std.testing.expectEqualSlices(u8, try tb.get("hello") orelse @panic(""), "world");
-    try std.testing.expectEqual(null, try tb.get("world"));
+    var val = try tb.get("hello");
+    switch (val) {
+        .Found => |v| {
+            try std.testing.expectEqualSlices(u8, v, "world");
+        },
+        else => {
+            std.debug.print("Unexpected result {any}\n", .{val});
+            @panic("");
+        },
+    }
+
+    val = try tb.get("world");
+    switch (val) {
+        .NotFound => {},
+        else => {
+            std.debug.print("Unexpected result {any}\n", .{val});
+            @panic("");
+        },
+    }
+
     try tb.remove("hello");
-    try std.testing.expectEqual(null, try tb.get("hello"));
+
+    val = try tb.get("hello");
+    switch (val) {
+        .Removed => {},
+        else => @panic("Wrong"),
+    }
+
+    // Try to insert one more time
+    try tb.put("hello", "bob");
+    val = try tb.get("hello");
+    switch (val) {
+        .Found => |v| {
+            try std.testing.expectEqualSlices(u8, v, "bob");
+        },
+        else => {
+            std.debug.print("Unexpected result {any}\n", .{val});
+            @panic("");
+        },
+    }
 }
 
 const Step = union(enum) {
@@ -220,8 +274,8 @@ fn random_step(rng: std.Random, alloc: Allocator, values: *InsertedValues) !Step
     const step = rng.int(u8) % count;
     const remove_exisiting = rng.int(u8) % 2;
 
-    const random_key = try generate_random_text(rng, 0, 30, alloc);
-    const value = try generate_random_text(rng, 0, 30, alloc);
+    const random_key = try test_utils.generate_random_text(rng, 0, 30, alloc);
+    const value = try test_utils.generate_random_text(rng, 0, 30, alloc);
 
     try values.append(alloc, .{ .key = random_key.items, .value = value.items });
 
@@ -249,26 +303,6 @@ fn random_step(rng: std.Random, alloc: Allocator, values: *InsertedValues) !Step
         },
         else => @panic(""),
     };
-}
-
-fn random_size(rng: std.Random, start: usize, end: usize) usize {
-    const random = rng.int(usize);
-    const range_len = end - start;
-
-    return start + (random % range_len);
-}
-
-fn generate_random_text(rng: std.Random, start: usize, end: usize, alloc: Allocator) !std.ArrayList(u8) {
-    const size = random_size(rng, start, end);
-    var res = try std.ArrayList(u8).initCapacity(alloc, size);
-
-    for (0..size) |_| {
-        // Take lower-case ascii chars: a-z. The range is 97 - 122.
-        const range_len = 122 - 97 + 1;
-        try res.append(alloc, rng.int(u8) % range_len + 97);
-    }
-
-    return res;
 }
 
 const InsertedValues = std.ArrayList(struct { key: []const u8, value: []const u8 });
@@ -313,7 +347,12 @@ test "HashTable equivalence" {
         var iter = table.iterator();
         while (iter.next()) |next| {
             const value = try tb.get(next.key_ptr.*);
-            try std.testing.expectEqualSlices(u8, value.?, next.value_ptr.*);
+            switch (value) {
+                .Found => |v| {
+                    try std.testing.expectEqualSlices(u8, v, next.value_ptr.*);
+                },
+                else => @panic("Wrong"),
+            }
         }
     }
 }
