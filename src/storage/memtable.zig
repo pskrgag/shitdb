@@ -132,6 +132,13 @@ pub const GetResult = union(enum) {
     Found: []const u8,
     Removed: void,
     NotFound: void,
+
+    pub fn as_key(self: *const GetResult) ?[]const u8 {
+        return switch (self.*) {
+            .Found => |k| k,
+            else => null,
+        };
+    }
 };
 
 /// MemTable that holds newly added key-value pairs
@@ -162,6 +169,9 @@ pub const MemTable = struct {
     pub fn put(self: *Self, key: []const u8, value: []const u8) !void {
         const kv = try KeyValue.new(key, value, Type.Add, self.arena.allocator());
 
+        if (value.len == 0)
+            return error.InvalidValue;
+
         std.debug.assert(!kv.is_tombstone());
         _ = try self.table.insert(kv);
     }
@@ -175,7 +185,7 @@ pub const MemTable = struct {
     }
 
     /// Retries value from MemTable
-    pub fn get(self: *Self, key: []const u8) !GetResult {
+    pub fn get(self: *Self, key: []const u8) GetResult {
         const found = self.table.find_greater_or_eq(FindKey, FindKey{ .seq = SeqCounter.load(.monotonic), .key = key });
 
         if (found) |value| {
@@ -211,18 +221,10 @@ test "Basic test" {
     defer tb.deinit(allocator);
 
     try tb.put("hello", "world");
-    var val = try tb.get("hello");
-    switch (val) {
-        .Found => |v| {
-            try std.testing.expectEqualSlices(u8, v, "world");
-        },
-        else => {
-            std.debug.print("Unexpected result {any}\n", .{val});
-            @panic("");
-        },
-    }
+    var val = tb.get("hello");
+    try std.testing.expectEqualSlices(u8, val.as_key().?, "world");
 
-    val = try tb.get("world");
+    val = tb.get("world");
     switch (val) {
         .NotFound => {},
         else => {
@@ -233,7 +235,7 @@ test "Basic test" {
 
     try tb.remove("hello");
 
-    val = try tb.get("hello");
+    val = tb.get("hello");
     switch (val) {
         .Removed => {},
         else => @panic("Wrong"),
@@ -241,118 +243,47 @@ test "Basic test" {
 
     // Try to insert one more time
     try tb.put("hello", "bob");
-    val = try tb.get("hello");
+    val = tb.get("hello");
+    try std.testing.expectEqualSlices(u8, val.as_key().?, "bob");
+}
+
+test "Try overwriting the key" {
+    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    var tb = try MemTable.new(allocator, null);
+    defer tb.deinit(allocator);
+
+    try tb.put("hello", "world");
+    try tb.put("hello", "bob");
+
+    var val = tb.get("hello");
+    try std.testing.expectEqualSlices(u8, val.as_key().?, "bob");
+
+    try tb.put("hello", "bibi");
+    val = tb.get("hello");
+    try std.testing.expectEqualSlices(u8, val.as_key().?, "bibi");
+
+    try tb.put("hello", "kiki");
+    val = tb.get("hello");
+    try std.testing.expectEqualSlices(u8, val.as_key().?, "kiki");
+
+    try tb.remove("hello");
+    val = tb.get("hello");
     switch (val) {
-        .Found => |v| {
-            try std.testing.expectEqualSlices(u8, v, "bob");
-        },
-        else => {
-            std.debug.print("Unexpected result {any}\n", .{val});
-            @panic("");
-        },
+        .Removed => {},
+        else => @panic("Wrong"),
     }
 }
-
-const Step = union(enum) {
-    Insert: struct {
-        key: std.ArrayList(u8),
-        value: std.ArrayList(u8),
-    },
-    Remove: struct {
-        key: std.ArrayList(u8),
-    },
-
-    fn dump(self: *const Step) void {
-        // TODO
-        _ = self;
-    }
-};
-
-fn random_step(rng: std.Random, alloc: Allocator, values: *InsertedValues) !Step {
-    const enum_info = @typeInfo(Step).@"union";
-    const count = enum_info.fields.len;
-    const step = rng.int(u8) % count;
-    const remove_exisiting = rng.int(u8) % 2;
-
-    const random_key = try test_utils.generate_random_text(rng, 0, 30, alloc);
-    const value = try test_utils.generate_random_text(rng, 0, 30, alloc);
-
-    try values.append(alloc, .{ .key = random_key.items, .value = value.items });
-
-    return switch (step) {
-        0 => Step{
-            .Insert = .{
-                .key = random_key,
-                .value = value,
-            },
-        },
-        1 => Step{
-            .Remove = .{
-                .key = blk: {
-                    if (remove_exisiting == 1) {
-                        const idx = rng.int(usize) % values.items.len;
-                        var new_arr = try std.ArrayList(u8).initCapacity(alloc, 0);
-
-                        try new_arr.appendSlice(alloc, values.items[idx].key);
-                        break :blk new_arr;
-                    } else {
-                        break :blk random_key;
-                    }
-                },
-            },
-        },
-        else => @panic(""),
-    };
-}
-
-const InsertedValues = std.ArrayList(struct { key: []const u8, value: []const u8 });
 
 test "HashTable equivalence" {
-    const debug = false;
-
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const seed = std.time.timestamp();
-    var prng = std.Random.DefaultPrng.init(@bitCast(seed));
-    const rng = prng.random();
-
-    var tb = try MemTable.new(allocator, null);
-    var table = std.StringArrayHashMap([]const u8).init(allocator);
-    var inserted_pairs = try InsertedValues.initCapacity(allocator, 0);
-
-    if (debug) {
-        std.debug.print("Seed = {}\n", .{seed});
-    }
-
-    for (0..1000) |_| {
-        const step = try random_step(rng, allocator, &inserted_pairs);
-
-        if (debug) {
-            step.dump();
-        }
-
-        switch (step) {
-            .Insert => |i| {
-                try tb.put(i.key.items, i.value.items);
-                try table.put(i.key.items, i.value.items);
-            },
-            .Remove => |rm| {
-                try tb.remove(rm.key.items);
-                _ = table.swapRemove(rm.key.items);
-            },
-        }
-
-        var iter = table.iterator();
-        while (iter.next()) |next| {
-            const value = try tb.get(next.key_ptr.*);
-            switch (value) {
-                .Found => |v| {
-                    try std.testing.expectEqualSlices(u8, v, next.value_ptr.*);
-                },
-                else => @panic("Wrong"),
-            }
-        }
-    }
+    const tb = try MemTable.new(allocator, null);
+    try test_utils.test_hash_table_equavalance(tb, false, 1000);
 }

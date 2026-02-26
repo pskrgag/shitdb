@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .imports = &.{
             .{ .name = "storage", .module = storage },
+            .{ .name = "test_utils", .module = test_utils },
         },
     });
 

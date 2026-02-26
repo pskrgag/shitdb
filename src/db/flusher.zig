@@ -10,14 +10,14 @@ pub const Flusher = struct {
     }
 
     pub fn insert(self: *Flusher, table: *MemTable) void {
-        self.list.append(&table.node);
+        self.list.prepend(&table.node);
     }
 
     pub fn get(self: *Flusher, key: []const u8) ?[]const u8 {
         var current = self.list.first;
         while (current) |node| {
             const table: *MemTable = @fieldParentPtr("node", node);
-            const val = try table.get(key);
+            const val = table.get(key);
 
             switch (val) {
                 .Found => |v| {

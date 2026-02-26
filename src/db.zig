@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const MemTable = @import("storage").MemTable;
 const MemTableOpts = @import("storage").MemTableOpts;
 const Manager = @import("db/manager.zig").Manager;
+const test_utils = @import("test_utils");
 const fs = std.fs;
 
 fn openOrCreateDir(path: []const u8) !std.fs.Dir {
@@ -69,12 +70,6 @@ test "Test more than one memtable" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const opts = KeyValueOptions{ .memtable = MemTableOpts{ .memtable_size = 1 << 10 } };
-
-    var new = try KeyValue.new("test", allocator, opts);
-    try new.put("hello", "world", allocator);
-    try std.testing.expectEqualSlices(u8, new.get("hello").?, "world");
-    try std.testing.expectEqual(new.get("world"), null);
-    try new.remove("hello", allocator);
-    try std.testing.expectEqual(new.get("hello"), null);
+    const tb = try KeyValue.new("test_db1", allocator, KeyValueOptions{ .memtable = .{ .memtable_size = 1000 } });
+    try test_utils.test_hash_table_equavalance(tb, false, 1000);
 }
