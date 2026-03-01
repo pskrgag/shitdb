@@ -18,7 +18,7 @@ const Type = enum(u1) {
 ///
 ///    8b      key len bytes      8b          value len bytes    1b        7b
 /// [key len] [     key     ] [value len] [      value       ] [type] [seq-number]
-pub const KeyValue = struct {
+pub const KeyValue = packed struct {
     data: [*]const u8,
 
     pub fn as_key(self: *const KeyValue) []const u8 {

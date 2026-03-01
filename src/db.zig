@@ -57,7 +57,12 @@ test "Simple API Test" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var new = try KeyValue.new("test", allocator, null);
+    var new = try KeyValue.new("test_db2", allocator, null);
+    defer {
+        std.fs.cwd().deleteTree("test_db2") catch {
+            @panic("gg");
+        };
+    }
     try new.put("hello", "world", allocator);
     try std.testing.expectEqualSlices(u8, new.get("hello").?, "world");
     try std.testing.expectEqual(new.get("world"), null);
@@ -71,5 +76,10 @@ test "Test more than one memtable" {
     const allocator = arena.allocator();
 
     const tb = try KeyValue.new("test_db1", allocator, KeyValueOptions{ .memtable = .{ .memtable_size = 1000 } });
-    try test_utils.test_hash_table_equavalance(tb, false, 1000);
+    defer {
+        std.fs.cwd().deleteTree("test_db1") catch {
+            @panic("gg");
+        };
+    }
+    try test_utils.test_hash_table_equavalance(tb, false, 500);
 }

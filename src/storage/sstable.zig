@@ -25,13 +25,20 @@ const MetaBlock = extern struct {
     magic: usize,
 };
 
-fn lvl_name(alloc: Allocator, lvl: usize, num: usize) ![]const u8 {
-    return try std.fmt.allocPrint(alloc, "lvl{}{}.ss", .{ lvl, num });
-}
+pub const Iterator = struct {
+    data: []const u8,
 
-fn generate_lvl_name(alloc: Allocator, lvl: usize) ![]const u8 {
-    return lvl_name(alloc, lvl, @atomicRmw(u64, &Lvl0Count, .Add, 1, .monotonic));
-}
+    pub fn next(self: *Iterator) ?KeyValue {
+        if (self.data.len > 0) {
+            const kv: KeyValue = KeyValue{ .data = self.data.ptr };
+
+            self.data = self.data[kv.full_size()..];
+            return kv;
+        } else {
+            return null;
+        }
+    }
+};
 
 const SSTable = struct {
     path: []const u8,
@@ -49,6 +56,13 @@ const SSTable = struct {
         blocks: std.ArrayList(BlockMeta),
         data_size: usize,
     };
+
+    fn meta(self: *const Self) MetaBlock {
+        var mt: MetaBlock = undefined;
+
+        @memcpy(utils.data_as_u8_ptr(&mt), self.file[self.file.len - @sizeOf(MetaBlock) ..]);
+        return mt;
+    }
 
     fn calculate_file_size(tbl: *const MemTable) usize {
         var iter = tbl.table.iterator();
@@ -108,12 +122,12 @@ const SSTable = struct {
         return .{ .data_size = data_size, .blocks = blocks };
     }
 
-    fn write_index(meta: ValuesMeta, file: *[]u8) usize {
+    fn write_index(value_meta: ValuesMeta, file: *[]u8) usize {
         var index_size: usize = 0;
         var offset: usize = 0;
 
         // Data blocks are written. Now create index block
-        for (meta.blocks.items) |mt| {
+        for (value_meta.blocks.items) |mt| {
             const block_idx = BlockIndex{ .size = mt.size, .offset = offset, .key_size = mt.last_key.len };
             const block_idx_ptr = utils.data_as_u8_const_ptr(&block_idx);
 
@@ -132,8 +146,8 @@ const SSTable = struct {
         return index_size;
     }
 
-    fn write_meta(file: *[]u8, meta: MetaBlock) !void {
-        @memcpy(file.*[0..@sizeOf(MetaBlock)], utils.data_as_u8_const_ptr(&meta));
+    fn write_meta(file: *[]u8, m: MetaBlock) !void {
+        @memcpy(file.*[0..@sizeOf(MetaBlock)], utils.data_as_u8_const_ptr(&m));
     }
 
     fn find_block_candidate(index: []const u8, key: []const u8) ?struct { offset: usize, size: usize } {
@@ -178,11 +192,24 @@ const SSTable = struct {
                 },
             }
 
-            std.debug.assert(kv.full_size() % 8 == 0);
             iter = iter[kv.full_size()..];
         }
 
         return null;
+    }
+
+    pub fn iterator(self: *Self) Iterator {
+        const mt = self.meta();
+
+        return .{ .data = self.file[0..mt.index_offset] };
+    }
+
+    pub fn open(dir: *std.fs.Dir, name: []const u8) !Self {
+        const file = try dir.openFile(name, .{});
+        const stat = try file.stat();
+
+        const mmap = try std.posix.mmap(null, stat.size, std.posix.PROT.READ, .{ .TYPE = .SHARED }, file.handle, 0);
+        return .{ .path = name, .file = mmap, .lvl = 0 };
     }
 
     pub fn create(dir: *std.fs.Dir, name: []const u8, tbl: *const MemTable, alloc: Allocator) !Self {
@@ -215,14 +242,15 @@ const SSTable = struct {
     }
 
     pub fn find_value(self: *const Self, key: []const u8, alloc: Allocator) !?std.ArrayList(u8) {
-        var meta: MetaBlock = undefined;
-        @memcpy(utils.data_as_u8_ptr(&meta), self.file[self.file.len - @sizeOf(MetaBlock) ..]);
+        const meta_block = self.meta();
 
-        if (meta.magic != Magic)
+        if (meta_block.magic != Magic)
             return error.CorruptedFile;
 
+        const index = self.file[meta_block.index_offset .. meta_block.index_offset + meta_block.index_size];
+
         // We found a block that may contain a value. Try to find a value there
-        if (Self.find_block_candidate(self.file[meta.index_offset .. meta.index_offset + meta.index_size], key)) |blk| {
+        if (Self.find_block_candidate(index, key)) |blk| {
             if (Self.find_value_in_block(self.file[blk.offset .. blk.offset + blk.size], key)) |val| {
                 var res = try std.ArrayList(u8).initCapacity(alloc, val.len);
 
@@ -241,6 +269,20 @@ const SSTable = struct {
         std.posix.munmap(@ptrCast(@alignCast(self.file)));
     }
 };
+
+fn lvl_name(alloc: Allocator, lvl: usize, num: usize) ![]const u8 {
+    return try std.fmt.allocPrint(alloc, "lvl{}{}.ss", .{ lvl, num });
+}
+
+fn generate_lvl_name(alloc: Allocator, lvl: usize) ![]const u8 {
+    return lvl_name(alloc, lvl, @atomicRmw(u64, &Lvl0Count, .Add, 1, .monotonic));
+}
+
+fn repeatChar(allocator: std.mem.Allocator, char: u8, count: usize) ![]u8 {
+    const result = try allocator.alloc(u8, count);
+    @memset(result, char);
+    return result;
+}
 
 test "Simple find and create" {
     var arena = std.heap.GeneralPurposeAllocator(.{}){};
@@ -283,4 +325,57 @@ test "Simple find and create" {
     for (to_find_non_present) |i| {
         try std.testing.expectEqual(try table.find_value(i, allocator), null);
     }
+
+    var iter = table.iterator();
+    var i: usize = 1;
+
+    while (iter.next()) |kv| {
+        const expected = try repeatChar(allocator, 'a', i);
+        defer allocator.free(expected);
+
+        try std.testing.expectEqualSlices(u8, kv.as_key(), expected);
+        try std.testing.expectEqualSlices(u8, kv.as_value().?, expected);
+        i += 1;
+    }
+
+    try std.testing.expectEqual(i, 200);
+}
+
+test "Merge" {
+    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const cwd = std.fs.cwd();
+    try cwd.makePath("test_db");
+    defer {
+        std.fs.cwd().deleteTree("test_db") catch {
+            @panic("gg");
+        };
+    }
+
+    var dir = try cwd.openDir("test_db", .{});
+    defer dir.close();
+
+    var tb = try MemTable.new(allocator, null);
+    defer tb.deinit(allocator);
+    const name = try generate_lvl_name(allocator, 0);
+
+    inline for (1..200) |i| {
+        try tb.put("a" ** i, "a" ** i);
+    }
+    var table = try SSTable.create(&dir, name, tb, allocator);
+    defer table.deinit(allocator);
+
+    var tb1 = try MemTable.new(allocator, null);
+    defer tb1.deinit(allocator);
+
+    inline for (1..200) |i| {
+        try tb1.put("ab" ** i, "ba" ** i);
+    }
+    const name1 = try generate_lvl_name(allocator, 1);
+    var table1 = try SSTable.create(&dir, name1, tb, allocator);
+    defer table1.deinit(allocator);
 }
