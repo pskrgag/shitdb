@@ -3,10 +3,51 @@ const utils = @import("utils.zig");
 const MemTable = @import("memtable.zig").MemTable;
 const KeyValue = @import("memtable.zig").KeyValue;
 const Allocator = std.mem.Allocator;
+const merging_iterator = @import("merging_iterator");
 
 pub const BlockSize = 4 << 10;
 const Magic: usize = 0xdeadbeefdeadbaba;
 var Lvl0Count: u64 = 0;
+
+// Layout of the SStable:
+//
+// +-----------------------+
+// |    Data block 1       |
+// +-----------------------+
+// |    Data block 2       |
+// +-----------------------+
+//         ...
+// +-----------------------+
+// |    Data block N       |
+// +-----------------------+
+// |         Index         |
+// +-----------------------+
+// |         Meta          |
+// |                       |
+// |   index_offset        |
+// |   index_size          |
+// |   magic               |
+// +-----------------------+
+//
+//
+// Index layout
+// +-----------------------+
+// |    BlockIndex 1       |
+// |                       |
+// |   offset              |
+// |   size                |
+// |   key_size            |
+// |   key[]               |
+// +-----------------------+
+//         ...
+// +-----------------------+
+// |    BlockIndex N       |
+// |                       |
+// |   offset              |
+// |   size                |
+// |   key_size            |
+// |   key[]               |
+// +-----------------------+
 
 const BlockIndex = packed struct {
     offset: usize,
@@ -38,9 +79,17 @@ pub const Iterator = struct {
             return null;
         }
     }
+
+    pub fn peek(self: *Iterator) ?KeyValue {
+        if (self.data.len > 0) {
+            return KeyValue{ .data = self.data.ptr };
+        } else {
+            return null;
+        }
+    }
 };
 
-const SSTable = struct {
+pub const SSTable = struct {
     path: []const u8,
     file: []u8,
     lvl: usize,
@@ -212,10 +261,11 @@ const SSTable = struct {
         return .{ .path = name, .file = mmap, .lvl = 0 };
     }
 
-    pub fn create(dir: *std.fs.Dir, name: []const u8, tbl: *const MemTable, alloc: Allocator) !Self {
+    pub fn create(dir: std.fs.Dir, name: []const u8, tbl: *const MemTable, alloc: Allocator) !Self {
         const file = try dir.createFile(name, .{
             .truncate = true,
             .read = true,
+            .exclusive = true,
         });
         defer file.close();
 
@@ -264,6 +314,33 @@ const SSTable = struct {
         return null;
     }
 
+    pub fn merge(dir: *std.fs.Dir, name: []const u8, self: Self, other: Self) !Self {
+        const iters = [_]merging_iterator.IteratorWrapper(KeyValue){ self.iterator(), other.iterator() };
+        const iter = merging_iterator.MergeIterator(KeyValue).new(iters);
+        const file = try dir.createFile(name, .{
+            .truncate = true,
+            .read = true,
+        });
+        defer file.close();
+
+        std.debug.assert(self.lvl == other.lvl);
+
+        const total_size = self.file.len + other.file.len;
+        try file.setEndPos(total_size);
+
+        var mmap = try std.posix.mmap(null, total_size, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED }, file.handle, 0);
+        const mmap_copy = mmap;
+
+        while (iter.next()) |key| {
+            const key_value_size = key.full_size();
+
+            @memcpy(mmap[0..key_value_size], key.data[0..key_value_size]);
+            mmap = mmap[key_value_size..];
+        }
+
+        return .{ .file = mmap_copy, .path = name, .lvl = self.lvl + 1 };
+    }
+
     pub fn deinit(self: *Self, alloc: Allocator) void {
         alloc.free(self.path);
         std.posix.munmap(@ptrCast(@alignCast(self.file)));
@@ -307,10 +384,10 @@ test "Simple find and create" {
     const name = try generate_lvl_name(allocator, 0);
 
     inline for (1..200) |i| {
-        try tb.put("a" ** i, "a" ** i);
+        try tb.put("a" ** i, "a" ** i, 0);
     }
 
-    var table = try SSTable.create(&dir, name, tb, allocator);
+    var table = try SSTable.create(dir, name, tb, allocator);
     defer table.deinit(allocator);
     const to_find = [_][]const u8{ "a" ** 1, "a" ** 20, "a" ** 51, "a" ** 100, "a" ** 150, "a" ** 132 };
 
@@ -364,18 +441,18 @@ test "Merge" {
     const name = try generate_lvl_name(allocator, 0);
 
     inline for (1..200) |i| {
-        try tb.put("a" ** i, "a" ** i);
+        try tb.put("a" ** (i * 2 + 1), "a" ** (i * 2 + 1), 0);
     }
-    var table = try SSTable.create(&dir, name, tb, allocator);
+    var table = try SSTable.create(dir, name, tb, allocator);
     defer table.deinit(allocator);
 
     var tb1 = try MemTable.new(allocator, null);
     defer tb1.deinit(allocator);
 
     inline for (1..200) |i| {
-        try tb1.put("ab" ** i, "ba" ** i);
+        try tb1.put("ab" ** (i * 2), "ba" ** (i * 2), 1);
     }
     const name1 = try generate_lvl_name(allocator, 1);
-    var table1 = try SSTable.create(&dir, name1, tb, allocator);
+    var table1 = try SSTable.create(dir, name1, tb, allocator);
     defer table1.deinit(allocator);
 }

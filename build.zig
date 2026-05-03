@@ -12,9 +12,24 @@ pub fn build(b: *std.Build) void {
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
+    const generic_utils = b.addModule("generic_utils", .{
+        .root_source_file = b.path("src/generic_utils.zig"),
+        .target = target,
+    });
+    const merging_iterator = b.addModule("merging_iterator ", .{
+        .root_source_file = b.path("src/merging_iterator/iterator.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "generic_utils", .module = generic_utils },
+        },
+    });
+
     const skiplist = b.addModule("skiplist", .{
         .root_source_file = b.path("src/skiplist/skiplist.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "generic_utils", .module = generic_utils },
+        },
     });
 
     const test_utils = b.addModule("test_utils", .{
@@ -28,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "skiplist", .module = skiplist },
             .{ .name = "test_utils", .module = test_utils },
+            .{ .name = "merging_iterator", .module = merging_iterator },
         },
     });
 
@@ -54,6 +70,10 @@ pub fn build(b: *std.Build) void {
         .root_module = db,
     });
     const run_db_tests = b.addRunArtifact(db_tests);
+    const iter_tests = b.addTest(.{
+        .root_module = merging_iterator,
+    });
+    const run_iter_tests = b.addRunArtifact(iter_tests);
 
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
@@ -62,6 +82,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_skiplist_tests.step);
     test_step.dependOn(&run_memtable_tests.step);
     test_step.dependOn(&run_db_tests.step);
+    test_step.dependOn(&run_iter_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

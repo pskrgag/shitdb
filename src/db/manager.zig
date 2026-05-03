@@ -5,6 +5,7 @@ const Flusher = @import("flusher.zig").Flusher;
 const fs = std.fs;
 const Allocator = std.mem.Allocator;
 const Mutex = std.Thread.Mutex;
+const Version = @import("version.zig").Version;
 
 pub const Manager = struct {
     // Active MemTable
@@ -13,35 +14,40 @@ pub const Manager = struct {
     root: fs.Dir,
     // Root path
     path: []const u8,
-    // Flusher that manages immutable memtables
-    flusher: Flusher,
     // Mutex that protects new table creation
-    flusher_mutex: Mutex,
+    new_table_lock: Mutex,
     // MemTable options
     opts: ?MemTableOpts,
+    // Current version of db
+    version: *Version,
+    // Internal allocator
+    alloc: std.heap.GeneralPurposeAllocator(.{}),
 
     const Self = @This();
 
     pub fn new(dir: fs.Dir, path: []const u8, alloc: Allocator, opts: ?MemTableOpts) !Self {
+        const version = try Version.from_file(dir, "MANIFEST", alloc);
+
         return .{
+            .version = version,
             .active = std.atomic.Value(*MemTable).init(try MemTable.new(alloc, opts)),
             .path = path,
             .root = dir,
-            .flusher = Flusher.new(),
-            .flusher_mutex = Mutex{},
+            .new_table_lock = Mutex{},
             .opts = opts,
+            .alloc = std.heap.GeneralPurposeAllocator(.{}){},
         };
     }
 
     fn allocate_new_table(self: *Self, old: *MemTable, alloc: Allocator) !void {
-        self.flusher_mutex.lock();
-        defer self.flusher_mutex.unlock();
+        self.new_table_lock.lock();
+        defer self.new_table_lock.unlock();
 
         if (self.active.load(.unordered) == old) {
             const new_table = try MemTable.new(alloc, self.opts);
 
             // Put current table into the flusher
-            self.flusher.insert(old);
+            self.version.insert(old);
 
             const old_table = self.active.swap(new_table, .monotonic);
             std.debug.assert(old_table == old);
@@ -53,7 +59,7 @@ pub const Manager = struct {
         const table = self.active.load(.acquire);
 
         // Current table is full. Allocate new one
-        table.put(key, value) catch {
+        table.put(key, value, self.version.next_seq()) catch {
             try self.allocate_new_table(table, alloc);
             // It was updated. Retry the operation
             return self.put(key, value, alloc);
@@ -65,16 +71,16 @@ pub const Manager = struct {
         const table = self.active.load(.acquire);
 
         // Current table is full. Allocate new one
-        table.remove(key) catch {
+        table.remove(key, self.version.next_seq()) catch {
             try self.allocate_new_table(table, alloc);
             // It was updated. Retry the operation
             return self.remove(key, alloc);
         };
     }
 
-    pub fn get(self: *Self, key: []const u8) ?[]const u8 {
+    pub fn get(self: *Self, key: []const u8) !?[]const u8 {
         const table = self.active.load(.acquire);
-        const val = table.get(key);
+        const val = table.get(key, self.version.current_seq());
 
         switch (val) {
             .Found => |v| {
@@ -82,11 +88,8 @@ pub const Manager = struct {
             },
             .Removed => return null,
             .NotFound => {
-                self.flusher_mutex.lock();
-                defer self.flusher_mutex.unlock();
-
-                // Check immutable
-                return self.flusher.get(key);
+                // Resolve from other memtables
+                return try self.version.get(key, self.alloc.allocator());
             },
         }
     }

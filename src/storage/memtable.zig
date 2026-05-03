@@ -1,17 +1,33 @@
 const std = @import("std");
 const skiplist = @import("skiplist");
 const Arena = skiplist.Arena;
-const sstable = @import("sstable.zig");
 const utils = @import("utils.zig");
 const Allocator = std.mem.Allocator;
 const Node = std.DoublyLinkedList.Node;
 const test_utils = @import("test_utils");
 
-var SeqCounter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub const sstable = @import("sstable.zig");
+pub const manifest = @import("manifest.zig");
 
 const Type = enum(u1) {
     Delete = 0,
     Add = 1,
+};
+
+pub const KeyValueOwned = struct {
+    data: []const u8,
+
+    pub fn from_kv(kv: *const KeyValue, alloc: Allocator) !KeyValueOwned {
+        const full_size = kv.full_size();
+        const ptr = try alloc.alloc(u8, full_size);
+
+        @memcpy(ptr, kv.data);
+        return .{ .data = ptr };
+    }
+
+    pub fn deinit(self: *KeyValueOwned, alloc: Allocator) void {
+        alloc.free(self.data);
+    }
 };
 
 /// Key and Value packed together.
@@ -68,7 +84,7 @@ pub const KeyValue = packed struct {
         return self.as_type() == .Delete;
     }
 
-    fn new(key: []const u8, value: ?[]const u8, tp: Type, alloc: Allocator) !KeyValue {
+    fn new(key: []const u8, value: ?[]const u8, seq: usize, tp: Type, alloc: Allocator) !KeyValue {
         const key_len_rounded = utils.round_up(key.len, 8);
         const val_len = if (value) |val| val.len else 0;
         const value_len_rounded = utils.round_up(val_len, 8);
@@ -78,7 +94,6 @@ pub const KeyValue = packed struct {
             return error.TooBig;
 
         const ptr = try alloc.alignedAlloc(u8, std.mem.Alignment.@"8", size);
-        const seq = SeqCounter.fetchAdd(1, .monotonic);
         const seq_type = (seq & ~(@as(u64, 1) << 63)) | (@as(u64, @intFromEnum(tp)) << 63);
 
         @memmove(ptr.ptr + 0, @as(*const [8]u8, @ptrCast(&key.len)));
@@ -145,7 +160,6 @@ pub const GetResult = union(enum) {
 pub const MemTable = struct {
     table: skiplist.SkipList(KeyValue),
     arena: Arena,
-    node: Node,
 
     const Self = @This();
 
@@ -154,7 +168,6 @@ pub const MemTable = struct {
         var self = try alloc.create(Self);
 
         self.arena = try Arena.new(alloc, opts.memtable_size);
-        self.node = Node{ .next = null, .prev = null };
 
         // TODO: oh, this is weird place. Actually it would be cool to reuse self.arena. However, it's not
         // really fair, since skiplist is utility memory and should not really count. Node itself can take a lot
@@ -166,8 +179,8 @@ pub const MemTable = struct {
     }
 
     /// Inserts new value into MemTable
-    pub fn put(self: *Self, key: []const u8, value: []const u8) !void {
-        const kv = try KeyValue.new(key, value, Type.Add, self.arena.allocator());
+    pub fn put(self: *Self, key: []const u8, value: []const u8, seq: usize) !void {
+        const kv = try KeyValue.new(key, value, seq, Type.Add, self.arena.allocator());
 
         if (value.len == 0)
             return error.InvalidValue;
@@ -177,16 +190,16 @@ pub const MemTable = struct {
     }
 
     // Removes value from MemTable
-    pub fn remove(self: *Self, key: []const u8) !void {
-        const kv = try KeyValue.new(key, "", Type.Delete, self.arena.allocator());
+    pub fn remove(self: *Self, key: []const u8, seq: usize) !void {
+        const kv = try KeyValue.new(key, "", seq, Type.Delete, self.arena.allocator());
 
         std.debug.assert(kv.is_tombstone());
         _ = try self.table.insert(kv);
     }
 
     /// Retries value from MemTable
-    pub fn get(self: *Self, key: []const u8) GetResult {
-        const found = self.table.find_greater_or_eq(FindKey, FindKey{ .seq = SeqCounter.load(.monotonic), .key = key });
+    pub fn get(self: *Self, key: []const u8, seq: usize) GetResult {
+        const found = self.table.find_greater_or_eq(FindKey, FindKey{ .seq = seq, .key = key });
 
         if (found) |value| {
             const the_same_key = std.mem.eql(u8, value.as_key(), key);
@@ -201,6 +214,16 @@ pub const MemTable = struct {
         }
 
         return .NotFound;
+    }
+
+    /// Returns maximum key
+    pub fn max(self: *Self) ?*const KeyValue {
+        return self.table.max();
+    }
+
+    /// Returns minimal key
+    pub fn min(self: *Self) ?*const KeyValue {
+        return self.table.min();
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
@@ -220,11 +243,11 @@ test "Basic test" {
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
 
-    try tb.put("hello", "world");
-    var val = tb.get("hello");
+    try tb.put("hello", "world", 0);
+    var val = tb.get("hello", 0);
     try std.testing.expectEqualSlices(u8, val.as_key().?, "world");
 
-    val = tb.get("world");
+    val = tb.get("world", 1);
     switch (val) {
         .NotFound => {},
         else => {
@@ -233,17 +256,17 @@ test "Basic test" {
         },
     }
 
-    try tb.remove("hello");
+    try tb.remove("hello", 2);
 
-    val = tb.get("hello");
+    val = tb.get("hello", 2);
     switch (val) {
         .Removed => {},
         else => @panic("Wrong"),
     }
 
     // Try to insert one more time
-    try tb.put("hello", "bob");
-    val = tb.get("hello");
+    try tb.put("hello", "bob", 3);
+    val = tb.get("hello", 3);
     try std.testing.expectEqualSlices(u8, val.as_key().?, "bob");
 }
 
@@ -257,22 +280,22 @@ test "Try overwriting the key" {
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
 
-    try tb.put("hello", "world");
-    try tb.put("hello", "bob");
+    try tb.put("hello", "world", 0);
+    try tb.put("hello", "bob", 1);
 
-    var val = tb.get("hello");
+    var val = tb.get("hello", 1);
     try std.testing.expectEqualSlices(u8, val.as_key().?, "bob");
 
-    try tb.put("hello", "bibi");
-    val = tb.get("hello");
+    try tb.put("hello", "bibi", 3);
+    val = tb.get("hello", 3);
     try std.testing.expectEqualSlices(u8, val.as_key().?, "bibi");
 
-    try tb.put("hello", "kiki");
-    val = tb.get("hello");
+    try tb.put("hello", "kiki", 4);
+    val = tb.get("hello", 4);
     try std.testing.expectEqualSlices(u8, val.as_key().?, "kiki");
 
-    try tb.remove("hello");
-    val = tb.get("hello");
+    try tb.remove("hello", 5);
+    val = tb.get("hello", 5);
     switch (val) {
         .Removed => {},
         else => @panic("Wrong"),

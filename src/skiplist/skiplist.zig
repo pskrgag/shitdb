@@ -1,86 +1,15 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const MaxHeigth = 12;
-
+const compare_keys = @import("generic_utils").compare_keys;
 pub const Arena = @import("arena.zig").ThreadSafeArena;
 
-fn is_primitive_type(Key: type) bool {
-    return switch (@typeInfo(Key)) {
-        .int, .float, .bool => true,
-        else => false,
-    };
-}
-
-fn compare_same(Key: type, lhs: Key, rhs: Key) std.math.Order {
-    return switch (@typeInfo(Key)) {
-        .int, .float, .bool => {
-            return std.math.order(lhs, rhs);
-        },
-        .pointer => |ptr| {
-            if (ptr.size == .slice and is_primitive_type(ptr.child)) {
-                return std.mem.order(ptr.child, lhs, rhs);
-            } else {
-                @compileError("todo " ++ @typeName(ptr.child));
-            }
-        },
-        .@"struct" => |_| {
-            if (@hasDecl(Key, "cmp")) {
-                return lhs.cmp(&rhs);
-            } else {
-                @compileError("Custom structs must implement 'cmp' method" ++ @typeName(Key));
-            }
-        },
-        else => @compileError("Unsupported type for comparison: " ++ @typeName(Key)),
-    };
-}
-
-fn transform_struct_name(comptime input: []const u8) [input.len]u8 {
-    comptime {
-        var result: [input.len]u8 = undefined;
-
-        for (input, 0..) |c, i| {
-            result[i] = if (c == '.') '_' else c;
-        }
-
-        return result;
-    }
-}
-
-fn compare_keys(Key: type, Other: type, lhs: Key, rhs: Other) std.math.Order {
-    if (Key == Other) {
-        return compare_same(Key, lhs, rhs);
-    } else {
-        return switch (@typeInfo(Key)) {
-            .@"struct" => |_| {
-                const suffix = blk: {
-                    switch (@typeInfo(Other)) {
-                        .pointer => |ptr| {
-                            if (ptr.size == .slice) {
-                                break :blk "slice_" ++ @typeName(ptr.child);
-                            } else {
-                                @compileError("todo");
-                            }
-                        },
-                        else => break :blk @typeName(Other),
-                    }
-                };
-
-                if (@hasDecl(Key, "cmp_with_" ++ &transform_struct_name(suffix))) {
-                    return @field(Key, "cmp_with_" ++ &transform_struct_name(suffix))(&lhs, &rhs);
-                } else {
-                    @compileError("Custom structs must implement 'cmp_with_" ++ &transform_struct_name(suffix) ++ "' method. Type name is " ++ @typeName(Key));
-                }
-            },
-            else => @compileError("Unsupported type for comparison: " ++ @typeName(Key)),
-        };
-    }
-}
+const MaxHeigth = 12;
 
 fn NodeRef(T: type) type {
     return packed struct {
         ptr: usize,
 
-        pub fn new(p: ?*Node(T)) NodeRef(T) {
+        pub fn new(p: ?*const Node(T)) NodeRef(T) {
             return .{ .ptr = if (p) |pp| @intFromPtr(pp) else 0 };
         }
 
@@ -92,7 +21,7 @@ fn NodeRef(T: type) type {
             return self.ptr == 0;
         }
 
-        pub fn as_ptr(self: *NodeRef(T)) ?*Node(T) {
+        pub fn as_ptr(self: *const NodeRef(T)) ?*Node(T) {
             if (self.ptr == 0) {
                 return null;
             } else {
@@ -316,6 +245,34 @@ pub fn SkipList(T: type) type {
             return Iterator(T).new(self.head.next_at_lvl(0));
         }
 
+        /// Returns maximum key
+        pub fn max(self: *const Self) ?*const T {
+            var iter = self.head.next_at_lvl(0);
+
+            if (iter.is_null())
+                return null;
+
+            while (true) {
+                const next = iter.as_ptr().?.next_at_lvl(0);
+
+                if (next.is_null())
+                    return &iter.as_ptr().?.key;
+
+                iter = next;
+            }
+        }
+
+        /// Returns minimal key
+        pub fn min(self: *const Self) ?*const T {
+            const node = self.head.next_at_lvl(0);
+
+            if (node.as_ptr()) |nd| {
+                return &nd.key;
+            } else {
+                return null;
+            }
+        }
+
         pub fn deinit(self: *Self, alloc: Allocator) void {
             self.arena.deinit(alloc);
         }
@@ -340,6 +297,21 @@ test "Basic" {
     try std.testing.expectEqual(iter.next().?.*, 30);
     try std.testing.expectEqual(iter.next().?.*, 40);
     try std.testing.expectEqual(iter.next(), null);
+}
+
+test "Min Max" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var list = try SkipList(usize).new(allocator, 1000);
+    try list.insert(40);
+    try list.insert(20);
+    try list.insert(10);
+    try list.insert(30);
+
+    try std.testing.expectEqual(list.max().?.*, 40);
+    try std.testing.expectEqual(list.min().?.*, 10);
 }
 
 fn producer(list: *SkipList(usize), vals: []const usize) !void {

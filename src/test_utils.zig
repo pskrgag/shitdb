@@ -89,6 +89,7 @@ pub fn test_hash_table_equavalance(c: anytype, debug: bool, steps: usize) !void 
 
     var table = std.StringArrayHashMap([]const u8).init(allocator);
     var inserted_pairs = try InsertedValues.initCapacity(allocator, 0);
+    var seq: usize = 0;
 
     if (debug) {
         std.debug.print("Seed = {}\n", .{seed});
@@ -110,11 +111,19 @@ pub fn test_hash_table_equavalance(c: anytype, debug: bool, steps: usize) !void 
 
                 switch (fn_type) {
                     .@"fn" => |f| {
-                        try switch (f.params.len) {
-                            3 => container.put(i.key.items, i.value.items),
-                            4 => container.put(i.key.items, i.value.items, allocator),
+                        switch (f.params.len) {
+                            3 => try container.put(i.key.items, i.value.items),
+                            4 => {
+                                switch (@typeInfo(f.params[3].type.?)) {
+                                    .int => {
+                                        try container.put(i.key.items, i.value.items, seq);
+                                        seq += 1;
+                                    },
+                                    else => try container.put(i.key.items, i.value.items, allocator),
+                                }
+                            },
                             else => @compileError("ohhh2"),
-                        };
+                        }
                     },
                     else => @compileError("ohh"),
                 }
@@ -129,11 +138,19 @@ pub fn test_hash_table_equavalance(c: anytype, debug: bool, steps: usize) !void 
 
                 switch (fn_type) {
                     .@"fn" => |f| {
-                        try switch (f.params.len) {
-                            2 => container.remove(rm.key.items),
-                            3 => container.remove(rm.key.items, allocator),
+                        switch (f.params.len) {
+                            2 => try container.remove(rm.key.items),
+                            3 => {
+                                switch (@typeInfo(f.params[2].type.?)) {
+                                    .int => {
+                                        try container.remove(rm.key.items, seq);
+                                        seq += 1;
+                                    },
+                                    else => try container.remove(rm.key.items, allocator),
+                                }
+                            },
                             else => @compileError("ohhh2"),
-                        };
+                        }
                     },
                     else => @compileError("ohh"),
                 }
@@ -144,14 +161,30 @@ pub fn test_hash_table_equavalance(c: anytype, debug: bool, steps: usize) !void 
 
         var iter = table.iterator();
         while (iter.next()) |next| {
-            const value = container.get(next.key_ptr.*);
-            const value_unwrapped = switch (@typeInfo(@TypeOf(value))) {
-                .optional => value.?,
-                .@"union" => @field(@TypeOf(value), "as_key")(&value).?,
-                else => @compileError("ohh"),
+            const fn_type = switch (@typeInfo(@TypeOf(container))) {
+                .pointer => @typeInfo(@TypeOf(@TypeOf(container.*).get)),
+                else => @typeInfo(@TypeOf(@TypeOf(container).get)),
             };
 
-            try std.testing.expectEqualSlices(u8, value_unwrapped, next.value_ptr.*);
+            switch (fn_type) {
+                .@"fn" => |f| {
+                    const value = switch (f.params.len) {
+                        2 => container.get(next.key_ptr.*),
+                        3 => container.get(next.key_ptr.*, seq),
+                        else => @compileError("ohhh2"),
+                    };
+
+                    const value_unwrapped = switch (@typeInfo(@TypeOf(value))) {
+                        .optional => value.?,
+                        .@"union" => @field(@TypeOf(value), "as_key")(&value).?,
+                        .error_union => (value catch @panic("Function panicked")).?,
+                        else => @compileError("ohh"),
+                    };
+
+                    try std.testing.expectEqualSlices(u8, value_unwrapped, next.value_ptr.*);
+                },
+                else => @compileError("ohh"),
+            }
         }
     }
 }

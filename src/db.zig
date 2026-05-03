@@ -35,8 +35,8 @@ pub const KeyValue = struct {
     }
 
     /// Returns a key associated with value
-    pub fn get(self: *Self, key: []const u8) ?[]const u8 {
-        return self.manager.get(key);
+    pub fn get(self: *Self, key: []const u8) !?[]const u8 {
+        return try self.manager.get(key);
     }
 
     /// Returns a key associated with value
@@ -64,7 +64,7 @@ test "Simple API Test" {
         };
     }
     try new.put("hello", "world", allocator);
-    try std.testing.expectEqualSlices(u8, new.get("hello").?, "world");
+    try std.testing.expectEqualSlices(u8, (try new.get("hello")).?, "world");
     try std.testing.expectEqual(new.get("world"), null);
     try new.remove("hello", allocator);
     try std.testing.expectEqual(new.get("hello"), null);
@@ -75,7 +75,11 @@ test "Test more than one memtable" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const tb = try KeyValue.new("test_db1", allocator, KeyValueOptions{ .memtable = .{ .memtable_size = 1000 } });
+    const tb = try KeyValue.new(
+        "test_db1",
+        allocator,
+        KeyValueOptions{ .memtable = .{ .memtable_size = 1000 } },
+    );
     defer {
         std.fs.cwd().deleteTree("test_db1") catch {
             @panic("gg");
