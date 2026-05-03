@@ -347,8 +347,8 @@ pub const SSTable = struct {
         return .{ .file = mmap_copy, .path = name, .lvl = self.lvl + 1 };
     }
 
-    pub fn deinit(self: *Self, alloc: Allocator) void {
-        alloc.free(self.path);
+    pub fn deinit(self: *Self) void {
+        // alloc.free(self.path);
         std.posix.munmap(@ptrCast(@alignCast(self.file)));
     }
 };
@@ -388,13 +388,14 @@ test "Simple find and create" {
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
     const name = try generate_lvl_name(allocator, 0);
+    defer allocator.free(name);
 
     inline for (1..200) |i| {
         try tb.put("a" ** i, "a" ** i, 0);
     }
 
     var table = try SSTable.create(dir, name, tb, allocator);
-    defer table.deinit(allocator);
+    defer table.deinit();
     const to_find = [_][]const u8{ "a" ** 1, "a" ** 20, "a" ** 51, "a" ** 100, "a" ** 150, "a" ** 132 };
 
     for (to_find) |i| {
@@ -450,12 +451,13 @@ test "Merge" {
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
     const name = try generate_lvl_name(allocator, 0);
+    defer allocator.free(name);
 
     inline for (1..200) |i| {
         try tb.put("a" ** (i * 2 + 1), "a" ** (i * 2 + 1), 0);
     }
     var table = try SSTable.create(dir, name, tb, allocator);
-    defer table.deinit(allocator);
+    defer table.deinit();
 
     var tb1 = try MemTable.new(allocator, null);
     defer tb1.deinit(allocator);
@@ -464,6 +466,7 @@ test "Merge" {
         try tb1.put("ab" ** (i * 2), "ba" ** (i * 2), 1);
     }
     const name1 = try generate_lvl_name(allocator, 1);
+    defer allocator.free(name1);
     var table1 = try SSTable.create(dir, name1, tb, allocator);
-    defer table1.deinit(allocator);
+    defer table1.deinit();
 }

@@ -27,7 +27,7 @@ pub const Flusher = struct {
     // Allocator
     alloc: std.mem.Allocator,
 
-    fn flusher_thread(self: *Flusher, dir: std.fs.Dir, version: *Version) !void {
+    fn flusher_thread_impl(self: *Flusher, dir: std.fs.Dir, version: *Version) !void {
         while (true) {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -58,13 +58,18 @@ pub const Flusher = struct {
 
             var table = try SSTable.create(dir, new_file, first, self.alloc);
             try version.apply(edit, self.alloc);
-            table.deinit(self.alloc);
+            table.deinit();
 
             @memmove(self.list[0 .. MaxNumTables - 1], self.list[1..MaxNumTables]);
             self.count -= 1;
 
-            self.full_cv.broadcast();
+            self.full_cv.signal();
         }
+    }
+
+    fn flusher_thread(self: *Flusher, dir: std.fs.Dir, version: *Version) !void {
+        // TODO: smth better please
+        flusher_thread_impl(self, dir, version) catch @panic("Flusher thread panicked");
     }
 
     pub fn new(alloc: Allocator, version: *Version, dir: std.fs.Dir) !*Flusher {
@@ -89,12 +94,13 @@ pub const Flusher = struct {
 
     pub fn insert(self: *Flusher, table: *MemTable) void {
         self.mutex.lock();
+        defer self.mutex.unlock();
 
         if (self.count < MaxNumTables) {
             self.list[self.count] = table;
             self.count += 1;
 
-            self.empty_cv.broadcast();
+            self.empty_cv.signal();
         } else {
             while (self.count == MaxNumTables)
                 self.full_cv.wait(&self.mutex);
@@ -102,8 +108,6 @@ pub const Flusher = struct {
             self.list[self.count] = table;
             self.count += 1;
         }
-
-        self.mutex.unlock();
     }
 
     pub fn get(self: *Flusher, key: []const u8, seq: usize, alloc: Allocator) !?[]const u8 {

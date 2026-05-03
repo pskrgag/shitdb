@@ -178,8 +178,8 @@ pub fn test_hash_table_equavalance(c: anytype, debug: bool, steps: usize) !void 
                         .optional => value.?,
                         .@"union" => @field(@TypeOf(value), "as_key")(&value).?,
                         .error_union => |err| switch (@typeInfo(err.payload)) {
-                            .optional => (value catch @panic("Function panicked")).?,
-                            .@"union" => switch (value catch @panic("Function panicked")) {
+                            .optional => (value catch |e| return e).?,
+                            .@"union" => switch (value catch |e| return e) {
                                 .Found => |v| v,
                                 else => @panic("yo bro"),
                             },

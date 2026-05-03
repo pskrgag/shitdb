@@ -41,6 +41,7 @@ pub const Version = struct {
     mutex: Mutex,
     // Flusher that periodically flushes immutable tables
     flusher: *Flusher,
+    // Local allocator
 
     const Self = @This();
 
@@ -48,9 +49,7 @@ pub const Version = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        std.debug.print("Apply\n", .{});
         for (edit.new_files.items) |file| {
-            std.debug.print("Applied\n", .{});
             try self.tables.append(alloc, file);
         }
 
@@ -90,7 +89,14 @@ pub const Version = struct {
             size = 1;
         }
 
-        const mmap = try std.posix.mmap(null, size, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED }, file.handle, 0);
+        const mmap = try std.posix.mmap(
+            null,
+            size,
+            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .TYPE = .SHARED },
+            file.handle,
+            0,
+        );
 
         res.* = .{
             .flusher = try Flusher.new(alloc, res, dir),

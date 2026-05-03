@@ -20,8 +20,6 @@ pub const Manager = struct {
     opts: ?MemTableOpts,
     // Current version of db
     version: *Version,
-    // Internal allocator
-    alloc: std.heap.GeneralPurposeAllocator(.{}),
 
     const Self = @This();
 
@@ -35,7 +33,6 @@ pub const Manager = struct {
             .root = dir,
             .new_table_lock = Mutex{},
             .opts = opts,
-            .alloc = std.heap.GeneralPurposeAllocator(.{}){},
         };
     }
 
