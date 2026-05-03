@@ -25,6 +25,10 @@ pub const KeyValueOwned = struct {
         return .{ .data = ptr };
     }
 
+    pub fn as_kv(self: *const KeyValueOwned) KeyValue {
+        return KeyValue{ .data = self.data.ptr };
+    }
+
     pub fn deinit(self: *KeyValueOwned, alloc: Allocator) void {
         alloc.free(self.data);
     }
@@ -130,7 +134,7 @@ pub const KeyValue = packed struct {
     }
 };
 
-const FindKey = struct {
+pub const FindKey = struct {
     key: []const u8,
     seq: usize,
 };
@@ -143,8 +147,9 @@ pub const MemTableOpts = struct {
     }
 };
 
+/// Result of the search
 pub const GetResult = union(enum) {
-    Found: []const u8,
+    Found: []u8,
     Removed: void,
     NotFound: void,
 
@@ -198,7 +203,7 @@ pub const MemTable = struct {
     }
 
     /// Retries value from MemTable
-    pub fn get(self: *Self, key: []const u8, seq: usize) GetResult {
+    pub fn get(self: *Self, key: []const u8, seq: usize, alloc: Allocator) !GetResult {
         const found = self.table.find_greater_or_eq(FindKey, FindKey{ .seq = seq, .key = key });
 
         if (found) |value| {
@@ -208,7 +213,10 @@ pub const MemTable = struct {
                 if (value.is_tombstone()) {
                     return .Removed;
                 } else {
-                    return GetResult{ .Found = value.as_value().? };
+                    const res = try alloc.alloc(u8, value.as_value().?.len);
+
+                    @memcpy(res, value.as_value().?);
+                    return GetResult{ .Found = res };
                 }
             }
         }
@@ -243,31 +251,41 @@ test "Basic test" {
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
 
-    try tb.put("hello", "world", 0);
-    var val = tb.get("hello", 0);
-    try std.testing.expectEqualSlices(u8, val.as_key().?, "world");
+    {
+        try tb.put("hello", "world", 0);
+        var val = try tb.get("hello", 0, allocator);
+        defer allocator.free(val.as_key().?);
+        try std.testing.expectEqualSlices(u8, val.as_key().?, "world");
+    }
 
-    val = tb.get("world", 1);
-    switch (val) {
-        .NotFound => {},
-        else => {
-            std.debug.print("Unexpected result {any}\n", .{val});
-            @panic("");
-        },
+    {
+        const val = try tb.get("world", 1, allocator);
+        switch (val) {
+            .NotFound => {},
+            else => {
+                std.debug.print("Unexpected result {any}\n", .{val});
+                @panic("");
+            },
+        }
     }
 
     try tb.remove("hello", 2);
 
-    val = tb.get("hello", 2);
-    switch (val) {
-        .Removed => {},
-        else => @panic("Wrong"),
+    {
+        const val = try tb.get("hello", 2, allocator);
+        switch (val) {
+            .Removed => {},
+            else => @panic("Wrong"),
+        }
     }
 
-    // Try to insert one more time
-    try tb.put("hello", "bob", 3);
-    val = tb.get("hello", 3);
-    try std.testing.expectEqualSlices(u8, val.as_key().?, "bob");
+    {
+        // Try to insert one more time
+        try tb.put("hello", "bob", 3);
+        const val = try tb.get("hello", 3, allocator);
+        defer allocator.free(val.as_key().?);
+        try std.testing.expectEqualSlices(u8, val.as_key().?, "bob");
+    }
 }
 
 test "Try overwriting the key" {
@@ -283,22 +301,33 @@ test "Try overwriting the key" {
     try tb.put("hello", "world", 0);
     try tb.put("hello", "bob", 1);
 
-    var val = tb.get("hello", 1);
-    try std.testing.expectEqualSlices(u8, val.as_key().?, "bob");
+    {
+        var val = try tb.get("hello", 1, allocator);
+        defer allocator.free(val.as_key().?);
+        try std.testing.expectEqualSlices(u8, val.as_key().?, "bob");
+    }
 
-    try tb.put("hello", "bibi", 3);
-    val = tb.get("hello", 3);
-    try std.testing.expectEqualSlices(u8, val.as_key().?, "bibi");
+    {
+        try tb.put("hello", "bibi", 3);
+        var val = try tb.get("hello", 3, allocator);
+        defer allocator.free(val.as_key().?);
+        try std.testing.expectEqualSlices(u8, val.as_key().?, "bibi");
+    }
 
-    try tb.put("hello", "kiki", 4);
-    val = tb.get("hello", 4);
-    try std.testing.expectEqualSlices(u8, val.as_key().?, "kiki");
+    {
+        try tb.put("hello", "kiki", 4);
+        var val = try tb.get("hello", 4, allocator);
+        defer allocator.free(val.as_key().?);
+        try std.testing.expectEqualSlices(u8, val.as_key().?, "kiki");
+    }
 
-    try tb.remove("hello", 5);
-    val = tb.get("hello", 5);
-    switch (val) {
-        .Removed => {},
-        else => @panic("Wrong"),
+    {
+        try tb.remove("hello", 5);
+        const val = try tb.get("hello", 5, allocator);
+        switch (val) {
+            .Removed => {},
+            else => @panic("Wrong"),
+        }
     }
 }
 

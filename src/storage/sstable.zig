@@ -1,7 +1,9 @@
 const std = @import("std");
 const utils = @import("utils.zig");
 const MemTable = @import("memtable.zig").MemTable;
+const GetResult = @import("memtable.zig").GetResult;
 const KeyValue = @import("memtable.zig").KeyValue;
+const KeyValueOwned = @import("memtable.zig").KeyValueOwned;
 const Allocator = std.mem.Allocator;
 const merging_iterator = @import("merging_iterator");
 
@@ -223,7 +225,7 @@ pub const SSTable = struct {
         return null;
     }
 
-    fn find_value_in_block(block_data: []const u8, key: []const u8) ?[]const u8 {
+    fn find_value_in_block(block_data: []const u8, key: []const u8, alloc: Allocator) !GetResult {
         var iter = block_data;
 
         while (iter.len > 0) {
@@ -231,20 +233,31 @@ pub const SSTable = struct {
             const current_key = kv.as_key();
 
             switch (std.mem.order(u8, key, current_key)) {
-                .eq => return kv.as_value(),
+                .eq => {
+                    switch (kv.as_type()) {
+                        .Delete => return .Removed,
+                        .Add => {
+                            const value = kv.as_value().?;
+                            var res = try std.ArrayList(u8).initCapacity(alloc, value.len);
+
+                            try res.appendSlice(alloc, value);
+                            return GetResult{ .Found = res.items };
+                        },
+                    }
+                },
                 .gt => {
                     // key is less then current_key. Go forward
                 },
                 .lt => {
                     // key is greater. It's missing in this block
-                    return null;
+                    return .NotFound;
                 },
             }
 
             iter = iter[kv.full_size()..];
         }
 
-        return null;
+        return .NotFound;
     }
 
     pub fn iterator(self: *Self) Iterator {
@@ -253,7 +266,7 @@ pub const SSTable = struct {
         return .{ .data = self.file[0..mt.index_offset] };
     }
 
-    pub fn open(dir: *std.fs.Dir, name: []const u8) !Self {
+    pub fn open(dir: std.fs.Dir, name: []const u8) !Self {
         const file = try dir.openFile(name, .{});
         const stat = try file.stat();
 
@@ -291,7 +304,7 @@ pub const SSTable = struct {
         return .{ .path = name, .file = mmap_copy, .lvl = 0 };
     }
 
-    pub fn find_value(self: *const Self, key: []const u8, alloc: Allocator) !?std.ArrayList(u8) {
+    pub fn find_value(self: *const Self, key: []const u8, alloc: Allocator) !GetResult {
         const meta_block = self.meta();
 
         if (meta_block.magic != Magic)
@@ -301,17 +314,10 @@ pub const SSTable = struct {
 
         // We found a block that may contain a value. Try to find a value there
         if (Self.find_block_candidate(index, key)) |blk| {
-            if (Self.find_value_in_block(self.file[blk.offset .. blk.offset + blk.size], key)) |val| {
-                var res = try std.ArrayList(u8).initCapacity(alloc, val.len);
-
-                try res.appendSlice(alloc, val);
-                return res;
-            } else {
-                return null;
-            }
+            return try Self.find_value_in_block(self.file[blk.offset .. blk.offset + blk.size], key, alloc);
         }
 
-        return null;
+        return .NotFound;
     }
 
     pub fn merge(dir: *std.fs.Dir, name: []const u8, self: Self, other: Self) !Self {
@@ -392,15 +398,20 @@ test "Simple find and create" {
     const to_find = [_][]const u8{ "a" ** 1, "a" ** 20, "a" ** 51, "a" ** 100, "a" ** 150, "a" ** 132 };
 
     for (to_find) |i| {
-        var val = (try table.find_value(i, allocator)).?;
-        defer val.deinit(allocator);
+        const val = try table.find_value(i, allocator);
 
-        try std.testing.expectEqualSlices(u8, i, val.items);
+        switch (val) {
+            .Found => |v| {
+                try std.testing.expectEqualSlices(u8, i, v);
+                defer allocator.free(v);
+            },
+            else => @panic("Unexpected return"),
+        }
     }
 
     const to_find_non_present = [_][]const u8{ "a" ** 201, "b", "c", "d" ** 100 };
     for (to_find_non_present) |i| {
-        try std.testing.expectEqual(try table.find_value(i, allocator), null);
+        try std.testing.expectEqual(try table.find_value(i, allocator), .NotFound);
     }
 
     var iter = table.iterator();

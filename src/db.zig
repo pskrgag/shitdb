@@ -35,8 +35,12 @@ pub const KeyValue = struct {
     }
 
     /// Returns a key associated with value
-    pub fn get(self: *Self, key: []const u8) !?[]const u8 {
-        return try self.manager.get(key);
+    pub fn get(self: *Self, key: []const u8, alloc: Allocator) !?[]u8 {
+        return try self.manager.get(key, alloc);
+    }
+
+    pub fn deinit_value(self: *Self, value: std.ArrayList(u8)) void {
+        self.manager.deinit_value(value);
     }
 
     /// Returns a key associated with value
@@ -64,10 +68,10 @@ test "Simple API Test" {
         };
     }
     try new.put("hello", "world", allocator);
-    try std.testing.expectEqualSlices(u8, (try new.get("hello")).?, "world");
-    try std.testing.expectEqual(new.get("world"), null);
+    try std.testing.expectEqualSlices(u8, (try new.get("hello", allocator)).?, "world");
+    try std.testing.expectEqual(new.get("world", allocator), null);
     try new.remove("hello", allocator);
-    try std.testing.expectEqual(new.get("hello"), null);
+    try std.testing.expectEqual(new.get("hello", allocator), null);
 }
 
 test "Test more than one memtable" {

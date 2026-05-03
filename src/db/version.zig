@@ -1,6 +1,7 @@
 const std = @import("std");
 const File = std.fs.File;
 const MemTable = @import("storage").MemTable;
+const SSTable = @import("storage").sstable.SSTable;
 const manifest = @import("storage").manifest;
 const Flusher = @import("flusher.zig").Flusher;
 const Allocator = std.mem.Allocator;
@@ -14,6 +15,15 @@ pub const FileMeta = struct {
     min: KeyValueOwned,
     lvl: u8,
     seq: usize,
+
+    fn less_than(ctx: void, lhs: FileMeta, rhs: FileMeta) bool {
+        _ = ctx;
+
+        if (lhs.lvl < rhs.lvl)
+            return true;
+
+        return lhs.seq > rhs.seq;
+    }
 };
 
 pub const Version = struct {
@@ -38,7 +48,9 @@ pub const Version = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        std.debug.print("Apply\n", .{});
         for (edit.new_files.items) |file| {
+            std.debug.print("Applied\n", .{});
             try self.tables.append(alloc, file);
         }
 
@@ -98,37 +110,66 @@ pub const Version = struct {
     }
 
     // Resolves value request.
-    pub fn get(self: *Self, key: []const u8, alloc: Allocator) !?[]const u8 {
+    pub fn get(self: *Self, key: []const u8, dir: std.fs.Dir, alloc: Allocator) !?[]u8 {
         // Resolved from immutable table
-        if (self.flusher.get(key, self.current_seq())) |val|
-            return val;
+        if (try self.flusher.get(key, self.current_seq(), alloc)) |val| {
+            var res = try std.ArrayList(u8).initCapacity(alloc, val.len);
+
+            try res.appendSlice(alloc, val);
+            return res.items;
+        }
 
         // Search sstables on a disk
-        return self.search_disk(key, alloc);
+        return self.search_disk(key, dir, alloc);
     }
 
-    fn search_disk(self: *Self, key: []const u8, alloc: Allocator) !?[]const u8 {
+    fn search_disk(self: *Self, key: []const u8, dir: std.fs.Dir, alloc: Allocator) !?[]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // const candidates = try std.ArrayList(FileMeta).initCapacity(alloc, self.tables.len);
+        var candidates = try std.ArrayList(FileMeta).initCapacity(alloc, self.tables.items.len);
 
-        // _ = candidates;
         for (self.tables.items) |table| {
-            _ = table;
-            _ = key;
-            _ = alloc;
+            const min = table.min.as_kv().as_key();
+            const max = table.max.as_kv().as_key();
+            const cmp_min = std.mem.order(u8, min, key);
+            const cmp_max = std.mem.order(u8, max, key);
+
+            if ((cmp_min == .lt or cmp_min == .eq) and (cmp_max == .gt or cmp_max == .eq)) {
+                try candidates.append(alloc, table);
+            }
         }
 
-        @panic("");
+        if (candidates.items.len == 0)
+            return null;
+
+        std.mem.sort(FileMeta, candidates.items, {}, FileMeta.less_than);
+
+        for (candidates.items) |table| {
+            const ss = try SSTable.open(dir, table.name);
+            const value = try ss.find_value(key, alloc);
+
+            switch (value) {
+                .Removed => return null,
+                .Found => |v| return v,
+                else => {},
+            }
+        }
+
+        return null;
     }
 };
 
 pub const VersionEdit = struct {
     next_file: ?usize,
     new_files: std.ArrayList(FileMeta),
+    next_seq: ?usize,
 
     pub fn empty(alloc: Allocator) !VersionEdit {
-        return .{ .next_file = null, .new_files = try std.ArrayList(FileMeta).initCapacity(alloc, 0) };
+        return .{
+            .next_file = null,
+            .new_files = try std.ArrayList(FileMeta).initCapacity(alloc, 0),
+            .next_seq = null,
+        };
     }
 };

@@ -43,6 +43,11 @@ pub const Flusher = struct {
             const new_file = try version.new_file(self.alloc, &seq);
             var edit = try VersionEdit.empty(self.alloc);
 
+            // var iter = first.table.iterator();
+            // while (iter.next()) |i| {
+            //     std.debug.print("flushing {s}\n", .{ i.as_key() });
+            // }
+
             try edit.new_files.append(self.alloc, FileMeta{
                 .lvl = 0,
                 .name = new_file,
@@ -101,10 +106,10 @@ pub const Flusher = struct {
         self.mutex.unlock();
     }
 
-    pub fn get(self: *Flusher, key: []const u8, seq: usize) ?[]const u8 {
+    pub fn get(self: *Flusher, key: []const u8, seq: usize, alloc: Allocator) !?[]const u8 {
         for (0..self.count) |i| {
             const table: *MemTable = self.list[i].?;
-            const val = table.get(key, seq);
+            const val = try table.get(key, seq, alloc);
 
             switch (val) {
                 .Found => |v| {

@@ -78,18 +78,25 @@ pub const Manager = struct {
         };
     }
 
-    pub fn get(self: *Self, key: []const u8) !?[]const u8 {
+    pub fn deinit_value(self: *Self, value: std.ArrayList(u8)) void {
+        value.deinit(self.alloc.allocator());
+    }
+
+    pub fn get(self: *Self, key: []const u8, alloc: Allocator) !?[]u8 {
         const table = self.active.load(.acquire);
-        const val = table.get(key, self.version.current_seq());
+        const val = try table.get(key, self.version.current_seq(), alloc);
 
         switch (val) {
             .Found => |v| {
-                return v;
+                var res = try std.ArrayList(u8).initCapacity(alloc, v.len);
+
+                try res.appendSlice(alloc, v);
+                return res.items;
             },
             .Removed => return null,
             .NotFound => {
                 // Resolve from other memtables
-                return try self.version.get(key, self.alloc.allocator());
+                return try self.version.get(key, self.root, alloc);
             },
         }
     }

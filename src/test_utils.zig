@@ -169,15 +169,22 @@ pub fn test_hash_table_equavalance(c: anytype, debug: bool, steps: usize) !void 
             switch (fn_type) {
                 .@"fn" => |f| {
                     const value = switch (f.params.len) {
-                        2 => container.get(next.key_ptr.*),
-                        3 => container.get(next.key_ptr.*, seq),
+                        3 => container.get(next.key_ptr.*, allocator),
+                        4 => container.get(next.key_ptr.*, seq, allocator),
                         else => @compileError("ohhh2"),
                     };
 
                     const value_unwrapped = switch (@typeInfo(@TypeOf(value))) {
                         .optional => value.?,
                         .@"union" => @field(@TypeOf(value), "as_key")(&value).?,
-                        .error_union => (value catch @panic("Function panicked")).?,
+                        .error_union => |err| switch (@typeInfo(err.payload)) {
+                            .optional => (value catch @panic("Function panicked")).?,
+                            .@"union" => switch (value catch @panic("Function panicked")) {
+                                .Found => |v| v,
+                                else => @panic("yo bro"),
+                            },
+                            else => @compileError("todo"),
+                        },
                         else => @compileError("ohh"),
                     };
 
