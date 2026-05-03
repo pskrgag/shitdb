@@ -68,6 +68,11 @@ const MetaBlock = extern struct {
     magic: usize,
 };
 
+const Block = struct {
+    offset: usize,
+    size: usize,
+};
+
 pub const Iterator = struct {
     data: []const u8,
 
@@ -201,16 +206,59 @@ pub const SSTable = struct {
         @memcpy(file.*[0..@sizeOf(MetaBlock)], utils.data_as_u8_const_ptr(&m));
     }
 
-    fn find_block_candidate(index: []const u8, key: []const u8) ?struct { offset: usize, size: usize } {
+    fn read_block_first_key(block: []const u8) []const u8 {
+        const kv: KeyValue = KeyValue{ .data = @ptrCast(@alignCast(block.ptr)) };
+        return kv.as_key();
+    }
+
+    fn find_block_candidate(index: []const u8, key: []const u8, file: []const u8) ?Block {
         var iter = index;
 
         while (iter.len > 0) {
-            const block: *align(1) const BlockIndex = @ptrCast(@alignCast(iter.ptr));
+            var block: *align(1) const BlockIndex = @ptrCast(@alignCast(iter.ptr));
             const current_key = iter[@sizeOf(BlockIndex) .. @sizeOf(BlockIndex) + block.key_size];
 
             std.debug.assert(block.key_size > 0);
             switch (std.mem.order(u8, key, current_key)) {
-                .eq, .lt => {
+                .eq => {
+                    // There is a small catch. Imagine following
+                    //
+                    // Now block points to block1
+                    //
+                    //        [block1]                       [block2]
+                    // [key|add, key|add, key|remove]    [key|add......]
+                    //
+                    // 1) If next block::key == key, then the newest value is indeed in next blocks
+                    // 2) Otherwise if block.first_key() == key then the newest value is in the next block.
+
+                    while (true) {
+                        // Next block does not exist
+                        if (iter.len == @sizeOf(BlockIndex) + block.key_size) {
+                            return .{ .offset = block.offset, .size = block.size };
+                        }
+
+                        const next_block = iter[@sizeOf(BlockIndex) + block.key_size ..];
+                        const next_key = iter[@sizeOf(BlockIndex) .. @sizeOf(BlockIndex) + block.key_size];
+
+                        if (std.mem.order(u8, next_key, key) == .eq) {
+                            // Definitely not in the current block
+                            iter = next_block;
+                            block = @ptrCast(@alignCast(iter.ptr));
+                        } else {
+                            // Read first key of the block. If it matches then pick next block
+                            const block_data = file[block.offset .. block.offset + block.size];
+                            const next_first_key = Self.read_block_first_key(block_data);
+
+                            if (std.mem.order(u8, next_first_key, key) == .eq) {
+                                iter = next_block;
+                                block = @ptrCast(@alignCast(iter.ptr));
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                },
+                .lt => {
                     // Found the block where to key may be present.
                     return .{ .offset = block.offset, .size = block.size };
                 },
@@ -229,8 +277,26 @@ pub const SSTable = struct {
         var iter = block_data;
 
         while (iter.len > 0) {
-            const kv: KeyValue = KeyValue{ .data = @ptrCast(@alignCast(iter.ptr)) };
-            const current_key = kv.as_key();
+            var kv: KeyValue = KeyValue{ .data = @ptrCast(@alignCast(iter.ptr)) };
+            var current_key = kv.as_key();
+
+            // Walk until we find element with biggest sequence number.
+            if (std.mem.order(u8, key, current_key) == .eq) {
+                while (iter.len > 0) {
+                    const next = iter[kv.full_size()..];
+
+                    const next_kv = KeyValue{ .data = @ptrCast(@alignCast(next.ptr)) };
+                    const next_key = next_kv.as_key();
+
+                    if (std.mem.order(u8, next_key, current_key) == .eq) {
+                        iter = next;
+                        current_key = next_key;
+                        kv = next_kv;
+                    } else {
+                        break;
+                    }
+                }
+            }
 
             switch (std.mem.order(u8, key, current_key)) {
                 .eq => {
@@ -313,7 +379,7 @@ pub const SSTable = struct {
         const index = self.file[meta_block.index_offset .. meta_block.index_offset + meta_block.index_size];
 
         // We found a block that may contain a value. Try to find a value there
-        if (Self.find_block_candidate(index, key)) |blk| {
+        if (Self.find_block_candidate(index, key, self.file)) |blk| {
             return try Self.find_value_in_block(self.file[blk.offset .. blk.offset + blk.size], key, alloc);
         }
 
@@ -454,7 +520,7 @@ test "Merge" {
     defer allocator.free(name);
 
     inline for (1..200) |i| {
-        try tb.put("a" ** (i * 2 + 1), "a" ** (i * 2 + 1), 0);
+        try tb.put("a" ** (i * 2 + 1), "a" ** (i * 2 + 1), i);
     }
     var table = try SSTable.create(dir, name, tb, allocator);
     defer table.deinit();
@@ -463,10 +529,112 @@ test "Merge" {
     defer tb1.deinit(allocator);
 
     inline for (1..200) |i| {
-        try tb1.put("ab" ** (i * 2), "ba" ** (i * 2), 1);
+        try tb1.put("ab" ** (i * 2), "ba" ** (i * 2), i);
     }
-    const name1 = try generate_lvl_name(allocator, 1);
+    const name1 = try generate_lvl_name(allocator, 201);
     defer allocator.free(name1);
     var table1 = try SSTable.create(dir, name1, tb, allocator);
     defer table1.deinit();
+}
+
+test "Remove" {
+    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const cwd = std.fs.cwd();
+    try cwd.makePath("test_db");
+    defer {
+        std.fs.cwd().deleteTree("test_db") catch {
+            @panic("gg");
+        };
+    }
+    var dir = try cwd.openDir("test_db", .{});
+    defer dir.close();
+
+    var tb = try MemTable.new(allocator, null);
+    defer tb.deinit(allocator);
+    const name = try generate_lvl_name(allocator, 0);
+    defer allocator.free(name);
+
+    try tb.put("b" ** 10, "b" ** 10, 1);
+    try tb.remove("b" ** 10, 2);
+
+    var table = try SSTable.create(dir, name, tb, allocator);
+    defer table.deinit();
+
+    const val = try table.find_value("b" ** 10, allocator);
+    switch (val) {
+        .Removed => {},
+        else => {
+            std.debug.print("val {}\n", .{val});
+            @panic("Unexpected return");
+        },
+    }
+}
+
+test "Remove more than one block" {
+    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const cwd = std.fs.cwd();
+    try cwd.makePath("test_db");
+    defer {
+        std.fs.cwd().deleteTree("test_db") catch {
+            @panic("gg");
+        };
+    }
+    var dir = try cwd.openDir("test_db", .{});
+    defer dir.close();
+
+    var tb = try MemTable.new(allocator, null);
+    defer tb.deinit(allocator);
+
+    try tb.put("b" ** (BlockSize / 4), "b" ** (BlockSize / 4), 1);
+    try tb.put("b" ** (BlockSize / 4), "d" ** (BlockSize / 4), 2);
+    try tb.put("b" ** (BlockSize / 4), "c" ** (BlockSize / 4), 3);
+    try tb.put("b" ** (BlockSize / 4), "d" ** (BlockSize / 4), 4);
+
+    {
+        const name = try generate_lvl_name(allocator, 0);
+        defer allocator.free(name);
+        var table = try SSTable.create(dir, name, tb, allocator);
+        defer table.deinit();
+
+        const val = try table.find_value("b" ** (BlockSize / 4), allocator);
+        switch (val) {
+            .Found => |v| {
+                try std.testing.expectEqualSlices(u8, "d" ** (BlockSize / 4), v);
+                defer allocator.free(v);
+            },
+            else => {
+                std.debug.print("val {}\n", .{val});
+                @panic("Unexpected return");
+            },
+        }
+    }
+
+    {
+        const name = try generate_lvl_name(allocator, 1);
+        defer allocator.free(name);
+
+        try tb.remove("b" ** (BlockSize / 4), 5);
+
+        var table = try SSTable.create(dir, name, tb, allocator);
+        defer table.deinit();
+
+        const val = try table.find_value("b" ** (BlockSize / 4), allocator);
+        switch (val) {
+            .Removed => {},
+            else => {
+                std.debug.print("val {}\n", .{val});
+                @panic("Unexpected return");
+            },
+        }
+    }
 }
