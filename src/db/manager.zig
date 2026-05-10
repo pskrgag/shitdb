@@ -56,10 +56,14 @@ pub const Manager = struct {
         const table = self.active.load(.acquire);
 
         // Current table is full. Allocate new one
-        table.put(key, value, self.version.next_seq()) catch {
-            try self.allocate_new_table(table, alloc);
-            // It was updated. Retry the operation
-            return self.put(key, value, alloc);
+        table.put(key, value, self.version.next_seq()) catch |e| {
+            if (e == error.OutOfMemory) {
+                try self.allocate_new_table(table, alloc);
+                // It was updated. Retry the operation
+                return self.put(key, value, alloc);
+            } else {
+                return e;
+            }
         };
     }
 
@@ -68,10 +72,14 @@ pub const Manager = struct {
         const table = self.active.load(.acquire);
 
         // Current table is full. Allocate new one
-        table.remove(key, self.version.next_seq()) catch {
-            try self.allocate_new_table(table, alloc);
-            // It was updated. Retry the operation
-            return self.remove(key, alloc);
+        table.remove(key, self.version.next_seq()) catch |e| {
+            if (e == error.OutOfMemory) {
+                try self.allocate_new_table(table, alloc);
+                // It was updated. Retry the operation
+                return self.remove(key, alloc);
+            } else {
+                return e;
+            }
         };
     }
 

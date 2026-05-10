@@ -42,15 +42,15 @@ pub const KeyValue = packed struct {
     data: [*]const u8,
 
     pub fn as_key(self: *const KeyValue) []const u8 {
-        const self_key_len: [*]const u64 = @ptrCast(@alignCast(self.data));
+        const self_key_len: [*]align(1) const u64 = @ptrCast(@alignCast(self.data));
 
         return (self.data + 8)[0..self_key_len[0]];
     }
 
     fn value_len(self: *const KeyValue) usize {
-        const self_key_len: [*]const u64 = @ptrCast(@alignCast(self.data));
+        const self_key_len: [*]align(1) const u64 = @ptrCast(@alignCast(self.data));
         const to_skip = utils.round_up(self_key_len[0], 8) + 8;
-        const self_value_len: [*]const u64 = @ptrCast(@alignCast(self.data + to_skip));
+        const self_value_len: [*]align(1) const u64 = @ptrCast(@alignCast(self.data + to_skip));
 
         return self_value_len[0];
     }

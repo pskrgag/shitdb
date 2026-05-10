@@ -237,21 +237,22 @@ pub const SSTable = struct {
                             return .{ .offset = block.offset, .size = block.size };
                         }
 
-                        const next_block = iter[@sizeOf(BlockIndex) + block.key_size ..];
-                        const next_key = iter[@sizeOf(BlockIndex) .. @sizeOf(BlockIndex) + block.key_size];
+                        const next_block_data = iter[@sizeOf(BlockIndex) + block.key_size ..];
+                        const next_block: *align(1) const BlockIndex = @ptrCast(@alignCast(next_block_data.ptr));
+                        const next_key = next_block_data[@sizeOf(BlockIndex) .. @sizeOf(BlockIndex) + next_block.key_size];
 
                         if (std.mem.order(u8, next_key, key) == .eq) {
                             // Definitely not in the current block
-                            iter = next_block;
-                            block = @ptrCast(@alignCast(iter.ptr));
+                            iter = next_block_data;
+                            block = next_block;
                         } else {
                             // Read first key of the block. If it matches then pick next block
                             const block_data = file[block.offset .. block.offset + block.size];
                             const next_first_key = Self.read_block_first_key(block_data);
 
                             if (std.mem.order(u8, next_first_key, key) == .eq) {
-                                iter = next_block;
-                                block = @ptrCast(@alignCast(iter.ptr));
+                                iter = next_block_data;
+                                block = next_block;
                             } else {
                                 break;
                             }
@@ -284,6 +285,9 @@ pub const SSTable = struct {
             if (std.mem.order(u8, key, current_key) == .eq) {
                 while (iter.len > 0) {
                     const next = iter[kv.full_size()..];
+
+                    if (next.len == 0)
+                        break;
 
                     const next_kv = KeyValue{ .data = @ptrCast(@alignCast(next.ptr)) };
                     const next_key = next_kv.as_key();

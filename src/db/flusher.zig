@@ -2,7 +2,7 @@ const std = @import("std");
 const MemTable = @import("storage").MemTable;
 const KeyValueOwned = @import("storage").KeyValueOwned;
 const VersionEdit = @import("version.zig").VersionEdit;
-const FileMeta = @import("version.zig").FileMeta;
+const FileMeta = @import("storage").manifest.FileMeta;
 const Version = @import("version.zig").Version;
 const DoublyLinkedList = std.DoublyLinkedList;
 const Thread = std.Thread;
@@ -26,14 +26,20 @@ pub const Flusher = struct {
     full_cv: std.Thread.Condition,
     // Allocator
     alloc: std.mem.Allocator,
+    // Stop flag
+    stop: std.atomic.Value(bool),
 
     fn flusher_thread_impl(self: *Flusher, dir: std.fs.Dir, version: *Version) !void {
-        while (true) {
+        while (!self.stop.load(.monotonic)) {
             self.mutex.lock();
-            defer self.mutex.unlock();
 
-            while (self.count == 0)
+            while (self.count == 0 and !self.stop.load(.monotonic))
                 self.empty_cv.wait(&self.mutex);
+
+            if (self.stop.load(.monotonic)) {
+                self.mutex.unlock();
+                return;
+            }
 
             const first = self.list[0].?;
             const min = try KeyValueOwned.from_kv(first.min().?, self.alloc);
@@ -64,6 +70,7 @@ pub const Flusher = struct {
             self.count -= 1;
 
             self.full_cv.signal();
+            self.mutex.unlock();
         }
     }
 
@@ -81,6 +88,7 @@ pub const Flusher = struct {
         flusher.empty_cv = std.Thread.Condition{};
         flusher.full_cv = std.Thread.Condition{};
         flusher.alloc = alloc;
+        flusher.stop = std.atomic.Value(bool).init(false);
 
         // Spawning a thread is a release operation, so all writes should be reversed.
         flusher.thread = try Thread.spawn(
@@ -111,6 +119,9 @@ pub const Flusher = struct {
     }
 
     pub fn get(self: *Flusher, key: []const u8, seq: usize, alloc: Allocator) !?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         for (0..self.count) |i| {
             const table: *MemTable = self.list[i].?;
             const val = try table.get(key, seq, alloc);
@@ -125,5 +136,13 @@ pub const Flusher = struct {
         }
 
         return null;
+    }
+
+    pub fn deinit(self: *Flusher, alloc: Allocator) void {
+        self.stop.store(true, .monotonic);
+        self.empty_cv.signal();
+        self.thread.join();
+
+        alloc.destroy(self);
     }
 };

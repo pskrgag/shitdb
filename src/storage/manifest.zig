@@ -1,19 +1,40 @@
 const std = @import("std");
 const utils = @import("utils.zig");
+const KeyValueOwned = @import("memtable.zig").KeyValueOwned;
+const KeyValue = @import("memtable.zig").KeyValue;
 const Writer = std.fs.File.Writer;
 const Allocator = std.mem.Allocator;
 const data_as_u8_const_ptr = utils.data_as_u8_const_ptr;
 
 const AddMagic = 0x10;
 const NextFileNumberMagic = 0x12;
+const NextSeqNumberMagic = 0x13;
+
+pub const FileMeta = struct {
+    name: []const u8,
+    max: KeyValueOwned,
+    min: KeyValueOwned,
+    lvl: u8,
+    seq: usize,
+
+    pub fn less_than(ctx: void, lhs: FileMeta, rhs: FileMeta) bool {
+        _ = ctx;
+
+        if (lhs.lvl != rhs.lvl)
+            return lhs.lvl < rhs.lvl;
+
+        return lhs.seq > rhs.seq;
+    }
+};
 
 pub const ManifestRecord = union(enum) {
-    Add: struct { lvl: u8, name: []const u8, smallest: []const u8, largest: []const u8 },
-    Delete: struct {
-        name: []const u8,
+    AddFile: FileMeta,
+    DeleteFile: struct {
+        seq: usize,
         lvl: u8,
     },
     NextFileNumber: usize,
+    NextSeqNumber: usize,
 
     const Self = @This();
 
@@ -24,69 +45,138 @@ pub const ManifestRecord = union(enum) {
     fn full_size(self: *const ManifestRecord) usize {
         var full: usize = 0;
 
-        switch (self) {
-            .Add => |add| {
-                full = ManifestRecord.string_size(add.name) + 1 + ManifestRecord.string_size(add.smallest) + ManifestRecord.string_size(add.largest);
+        switch (self.*) {
+            .AddFile => |add| {
+                full = ManifestRecord.string_size(add.name) + @sizeOf(u8) + @sizeOf(usize) + ManifestRecord.string_size(add.max.data) + ManifestRecord.string_size(add.min.data);
             },
-            .Delete => |del| {
-                full = ManifestRecord.string_size(del.name) + 1;
+            .DeleteFile => |a| {
+                full = @sizeOf(@TypeOf(a));
             },
             .NextFileNumber => |num| {
-                full = @sizeOf(num);
+                full = @sizeOf(@TypeOf(num));
+            },
+            .NextSeqNumber => |num| {
+                full = @sizeOf(@TypeOf(num));
             },
         }
 
         return full + 1;
     }
 
-    fn putBytes(buf: []u8, pos: *usize, bytes: []const u8) void {
-        std.debug.assert(bytes.len <= buf.len - pos.*);
-
-        @memcpy(buf[pos.* .. pos.* + bytes.len], bytes);
-        pos.* += bytes.len;
+    fn put_bytes(buf: *[]u8, bytes: []const u8) void {
+        @memcpy(buf.*[0..bytes.len], bytes);
+        buf.* = buf.*[bytes.len..];
     }
 
-    fn putInt(
+    fn put_slice(buf: *[]u8, bytes: []const u8) void {
+        Self.put_int(usize, buf, bytes.len);
+        Self.put_bytes(buf, bytes);
+    }
+
+    fn put_int(
         comptime T: type,
-        buf: []u8,
-        pos: *usize,
+        buf: *[]u8,
         value: T,
     ) void {
         const n = @sizeOf(T);
+        const dst: *[n]u8 = buf.*[0..][0..n];
 
-        const dst: *[n]u8 = buf[pos.* .. pos.* + n];
         std.mem.writeInt(T, dst, value, .little);
-        pos.* += n;
+        buf.* = buf.*[n..];
     }
 
-    fn serialize(self: *ManifestRecord, alloc: Allocator) ![]const u8 {
+    fn get_bytes(buf: *[]const u8, len: usize) []const u8 {
+        std.debug.assert(len <= buf.*.len);
+
+        const res = buf.*[0..len];
+        buf.* = buf.*[len..];
+        return res;
+    }
+
+    fn get_slice(buf: *[]const u8) []const u8 {
+        const size = Self.get_int(usize, buf);
+        return Self.get_bytes(buf, size);
+    }
+
+    fn get_int(
+        comptime T: type,
+        buf: *[]const u8,
+    ) T {
+        const n = @sizeOf(T);
+        std.debug.assert(n <= buf.*.len);
+
+        const src: *const [n]u8 = buf.*[0..][0..n];
+        const res = std.mem.readInt(T, src, .little);
+
+        buf.* = buf.*[n..];
+        return res;
+    }
+
+    pub fn serialize_to(self: *const ManifestRecord, dst: *std.ArrayList(u8), alloc: Allocator) !void {
         const size = self.full_size();
-        const data = try alloc.alloc(u8, size);
-        const pos = 0;
+        try dst.resize(alloc, dst.items.len + size);
 
-        switch (self) {
-            .Add => |add| {
-                Self.putInt(u8, data, &pos, AddMagic);
-                Self.putInt(u8, data, &pos, add.lvl);
+        var data = dst.items[dst.items.len - size ..];
 
-                Self.putInt(usize, data, &pos, add.name.len);
-                Self.putBytes(data, &pos, add.name.ptr);
+        switch (self.*) {
+            .AddFile => |add| {
+                Self.put_int(u8, &data, AddMagic);
+                Self.put_int(u8, &data, add.lvl);
+                Self.put_int(usize, &data, add.seq);
 
-                Self.putInt(usize, data, &pos, add.smallest.len);
-                Self.putBytes(data, &pos, add.smallest.ptr);
-
-                Self.putInt(usize, data, &pos, add.largest.len);
-                Self.putBytes(data, &pos, add.largest.ptr);
-
-                return data;
+                Self.put_slice(&data, add.name);
+                Self.put_slice(&data, add.max.data);
+                Self.put_slice(&data, add.min.data);
             },
             .NextFileNumber => |next| {
-                Self.putInt(u8, data, &pos, NextFileNumberMagic);
-                Self.putInt(u8, data, &pos, next);
+                Self.put_int(u8, &data, NextFileNumberMagic);
+                Self.put_int(usize, &data, next);
             },
-            .Delete => |add| {
+            .NextSeqNumber => |next| {
+                Self.put_int(u8, &data, NextSeqNumberMagic);
+                Self.put_int(usize, &data, next);
+            },
+            .DeleteFile => |add| {
                 _ = add;
             },
         }
+    }
+
+    pub fn deserialize_from(data: []const u8, alloc: Allocator) !std.ArrayList(Self) {
+        var res = try std.ArrayList(Self).initCapacity(alloc, 0);
+        var iter = data;
+
+        while (iter.len > 0) {
+            const magic = Self.get_int(u8, &iter);
+
+            switch (magic) {
+                AddMagic => {
+                    const lvl = Self.get_int(u8, &iter);
+                    const seq = Self.get_int(usize, &iter);
+                    const name = Self.get_slice(&iter);
+                    const max = Self.get_slice(&iter);
+                    const min = Self.get_slice(&iter);
+
+                    try res.append(alloc, .{ .AddFile = .{
+                        .lvl = lvl,
+                        .name = name,
+                        .min = try KeyValueOwned.from_kv(&KeyValue{ .data = min.ptr }, alloc),
+                        .max = try KeyValueOwned.from_kv(&KeyValue{ .data = max.ptr }, alloc),
+                        .seq = seq,
+                    } });
+                },
+                NextFileNumberMagic => {
+                    const filenum = Self.get_int(usize, &iter);
+                    try res.append(alloc, .{ .NextFileNumber = filenum });
+                },
+                NextSeqNumberMagic => {
+                    const filenum = Self.get_int(usize, &iter);
+                    try res.append(alloc, .{ .NextSeqNumber = filenum });
+                },
+                else => return error.CorruptedData,
+            }
+        }
+
+        return res;
     }
 };
