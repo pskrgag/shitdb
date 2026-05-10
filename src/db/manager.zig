@@ -20,6 +20,8 @@ pub const Manager = struct {
     opts: ?MemTableOpts,
     // Current version of db
     version: *Version,
+    // Allocator used for owned DB structures
+    alloc: Allocator,
 
     const Self = @This();
 
@@ -33,6 +35,7 @@ pub const Manager = struct {
             .root = dir,
             .new_table_lock = Mutex{},
             .opts = opts,
+            .alloc = alloc,
         };
     }
 
@@ -67,6 +70,7 @@ pub const Manager = struct {
         };
     }
 
+    /// Removes a value from database
     pub fn remove(self: *Self, key: []const u8, alloc: Allocator) !void {
         // consume would suffice, but whatever
         const table = self.active.load(.acquire);
@@ -83,20 +87,14 @@ pub const Manager = struct {
         };
     }
 
-    pub fn deinit_value(self: *Self, value: std.ArrayList(u8)) void {
-        value.deinit(self.alloc.allocator());
-    }
-
+    /// Retrieves a value from database
     pub fn get(self: *Self, key: []const u8, alloc: Allocator) !?[]u8 {
         const table = self.active.load(.acquire);
         const val = try table.get(key, self.version.current_seq(), alloc);
 
         switch (val) {
             .Found => |v| {
-                var res = try std.ArrayList(u8).initCapacity(alloc, v.len);
-
-                try res.appendSlice(alloc, v);
-                return res.items;
+                return v;
             },
             .Removed => return null,
             .NotFound => {
@@ -104,5 +102,12 @@ pub const Manager = struct {
                 return try self.version.get(key, self.root, alloc);
             },
         }
+    }
+
+    pub fn deinit(self: *Self) void {
+        // here we expect that no other user accesses data-base
+        self.active.load(.acquire).deinit(self.alloc);
+        self.version.deinit(self.alloc);
+        self.root.close();
     }
 };

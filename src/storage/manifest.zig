@@ -159,7 +159,7 @@ pub const ManifestRecord = union(enum) {
 
                     try res.append(alloc, .{ .AddFile = .{
                         .lvl = lvl,
-                        .name = name,
+                        .name = try alloc.dupe(u8, name),
                         .min = try KeyValueOwned.from_kv(&KeyValue{ .data = min.ptr }, alloc),
                         .max = try KeyValueOwned.from_kv(&KeyValue{ .data = max.ptr }, alloc),
                         .seq = seq,

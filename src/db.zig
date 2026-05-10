@@ -39,10 +39,6 @@ pub const KeyValue = struct {
         return try self.manager.get(key, alloc);
     }
 
-    pub fn deinit_value(self: *Self, value: std.ArrayList(u8)) void {
-        self.manager.deinit_value(value);
-    }
-
     /// Returns a key associated with value
     pub fn remove(self: *Self, key: []const u8, alloc: Allocator) !void {
         return self.manager.remove(key, alloc);
@@ -54,21 +50,35 @@ pub const KeyValue = struct {
         const mem_opts = if (opts) |o| o.memtable else null;
         return .{ .manager = try Manager.new(dir, path, alloc, mem_opts) };
     }
+
+    /// De-initializes db session
+    pub fn deinit(self: *Self) void {
+        self.manager.deinit();
+    }
 };
 
 test "Simple API Test" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
+    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
     const allocator = arena.allocator();
 
     var new = try KeyValue.new("test_db2", allocator, null);
     defer {
+        new.deinit();
         std.fs.cwd().deleteTree("test_db2") catch {
             @panic("gg");
         };
     }
     try new.put("hello", "world", allocator);
-    try std.testing.expectEqualSlices(u8, (try new.get("hello", allocator)).?, "world");
+
+    {
+        const val = (try new.get("hello", allocator)).?;
+        defer allocator.free(val);
+        try std.testing.expectEqualSlices(u8, val, "world");
+    }
+
     try std.testing.expectEqual(new.get("world", allocator), null);
     try new.remove("hello", allocator);
     try std.testing.expectEqual(new.get("hello", allocator), null);
@@ -79,12 +89,14 @@ test "Test more than one memtable" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const tb = try KeyValue.new(
+    var tb = try KeyValue.new(
         "test_db1",
         allocator,
         KeyValueOptions{ .memtable = .{ .memtable_size = 1000 } },
     );
+
     defer {
+        tb.deinit();
         std.fs.cwd().deleteTree("test_db1") catch {
             @panic("gg");
         };

@@ -13,8 +13,6 @@ const FileMeta = @import("storage").manifest.FileMeta;
 pub const Version = struct {
     // File handle
     file: File,
-    // File data
-    data: [*]u8,
     // Next file number
     next_file: Value(usize),
     // Next sequence number
@@ -75,29 +73,13 @@ pub const Version = struct {
             else => return err,
         };
         const stat = try file.stat();
-        var size = stat.size;
-        const was_empty = size == 0;
+        const size = stat.size;
+        const empty = size == 0;
         const res = try alloc.create(Self);
-
-        // Mmaping 0 is not valid thing (make sense, right?)
-        if (was_empty) {
-            try file.setEndPos(1);
-            size = 1;
-        }
-
-        const mmap = try std.posix.mmap(
-            null,
-            size,
-            std.posix.PROT.READ | std.posix.PROT.WRITE,
-            .{ .TYPE = .SHARED },
-            file.handle,
-            0,
-        );
 
         res.* = .{
             .flusher = try Flusher.new(alloc, res, dir),
             .file = file,
-            .data = mmap.ptr,
             .tables = try std.ArrayList(FileMeta).initCapacity(alloc, 0),
             .next_file = Value(usize).init(0),
             .next_sequence = Value(usize).init(0),
@@ -106,11 +88,21 @@ pub const Version = struct {
         errdefer res.deinit(alloc);
 
         if (size > 1) {
+            const mmap = try std.posix.mmap(
+                null,
+                size,
+                std.posix.PROT.READ | std.posix.PROT.WRITE,
+                .{ .TYPE = .SHARED },
+                file.handle,
+                0,
+            );
+            defer std.posix.munmap(mmap);
+
             const rep = try manifest.ManifestRecord.deserialize_from(mmap, alloc);
             try res.replay(rep, alloc);
         }
 
-        if (was_empty) {
+        if (empty) {
             try file.seekTo(0);
         } else {
             try file.seekFromEnd(0);
@@ -342,6 +334,7 @@ test "Version apply persists edits that reopen can replay" {
     const allocator = arena.allocator();
 
     const dirname = "test_db_version_replay";
+    std.fs.cwd().deleteTree(dirname) catch {};
     try std.fs.cwd().makeDir(dirname);
 
     var dir = try std.fs.cwd().openDir(dirname, .{});

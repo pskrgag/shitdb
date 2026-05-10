@@ -139,8 +139,12 @@ pub const Flusher = struct {
     }
 
     pub fn deinit(self: *Flusher, alloc: Allocator) void {
+        self.mutex.lock();
         self.stop.store(true, .monotonic);
-        self.empty_cv.signal();
+        self.empty_cv.broadcast();
+        self.full_cv.broadcast();
+        self.mutex.unlock();
+
         self.thread.join();
 
         alloc.destroy(self);
