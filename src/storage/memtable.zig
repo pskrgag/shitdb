@@ -38,7 +38,7 @@ pub const KeyValueOwned = struct {
 ///
 ///    8b      key len bytes      8b          value len bytes    1b        7b
 /// [key len] [     key     ] [value len] [      value       ] [type] [seq-number]
-pub const KeyValue = packed struct {
+pub const KeyValue = struct {
     data: [*]const u8,
 
     pub fn as_key(self: *const KeyValue) []const u8 {
@@ -242,7 +242,7 @@ pub const MemTable = struct {
 };
 
 test "Basic test" {
-    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    var arena = std.heap.DebugAllocator(.{}){};
     defer {
         _ = arena.deinit();
     }
@@ -289,7 +289,7 @@ test "Basic test" {
 }
 
 test "Try overwriting the key" {
-    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    var arena = std.heap.DebugAllocator(.{}){};
     defer {
         _ = arena.deinit();
     }

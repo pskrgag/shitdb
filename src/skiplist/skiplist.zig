@@ -6,7 +6,7 @@ pub const Arena = @import("arena.zig").ThreadSafeArena;
 const MaxHeigth = 12;
 
 fn NodeRef(T: type) type {
-    return packed struct {
+    return packed struct(usize) {
         ptr: usize,
 
         pub fn new(p: ?*const Node(T)) NodeRef(T) {
@@ -167,7 +167,7 @@ pub fn SkipList(T: type) type {
                 .head = node,
                 .arena = arena,
                 .heigth = std.atomic.Value(usize).init(1),
-                .prng = std.Random.DefaultPrng.init(@bitCast(std.time.timestamp())),
+                .prng = std.Random.DefaultPrng.init(0x1234_5678_9abc_def0),
             };
         }
 
@@ -338,7 +338,8 @@ test "Test MT" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const rand = std.crypto.random;
+    var shuffle_prng = std.Random.DefaultPrng.init(0xdead_beef);
+    const rand = shuffle_prng.random();
 
     var list = try SkipList(usize).new(allocator, NumPush * NumPush);
     var list1 = try std.ArrayList(usize).initCapacity(allocator, NumPush);

@@ -8,6 +8,7 @@ const DoublyLinkedList = std.DoublyLinkedList;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 const SSTable = @import("storage").sstable.SSTable;
+const io = std.Options.debug_io;
 
 const MaxNumTables: usize = 5;
 
@@ -19,74 +20,52 @@ pub const Flusher = struct {
     // Flusher thread
     thread: std.Thread,
     // Protects concurrent access to list
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     // CV for empty state
-    empty_cv: std.Thread.Condition,
+    empty_cv: std.Io.Condition,
     // CV for full state
-    full_cv: std.Thread.Condition,
+    full_cv: std.Io.Condition,
     // Allocator
     alloc: std.mem.Allocator,
     // Stop flag
     stop: std.atomic.Value(bool),
 
-    fn flusher_thread_impl(self: *Flusher, dir: std.fs.Dir, version: *Version) !void {
+    fn flusher_thread_impl(self: *Flusher, dir: std.Io.Dir, version: *Version) !void {
         while (!self.stop.load(.monotonic)) {
-            self.mutex.lock();
+            self.mutex.lockUncancelable(io);
 
             while (self.count == 0 and !self.stop.load(.monotonic))
-                self.empty_cv.wait(&self.mutex);
+                self.empty_cv.waitUncancelable(io, &self.mutex);
 
             if (self.stop.load(.monotonic)) {
-                self.mutex.unlock();
+                self.mutex.unlock(io);
                 return;
             }
 
             const first = self.list[0].?;
-            const min = try KeyValueOwned.from_kv(first.min().?, self.alloc);
-            const max = try KeyValueOwned.from_kv(first.max().?, self.alloc);
-            var seq: usize = 0;
-
-            const new_file = try version.new_file(self.alloc, &seq);
-            var edit = try VersionEdit.empty(self.alloc);
-
-            // var iter = first.table.iterator();
-            // while (iter.next()) |i| {
-            //     std.debug.print("flushing {s}\n", .{ i.as_key() });
-            // }
-
-            try edit.new_files.append(self.alloc, FileMeta{
-                .lvl = 0,
-                .name = new_file,
-                .max = max,
-                .min = min,
-                .seq = seq,
-            });
-
-            var table = try SSTable.create(dir, new_file, first, self.alloc);
-            try version.apply(edit, self.alloc);
-            table.deinit();
+            try version.flush_memtable(first, dir, self.alloc);
 
             @memmove(self.list[0 .. MaxNumTables - 1], self.list[1..MaxNumTables]);
             self.count -= 1;
 
-            self.full_cv.signal();
-            self.mutex.unlock();
+            self.full_cv.signal(io);
+            self.mutex.unlock(io);
         }
     }
 
-    fn flusher_thread(self: *Flusher, dir: std.fs.Dir, version: *Version) !void {
+    fn flusher_thread(self: *Flusher, dir: std.Io.Dir, version: *Version) !void {
         // TODO: smth better please
         flusher_thread_impl(self, dir, version) catch @panic("Flusher thread panicked");
     }
 
-    pub fn new(alloc: Allocator, version: *Version, dir: std.fs.Dir) !*Flusher {
+    pub fn new(alloc: Allocator, version: *Version, dir: std.Io.Dir) !*Flusher {
         const flusher = try alloc.create(Flusher);
 
         flusher.list = .{null} ** MaxNumTables;
         flusher.count = 0;
-        flusher.mutex = std.Thread.Mutex{};
-        flusher.empty_cv = std.Thread.Condition{};
-        flusher.full_cv = std.Thread.Condition{};
+        flusher.mutex = std.Io.Mutex.init;
+        flusher.empty_cv = std.Io.Condition.init;
+        flusher.full_cv = std.Io.Condition.init;
         flusher.alloc = alloc;
         flusher.stop = std.atomic.Value(bool).init(false);
 
@@ -101,17 +80,17 @@ pub const Flusher = struct {
     }
 
     pub fn insert(self: *Flusher, table: *MemTable) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.count < MaxNumTables) {
             self.list[self.count] = table;
             self.count += 1;
 
-            self.empty_cv.signal();
+            self.empty_cv.signal(io);
         } else {
             while (self.count == MaxNumTables)
-                self.full_cv.wait(&self.mutex);
+                self.full_cv.waitUncancelable(io, &self.mutex);
 
             self.list[self.count] = table;
             self.count += 1;
@@ -119,8 +98,8 @@ pub const Flusher = struct {
     }
 
     pub fn get(self: *Flusher, key: []const u8, seq: usize, alloc: Allocator) !?[]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         for (0..self.count) |i| {
             const table: *MemTable = self.list[i].?;
@@ -139,11 +118,11 @@ pub const Flusher = struct {
     }
 
     pub fn deinit(self: *Flusher, alloc: Allocator) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(io);
         self.stop.store(true, .monotonic);
-        self.empty_cv.broadcast();
-        self.full_cv.broadcast();
-        self.mutex.unlock();
+        self.empty_cv.broadcast(io);
+        self.full_cv.broadcast(io);
+        self.mutex.unlock(io);
 
         self.thread.join();
 

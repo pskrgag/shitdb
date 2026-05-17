@@ -2,16 +2,17 @@ const std = @import("std");
 const MemTable = @import("storage").MemTable;
 const MemTableOpts = @import("storage").MemTableOpts;
 const Flusher = @import("flusher.zig").Flusher;
-const fs = std.fs;
+const fs = std.Io.Dir;
+const io = std.Options.debug_io;
 const Allocator = std.mem.Allocator;
-const Mutex = std.Thread.Mutex;
+const Mutex = std.Io.Mutex;
 const Version = @import("version.zig").Version;
 
 pub const Manager = struct {
     // Active MemTable
     active: std.atomic.Value(*MemTable),
     // Root folder
-    root: fs.Dir,
+    root: fs,
     // Root path
     path: []const u8,
     // Mutex that protects new table creation
@@ -25,7 +26,7 @@ pub const Manager = struct {
 
     const Self = @This();
 
-    pub fn new(dir: fs.Dir, path: []const u8, alloc: Allocator, opts: ?MemTableOpts) !Self {
+    pub fn new(dir: fs, path: []const u8, alloc: Allocator, opts: ?MemTableOpts) !Self {
         const version = try Version.from_file(dir, "MANIFEST", alloc);
 
         return .{
@@ -33,15 +34,15 @@ pub const Manager = struct {
             .active = std.atomic.Value(*MemTable).init(try MemTable.new(alloc, opts)),
             .path = path,
             .root = dir,
-            .new_table_lock = Mutex{},
+            .new_table_lock = Mutex.init,
             .opts = opts,
             .alloc = alloc,
         };
     }
 
     fn allocate_new_table(self: *Self, old: *MemTable, alloc: Allocator) !void {
-        self.new_table_lock.lock();
-        defer self.new_table_lock.unlock();
+        self.new_table_lock.lockUncancelable(io);
+        defer self.new_table_lock.unlock(io);
 
         if (self.active.load(.unordered) == old) {
             const new_table = try MemTable.new(alloc, self.opts);
@@ -106,8 +107,11 @@ pub const Manager = struct {
 
     pub fn deinit(self: *Self) void {
         // here we expect that no other user accesses data-base
-        self.active.load(.acquire).deinit(self.alloc);
+        const active = self.active.load(.acquire);
+
+        self.version.flush_memtable(active, self.root, self.alloc) catch @panic("failed to flush active memtable");
+        active.deinit(self.alloc);
         self.version.deinit(self.alloc);
-        self.root.close();
+        self.root.close(io);
     }
 };

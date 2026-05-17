@@ -6,6 +6,7 @@ const KeyValue = @import("memtable.zig").KeyValue;
 const KeyValueOwned = @import("memtable.zig").KeyValueOwned;
 const Allocator = std.mem.Allocator;
 const merging_iterator = @import("merging_iterator");
+const io = std.Options.debug_io;
 
 pub const BlockSize = 4 << 10;
 const Magic: usize = 0xdeadbeefdeadbaba;
@@ -258,6 +259,8 @@ pub const SSTable = struct {
                             }
                         }
                     }
+
+                    return .{ .offset = block.offset, .size = block.size };
                 },
                 .lt => {
                     // Found the block where to key may be present.
@@ -336,27 +339,29 @@ pub const SSTable = struct {
         return .{ .data = self.file[0..mt.index_offset] };
     }
 
-    pub fn open(dir: std.fs.Dir, name: []const u8) !Self {
-        const file = try dir.openFile(name, .{});
-        const stat = try file.stat();
+    pub fn open(dir: std.Io.Dir, name: []const u8) !Self {
+        const file = try dir.openFile(io, name, .{});
+        defer file.close(io);
 
-        const mmap = try std.posix.mmap(null, stat.size, std.posix.PROT.READ, .{ .TYPE = .SHARED }, file.handle, 0);
+        const stat = try file.stat(io);
+
+        const mmap = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
         return .{ .path = name, .file = mmap, .lvl = 0 };
     }
 
-    pub fn create(dir: std.fs.Dir, name: []const u8, tbl: *const MemTable, alloc: Allocator) !Self {
-        const file = try dir.createFile(name, .{
+    pub fn create(dir: std.Io.Dir, name: []const u8, tbl: *const MemTable, alloc: Allocator) !Self {
+        const file = try dir.createFile(io, name, .{
             .truncate = true,
             .read = true,
             .exclusive = true,
         });
-        defer file.close();
+        defer file.close(io);
 
         // Resize file to reduce I/O and use mmap
         const total_size = Self.calculate_file_size(tbl);
-        try file.setEndPos(total_size);
+        try file.setLength(io, total_size);
 
-        var mmap = try std.posix.mmap(null, total_size, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED }, file.handle, 0);
+        var mmap = try std.posix.mmap(null, total_size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, file.handle, 0);
         const mmap_copy = mmap;
 
         var values_meta = try Self.write_values(tbl, @ptrCast(&mmap), alloc);
@@ -390,21 +395,21 @@ pub const SSTable = struct {
         return .NotFound;
     }
 
-    pub fn merge(dir: *std.fs.Dir, name: []const u8, self: Self, other: Self) !Self {
+    pub fn merge(dir: *std.Io.Dir, name: []const u8, self: Self, other: Self) !Self {
         const iters = [_]merging_iterator.IteratorWrapper(KeyValue){ self.iterator(), other.iterator() };
         const iter = merging_iterator.MergeIterator(KeyValue).new(iters);
-        const file = try dir.createFile(name, .{
+        const file = try dir.createFile(io, name, .{
             .truncate = true,
             .read = true,
         });
-        defer file.close();
+        defer file.close(io);
 
         std.debug.assert(self.lvl == other.lvl);
 
         const total_size = self.file.len + other.file.len;
-        try file.setEndPos(total_size);
+        try file.setLength(io, total_size);
 
-        var mmap = try std.posix.mmap(null, total_size, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .SHARED }, file.handle, 0);
+        var mmap = try std.posix.mmap(null, total_size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, file.handle, 0);
         const mmap_copy = mmap;
 
         while (iter.next()) |key| {
@@ -438,22 +443,22 @@ fn repeatChar(allocator: std.mem.Allocator, char: u8, count: usize) ![]u8 {
 }
 
 test "Simple find and create" {
-    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    var arena = std.heap.DebugAllocator(.{}){};
     defer {
         _ = arena.deinit();
     }
     const allocator = arena.allocator();
 
-    const cwd = std.fs.cwd();
-    try cwd.makePath("test_db");
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, "test_db");
     defer {
-        std.fs.cwd().deleteTree("test_db") catch {
+        std.Io.Dir.cwd().deleteTree(io, "test_db") catch {
             @panic("gg");
         };
     }
 
-    var dir = try cwd.openDir("test_db", .{});
-    defer dir.close();
+    var dir = try cwd.openDir(io, "test_db", .{});
+    defer dir.close(io);
 
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
@@ -501,22 +506,22 @@ test "Simple find and create" {
 }
 
 test "Merge" {
-    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    var arena = std.heap.DebugAllocator(.{}){};
     defer {
         _ = arena.deinit();
     }
     const allocator = arena.allocator();
 
-    const cwd = std.fs.cwd();
-    try cwd.makePath("test_db");
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, "test_db");
     defer {
-        std.fs.cwd().deleteTree("test_db") catch {
+        std.Io.Dir.cwd().deleteTree(io, "test_db") catch {
             @panic("gg");
         };
     }
 
-    var dir = try cwd.openDir("test_db", .{});
-    defer dir.close();
+    var dir = try cwd.openDir(io, "test_db", .{});
+    defer dir.close(io);
 
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
@@ -542,21 +547,21 @@ test "Merge" {
 }
 
 test "Remove" {
-    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    var arena = std.heap.DebugAllocator(.{}){};
     defer {
         _ = arena.deinit();
     }
     const allocator = arena.allocator();
 
-    const cwd = std.fs.cwd();
-    try cwd.makePath("test_db");
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, "test_db");
     defer {
-        std.fs.cwd().deleteTree("test_db") catch {
+        std.Io.Dir.cwd().deleteTree(io, "test_db") catch {
             @panic("gg");
         };
     }
-    var dir = try cwd.openDir("test_db", .{});
-    defer dir.close();
+    var dir = try cwd.openDir(io, "test_db", .{});
+    defer dir.close(io);
 
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
@@ -580,21 +585,21 @@ test "Remove" {
 }
 
 test "Remove more than one block" {
-    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    var arena = std.heap.DebugAllocator(.{}){};
     defer {
         _ = arena.deinit();
     }
     const allocator = arena.allocator();
 
-    const cwd = std.fs.cwd();
-    try cwd.makePath("test_db");
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, "test_db");
     defer {
-        std.fs.cwd().deleteTree("test_db") catch {
+        std.Io.Dir.cwd().deleteTree(io, "test_db") catch {
             @panic("gg");
         };
     }
-    var dir = try cwd.openDir("test_db", .{});
-    defer dir.close();
+    var dir = try cwd.openDir(io, "test_db", .{});
+    defer dir.close(io);
 
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);

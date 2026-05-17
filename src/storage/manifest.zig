@@ -2,7 +2,7 @@ const std = @import("std");
 const utils = @import("utils.zig");
 const KeyValueOwned = @import("memtable.zig").KeyValueOwned;
 const KeyValue = @import("memtable.zig").KeyValue;
-const Writer = std.fs.File.Writer;
+const Writer = std.Io.File.Writer;
 const Allocator = std.mem.Allocator;
 const data_as_u8_const_ptr = utils.data_as_u8_const_ptr;
 
@@ -16,6 +16,12 @@ pub const FileMeta = struct {
     min: KeyValueOwned,
     lvl: u8,
     seq: usize,
+
+    pub fn deinit(self: *FileMeta, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.max.deinit(alloc);
+        self.min.deinit(alloc);
+    }
 
     pub fn less_than(ctx: void, lhs: FileMeta, rhs: FileMeta) bool {
         _ = ctx;

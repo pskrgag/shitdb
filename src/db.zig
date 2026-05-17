@@ -4,15 +4,17 @@ const MemTable = @import("storage").MemTable;
 const MemTableOpts = @import("storage").MemTableOpts;
 const Manager = @import("db/manager.zig").Manager;
 const test_utils = @import("test_utils");
-const fs = std.fs;
+const Dir = std.Io.Dir;
+const io = std.Options.debug_io;
 
-fn openOrCreateDir(path: []const u8) !std.fs.Dir {
-    const opts = fs.Dir.OpenOptions{ .iterate = true };
+fn openOrCreateDir(path: []const u8) !Dir {
+    const cwd = Dir.cwd();
+    const opts = Dir.OpenOptions{ .iterate = true };
 
-    return std.fs.cwd().openDir(path, opts) catch |err| switch (err) {
+    return cwd.openDir(io, path, opts) catch |err| switch (err) {
         error.FileNotFound => {
-            try std.fs.cwd().makeDir(path);
-            return try std.fs.cwd().openDir(path, opts);
+            try cwd.createDir(io, path, .default_dir);
+            return try cwd.openDir(io, path, opts);
         },
         else => return err,
     };
@@ -58,7 +60,7 @@ pub const KeyValue = struct {
 };
 
 test "Simple API Test" {
-    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    var arena = std.heap.DebugAllocator(.{}){};
     defer {
         _ = arena.deinit();
     }
@@ -67,7 +69,7 @@ test "Simple API Test" {
     var new = try KeyValue.new("test_db2", allocator, null);
     defer {
         new.deinit();
-        std.fs.cwd().deleteTree("test_db2") catch {
+        std.Io.Dir.cwd().deleteTree(io, "test_db2") catch {
             @panic("gg");
         };
     }
@@ -97,9 +99,41 @@ test "Test more than one memtable" {
 
     defer {
         tb.deinit();
-        std.fs.cwd().deleteTree("test_db1") catch {
+        std.Io.Dir.cwd().deleteTree(io, "test_db1") catch {
             @panic("gg");
         };
     }
     try test_utils.test_hash_table_equavalance(tb, false, 500);
+}
+
+test "Shutdown and then boot" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {};
+    var old = try KeyValue.new("test_db3", allocator, null);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {
+            @panic("gg");
+        };
+    }
+
+    inline for (1..200) |i| {
+        try old.put("a" ** i, "a" ** i, allocator);
+    }
+
+    old.deinit();
+
+    var new = try KeyValue.new("test_db3", allocator, null);
+    defer new.deinit();
+
+    inline for (1..200) |i| {
+        const val = (try new.get("a" ** i, allocator)).?;
+        defer allocator.free(val);
+
+        try std.testing.expectEqualSlices(u8, val, "a" ** i);
+    }
 }

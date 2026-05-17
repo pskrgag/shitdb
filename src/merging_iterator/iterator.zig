@@ -100,7 +100,7 @@ const SliceIter = struct {
 };
 
 test "Basic" {
-    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    var arena = std.heap.DebugAllocator(.{}){};
     defer {
         _ = arena.deinit();
     }
@@ -144,7 +144,7 @@ test "Basic" {
 }
 
 test "Zig-zag" {
-    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    var arena = std.heap.DebugAllocator(.{}){};
     defer {
         _ = arena.deinit();
     }

@@ -1,14 +1,15 @@
 const std = @import("std");
-const File = std.fs.File;
+const File = std.Io.File;
 const MemTable = @import("storage").MemTable;
 const SSTable = @import("storage").sstable.SSTable;
 const manifest = @import("storage").manifest;
 const Flusher = @import("flusher.zig").Flusher;
 const Allocator = std.mem.Allocator;
 const KeyValueOwned = @import("storage").KeyValueOwned;
-const Mutex = std.Thread.Mutex;
+const Mutex = std.Io.Mutex;
 const Value = std.atomic.Value;
 const FileMeta = @import("storage").manifest.FileMeta;
+const io = std.Options.debug_io;
 
 pub const Version = struct {
     // File handle
@@ -37,10 +38,11 @@ pub const Version = struct {
             try rec.serialize_to(&serialized_records, alloc);
         }
 
-        try self.file.writeAll(serialized_records.items);
+        const offset = try self.file.length(io);
+        try self.file.writePositionalAll(io, serialized_records.items, offset);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         for (edit.new_files.items) |file| {
             try self.tables.append(alloc, file);
@@ -67,14 +69,15 @@ pub const Version = struct {
         return res;
     }
 
-    pub fn from_file(dir: std.fs.Dir, path: []const u8, alloc: Allocator) !*Self {
-        const file = dir.openFile(path, .{ .mode = .read_write }) catch |err| switch (err) {
-            error.FileNotFound => try dir.createFile(path, .{ .read = true }),
+    pub fn from_file(dir: std.Io.Dir, path: []const u8, alloc: Allocator) !*Self {
+        const file = dir.openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => try dir.createFile(io, path, .{ .read = true }),
             else => return err,
         };
-        const stat = try file.stat();
+        errdefer file.close(io);
+
+        const stat = try file.stat(io);
         const size = stat.size;
-        const empty = size == 0;
         const res = try alloc.create(Self);
 
         res.* = .{
@@ -83,29 +86,24 @@ pub const Version = struct {
             .tables = try std.ArrayList(FileMeta).initCapacity(alloc, 0),
             .next_file = Value(usize).init(0),
             .next_sequence = Value(usize).init(0),
-            .mutex = Mutex{},
+            .mutex = Mutex.init,
         };
         errdefer res.deinit(alloc);
 
-        if (size > 1) {
+        if (size > 0) {
             const mmap = try std.posix.mmap(
                 null,
                 size,
-                std.posix.PROT.READ | std.posix.PROT.WRITE,
+                .{ .READ = true, .WRITE = true },
                 .{ .TYPE = .SHARED },
                 file.handle,
                 0,
             );
             defer std.posix.munmap(mmap);
 
-            const rep = try manifest.ManifestRecord.deserialize_from(mmap, alloc);
+            var rep = try manifest.ManifestRecord.deserialize_from(mmap, alloc);
+            defer rep.deinit(alloc);
             try res.replay(rep, alloc);
-        }
-
-        if (empty) {
-            try file.seekTo(0);
-        } else {
-            try file.seekFromEnd(0);
         }
 
         return res;
@@ -116,8 +114,36 @@ pub const Version = struct {
         self.flusher.insert(table);
     }
 
+    // Flushes a memtable synchronously into an SSTable and records it in the manifest.
+    pub fn flush_memtable(self: *Version, table: *MemTable, dir: std.Io.Dir, alloc: Allocator) !void {
+        if (table.min() == null)
+            return;
+
+        const min = try KeyValueOwned.from_kv(table.min().?, alloc);
+        const max = try KeyValueOwned.from_kv(table.max().?, alloc);
+        var seq: usize = 0;
+
+        const file_name = try self.new_file(alloc, &seq);
+        var edit = try VersionEdit.empty(alloc);
+        defer edit.new_files.deinit(alloc);
+
+        try edit.new_files.append(alloc, FileMeta{
+            .lvl = 0,
+            .name = file_name,
+            .max = max,
+            .min = min,
+            .seq = seq,
+        });
+        edit.next_file = seq + 1;
+
+        var sstable = try SSTable.create(dir, file_name, table, alloc);
+        defer sstable.deinit();
+
+        try self.apply(edit, alloc);
+    }
+
     // Resolves value request.
-    pub fn get(self: *Self, key: []const u8, dir: std.fs.Dir, alloc: Allocator) !?[]u8 {
+    pub fn get(self: *Self, key: []const u8, dir: std.Io.Dir, alloc: Allocator) !?[]u8 {
         // Resolved from immutable table
         if (try self.flusher.get(key, self.current_seq(), alloc)) |val| {
             var res = try std.ArrayList(u8).initCapacity(alloc, val.len);
@@ -130,11 +156,12 @@ pub const Version = struct {
         return self.search_disk(key, dir, alloc);
     }
 
-    fn search_disk(self: *Self, key: []const u8, dir: std.fs.Dir, alloc: Allocator) !?[]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn search_disk(self: *Self, key: []const u8, dir: std.Io.Dir, alloc: Allocator) !?[]u8 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         var candidates = try std.ArrayList(FileMeta).initCapacity(alloc, self.tables.items.len);
+        defer candidates.deinit(alloc);
 
         for (self.tables.items) |table| {
             const min = table.min.as_kv().as_key();
@@ -153,7 +180,8 @@ pub const Version = struct {
         std.mem.sort(FileMeta, candidates.items, {}, FileMeta.less_than);
 
         for (candidates.items) |table| {
-            const ss = try SSTable.open(dir, table.name);
+            var ss = try SSTable.open(dir, table.name);
+            defer ss.deinit();
             const value = try ss.find_value(key, alloc);
 
             switch (value) {
@@ -177,6 +205,10 @@ pub const Version = struct {
                 .NextSeqNumber => |next| self.next_sequence.store(next, .monotonic),
                 .AddFile => |f| {
                     try self.tables.append(alloc, f);
+                    while (self.next_file.load(.monotonic) <= f.seq) {
+                        const current = self.next_file.load(.monotonic);
+                        _ = self.next_file.cmpxchgWeak(current, f.seq + 1, .monotonic, .monotonic) orelse break;
+                    }
                 },
                 .DeleteFile => |f| {
                     for (self.tables.items, 0..) |file, idx| {
@@ -195,8 +227,12 @@ pub const Version = struct {
 
     // De-initializes version
     pub fn deinit(self: *Version, alloc: Allocator) void {
+        for (self.tables.items) |*table| {
+            table.deinit(alloc);
+        }
         self.tables.deinit(alloc);
         self.flusher.deinit(alloc);
+        self.file.close(io);
         alloc.destroy(self);
     }
 };
@@ -237,20 +273,20 @@ pub const VersionEdit = struct {
 };
 
 test "Version serialization" {
-    var arena = std.heap.GeneralPurposeAllocator(.{}){};
+    var arena = std.heap.DebugAllocator(.{}){};
     defer {
         _ = arena.deinit();
     }
     const allocator = arena.allocator();
 
     const dirname = "test_db10";
-    try std.fs.cwd().makeDir(dirname);
+    try std.Io.Dir.cwd().createDir(io, dirname, .default_dir);
 
-    var dir = try std.fs.cwd().openDir(dirname, .{});
+    var dir = try std.Io.Dir.cwd().openDir(io, dirname, .{});
 
     defer {
-        dir.close();
-        std.fs.cwd().deleteTree(dirname) catch {
+        dir.close(io);
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
             @panic("gg");
         };
     }
@@ -260,6 +296,7 @@ test "Version serialization" {
 
     {
         var edit = try VersionEdit.empty(allocator);
+        defer edit.new_files.deinit(allocator);
         edit.next_seq = 1;
         try version.apply(edit, allocator);
     }
@@ -282,7 +319,7 @@ fn test_file_meta(
     try memtable.put(max_key, max_value, seq + 1);
 
     return .{
-        .name = name,
+        .name = try alloc.dupe(u8, name),
         .lvl = lvl,
         .seq = seq,
         .min = try KeyValueOwned.from_kv(memtable.min().?, alloc),
@@ -334,13 +371,13 @@ test "Version apply persists edits that reopen can replay" {
     const allocator = arena.allocator();
 
     const dirname = "test_db_version_replay";
-    std.fs.cwd().deleteTree(dirname) catch {};
-    try std.fs.cwd().makeDir(dirname);
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+    try std.Io.Dir.cwd().createDir(io, dirname, .default_dir);
 
-    var dir = try std.fs.cwd().openDir(dirname, .{});
+    var dir = try std.Io.Dir.cwd().openDir(io, dirname, .{});
     defer {
-        dir.close();
-        std.fs.cwd().deleteTree(dirname) catch {
+        dir.close(io);
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
             @panic("failed to delete test db");
         };
     }
@@ -350,6 +387,7 @@ test "Version apply persists edits that reopen can replay" {
         defer version.deinit(allocator);
 
         var edit = try VersionEdit.empty(allocator);
+        defer edit.new_files.deinit(allocator);
         edit.next_seq = 9;
         edit.next_file = 11;
         try edit.new_files.append(allocator, try test_file_meta(
@@ -371,7 +409,7 @@ test "Version apply persists edits that reopen can replay" {
         defer reopened.deinit(allocator);
 
         try std.testing.expectEqual(@as(usize, 9), reopened.current_seq());
-        try std.testing.expectEqual(@as(usize, 11), reopened.next_file.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 12), reopened.next_file.load(.monotonic));
         try std.testing.expectEqual(@as(usize, 1), reopened.tables.items.len);
         try std.testing.expectEqualSlices(u8, "memtable11.sst", reopened.tables.items[0].name);
     }

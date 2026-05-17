@@ -83,11 +83,11 @@ pub fn test_hash_table_equavalance(c: anytype, debug: bool, steps: usize) !void 
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const seed = std.time.timestamp();
-    var prng = std.Random.DefaultPrng.init(@bitCast(seed));
+    const seed: u64 = 0x1234_5678_9abc_def0;
+    var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
 
-    var table = std.StringArrayHashMap([]const u8).init(allocator);
+    var table = std.StringHashMap([]const u8).init(allocator);
     var inserted_pairs = try InsertedValues.initCapacity(allocator, 0);
     var seq: usize = 0;
 
@@ -155,7 +155,7 @@ pub fn test_hash_table_equavalance(c: anytype, debug: bool, steps: usize) !void 
                     else => @compileError("ohh"),
                 }
 
-                _ = table.swapRemove(rm.key.items);
+                _ = table.remove(rm.key.items);
             },
         }
 

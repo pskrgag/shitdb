@@ -19,7 +19,7 @@ fn compare_same(Key: type, lhs: Key, rhs: Key) std.math.Order {
                 @compileError("todo " ++ @typeName(ptr.child));
             }
         },
-        .@"struct" => |_| {
+        .@"struct" => {
             if (@hasDecl(Key, "cmp")) {
                 return lhs.cmp(&rhs);
             } else {
@@ -47,7 +47,7 @@ pub fn compare_keys(Key: type, Other: type, lhs: Key, rhs: Other) std.math.Order
         return compare_same(Key, lhs, rhs);
     } else {
         return switch (@typeInfo(Key)) {
-            .@"struct" => |_| {
+            .@"struct" => {
                 const suffix = blk: {
                     switch (@typeInfo(Other)) {
                         .pointer => |ptr| {
