@@ -194,4 +194,27 @@ pub fn test_hash_table_equavalance(c: anytype, debug: bool, steps: usize) !void 
             }
         }
     }
+
+    // This is INSANE HACK for my own sanity.
+    //
+    // Here is a catch: we allocate/remove entries using allocator that is valid only in scope of current function.
+    // So we need to call .deinit() here, since otherwise some internal allocations could be already freed.
+    //
+    // So this is a hack for Manager.
+    //
+    // SANE SOLUTION: accept constructor arguments and construct the whole thing here. But I am too lazy =)
+    const fn_type = switch (@typeInfo(@TypeOf(container))) {
+        .pointer => @typeInfo(@TypeOf(@TypeOf(container.*).deinit)),
+        else => @typeInfo(@TypeOf(@TypeOf(container).deinit)),
+    };
+
+    switch (fn_type) {
+        .@"fn" => |f| {
+            switch (f.params.len) {
+                1 => container.deinit(),
+                else => {},
+            }
+        },
+        else => @compileError("ohh"),
+    }
 }

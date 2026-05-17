@@ -91,18 +91,19 @@ test "Test more than one memtable" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var tb = try KeyValue.new(
+    const tb = try KeyValue.new(
         "test_db1",
         allocator,
         KeyValueOptions{ .memtable = .{ .memtable_size = 1000 } },
     );
 
     defer {
-        tb.deinit();
         std.Io.Dir.cwd().deleteTree(io, "test_db1") catch {
             @panic("gg");
         };
     }
+
+    // deinit will be called inside test_hash_table_equavalance. I HATE ZIG, it's even worse than C.
     try test_utils.test_hash_table_equavalance(tb, false, 500);
 }
 

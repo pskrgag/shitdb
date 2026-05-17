@@ -112,7 +112,10 @@ pub const Manager = struct {
         // here we expect that no other user accesses data-base
         const active = self.active.load(.acquire);
 
-        self.version.flush_memtable(active, self.root, self.alloc) catch @panic("failed to flush active memtable");
+        self.version.flush_memtable(active, self.root, self.alloc) catch {
+            @panic("failed to flush active memtable");
+        };
+
         active.deinit(self.alloc);
         self.version.deinit(self.alloc);
         self.root.close(io);

@@ -49,9 +49,9 @@ pub const Version = struct {
             try self.tables.append(alloc, file);
         }
 
-        if (edit.next_file) |next_file| {
-            self.next_file = Value(usize).init(next_file);
-        }
+        // if (edit.next_file) |next_file| {
+        //     self.next_file = Value(usize).init(next_file);
+        // }
     }
 
     pub fn next_seq(self: *Self) usize {
@@ -64,14 +64,6 @@ pub const Version = struct {
 
     pub fn new_file_seq(self: *Self) usize {
         return self.next_file.fetchAdd(1, .monotonic);
-    }
-
-    pub fn new_file(self: *Self, alloc: Allocator, seq: *usize) ![]const u8 {
-        const s = self.next_file.fetchAdd(1, .monotonic);
-        const res = std.fmt.allocPrint(alloc, "memtable{}.sst", .{s});
-
-        seq.* = s;
-        return res;
     }
 
     pub fn from_file(dir: std.Io.Dir, path: []const u8, alloc: Allocator) !*Self {
@@ -119,6 +111,11 @@ pub const Version = struct {
         self.flusher.insert(table);
     }
 
+    fn file_name(seq: usize, alloc: Allocator) ![]const u8 {
+        const res = std.fmt.allocPrint(alloc, "memtable{}.sst", .{seq});
+        return res;
+    }
+
     // Flushes a memtable synchronously into an SSTable and records it in the manifest.
     pub fn flush_memtable(self: *Version, table: *WalTable, dir: std.Io.Dir, alloc: Allocator) !void {
         if (table.min() == null)
@@ -126,23 +123,22 @@ pub const Version = struct {
 
         const min = try KeyValueOwned.from_kv(table.min().?, alloc);
         const max = try KeyValueOwned.from_kv(table.max().?, alloc);
-        var seq: usize = 0;
 
-        const file_name = try self.new_file(alloc, &seq);
+        const name = try Self.file_name(table.seq, alloc);
         var edit = try VersionEdit.empty(alloc);
         defer edit.new_files.deinit(alloc);
 
         try edit.new_files.append(alloc, FileMeta{
             .lvl = 0,
-            .name = file_name,
+            .name = name,
             .max = max,
             .min = min,
-            .seq = seq,
+            .seq = table.seq,
         });
-        edit.next_file = seq + 1;
+        edit.next_file = table.seq + 1;
 
         // TODO: maybe make SSTable::create generic over table type? Accessing table.table is ugly af.
-        var sstable = try SSTable.create(dir, file_name, &table.table, alloc);
+        var sstable = try SSTable.create(dir, name, &table.table, alloc);
         defer sstable.deinit();
 
         try self.apply(edit, alloc);
