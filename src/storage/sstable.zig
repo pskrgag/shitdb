@@ -361,7 +361,14 @@ pub const SSTable = struct {
         const total_size = Self.calculate_file_size(tbl);
         try file.setLength(io, total_size);
 
-        var mmap = try std.posix.mmap(null, total_size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, file.handle, 0);
+        var mmap = try std.posix.mmap(
+            null,
+            total_size,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
+            file.handle,
+            0,
+        );
         const mmap_copy = mmap;
 
         var values_meta = try Self.write_values(tbl, @ptrCast(&mmap), alloc);
@@ -469,7 +476,7 @@ test "Simple find and create" {
         try tb.put("a" ** i, "a" ** i, 0);
     }
 
-    var table = try SSTable.create(dir, name, tb, allocator);
+    var table = try SSTable.create(dir, name, &tb, allocator);
     defer table.deinit();
     const to_find = [_][]const u8{ "a" ** 1, "a" ** 20, "a" ** 51, "a" ** 100, "a" ** 150, "a" ** 132 };
 
@@ -531,7 +538,7 @@ test "Merge" {
     inline for (1..200) |i| {
         try tb.put("a" ** (i * 2 + 1), "a" ** (i * 2 + 1), i);
     }
-    var table = try SSTable.create(dir, name, tb, allocator);
+    var table = try SSTable.create(dir, name, &tb, allocator);
     defer table.deinit();
 
     var tb1 = try MemTable.new(allocator, null);
@@ -542,7 +549,7 @@ test "Merge" {
     }
     const name1 = try generate_lvl_name(allocator, 201);
     defer allocator.free(name1);
-    var table1 = try SSTable.create(dir, name1, tb, allocator);
+    var table1 = try SSTable.create(dir, name1, &tb, allocator);
     defer table1.deinit();
 }
 
@@ -571,7 +578,7 @@ test "Remove" {
     try tb.put("b" ** 10, "b" ** 10, 1);
     try tb.remove("b" ** 10, 2);
 
-    var table = try SSTable.create(dir, name, tb, allocator);
+    var table = try SSTable.create(dir, name, &tb, allocator);
     defer table.deinit();
 
     const val = try table.find_value("b" ** 10, allocator);
@@ -612,7 +619,7 @@ test "Remove more than one block" {
     {
         const name = try generate_lvl_name(allocator, 0);
         defer allocator.free(name);
-        var table = try SSTable.create(dir, name, tb, allocator);
+        var table = try SSTable.create(dir, name, &tb, allocator);
         defer table.deinit();
 
         const val = try table.find_value("b" ** (BlockSize / 4), allocator);
@@ -634,7 +641,7 @@ test "Remove more than one block" {
 
         try tb.remove("b" ** (BlockSize / 4), 5);
 
-        var table = try SSTable.create(dir, name, tb, allocator);
+        var table = try SSTable.create(dir, name, &tb, allocator);
         defer table.deinit();
 
         const val = try table.find_value("b" ** (BlockSize / 4), allocator);

@@ -168,19 +168,17 @@ pub const MemTable = struct {
 
     const Self = @This();
 
-    pub fn new(alloc: Allocator, user_opts: ?MemTableOpts) !*Self {
+    pub fn new(alloc: Allocator, user_opts: ?MemTableOpts) !Self {
         const opts = user_opts orelse MemTableOpts.default();
-        var self = try alloc.create(Self);
-
-        self.arena = try Arena.new(alloc, opts.memtable_size);
+        const arena = try Arena.new(alloc, opts.memtable_size);
 
         // TODO: oh, this is weird place. Actually it would be cool to reuse self.arena. However, it's not
         // really fair, since skiplist is utility memory and should not really count. Node itself can take a lot
         // of memory.
         //
         // So here I just try to guess enough memory for skiplist itself.
-        self.table = try skiplist.SkipList(KeyValue).new(alloc, opts.memtable_size * 10);
-        return self;
+        const table = try skiplist.SkipList(KeyValue).new(alloc, opts.memtable_size * 10);
+        return .{ .arena = arena, .table = table };
     }
 
     /// Inserts new value into MemTable
@@ -237,7 +235,6 @@ pub const MemTable = struct {
     pub fn deinit(self: *Self, alloc: Allocator) void {
         self.table.deinit(alloc);
         self.arena.deinit(alloc);
-        alloc.destroy(self);
     }
 };
 

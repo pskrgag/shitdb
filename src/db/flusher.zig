@@ -9,12 +9,13 @@ const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 const SSTable = @import("storage").sstable.SSTable;
 const io = std.Options.debug_io;
+const WalTable = @import("wal_table.zig").WalTable;
 
 const MaxNumTables: usize = 5;
 
 pub const Flusher = struct {
     // List of full memtables
-    list: [MaxNumTables]?*MemTable,
+    list: [MaxNumTables]?*WalTable,
     // Number of tables
     count: usize,
     // Flusher thread
@@ -79,7 +80,7 @@ pub const Flusher = struct {
         return flusher;
     }
 
-    pub fn insert(self: *Flusher, table: *MemTable) void {
+    pub fn insert(self: *Flusher, table: *WalTable) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
 
@@ -102,7 +103,7 @@ pub const Flusher = struct {
         defer self.mutex.unlock(io);
 
         for (0..self.count) |i| {
-            const table: *MemTable = self.list[i].?;
+            const table: *WalTable = self.list[i].?;
             const val = try table.get(key, seq, alloc);
 
             switch (val) {

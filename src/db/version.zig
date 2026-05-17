@@ -10,6 +10,7 @@ const Mutex = std.Io.Mutex;
 const Value = std.atomic.Value;
 const FileMeta = @import("storage").manifest.FileMeta;
 const io = std.Options.debug_io;
+const WalTable = @import("wal_table.zig").WalTable;
 
 pub const Version = struct {
     // File handle
@@ -61,6 +62,10 @@ pub const Version = struct {
         return self.next_sequence.load(.monotonic);
     }
 
+    pub fn new_file_seq(self: *Self) usize {
+        return self.next_file.fetchAdd(1, .monotonic);
+    }
+
     pub fn new_file(self: *Self, alloc: Allocator, seq: *usize) ![]const u8 {
         const s = self.next_file.fetchAdd(1, .monotonic);
         const res = std.fmt.allocPrint(alloc, "memtable{}.sst", .{s});
@@ -110,12 +115,12 @@ pub const Version = struct {
     }
 
     // Inserts new immutable memtable
-    pub fn insert(self: *Version, table: *MemTable) void {
+    pub fn insert(self: *Version, table: *WalTable) void {
         self.flusher.insert(table);
     }
 
     // Flushes a memtable synchronously into an SSTable and records it in the manifest.
-    pub fn flush_memtable(self: *Version, table: *MemTable, dir: std.Io.Dir, alloc: Allocator) !void {
+    pub fn flush_memtable(self: *Version, table: *WalTable, dir: std.Io.Dir, alloc: Allocator) !void {
         if (table.min() == null)
             return;
 
@@ -136,7 +141,8 @@ pub const Version = struct {
         });
         edit.next_file = seq + 1;
 
-        var sstable = try SSTable.create(dir, file_name, table, alloc);
+        // TODO: maybe make SSTable::create generic over table type? Accessing table.table is ugly af.
+        var sstable = try SSTable.create(dir, file_name, &table.table, alloc);
         defer sstable.deinit();
 
         try self.apply(edit, alloc);
@@ -205,21 +211,24 @@ pub const Version = struct {
                 .NextSeqNumber => |next| self.next_sequence.store(next, .monotonic),
                 .AddFile => |f| {
                     try self.tables.append(alloc, f);
+
                     while (self.next_file.load(.monotonic) <= f.seq) {
-                        const current = self.next_file.load(.monotonic);
-                        _ = self.next_file.cmpxchgWeak(current, f.seq + 1, .monotonic, .monotonic) orelse break;
+                        self.next_file.store(f.seq + 1, .monotonic);
                     }
                 },
                 .DeleteFile => |f| {
+                    var found = false;
+
                     for (self.tables.items, 0..) |file, idx| {
                         if (file.seq == f.seq and file.lvl == f.lvl) {
                             _ = self.tables.swapRemove(idx);
-                            continue;
+                            found = true;
+                            break;
                         }
                     }
 
                     // File was not created??
-                    std.debug.assert(false);
+                    std.debug.assert(found);
                 },
             }
         }
@@ -230,6 +239,7 @@ pub const Version = struct {
         for (self.tables.items) |*table| {
             table.deinit(alloc);
         }
+
         self.tables.deinit(alloc);
         self.flusher.deinit(alloc);
         self.file.close(io);

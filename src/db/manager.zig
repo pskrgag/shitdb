@@ -7,10 +7,11 @@ const io = std.Options.debug_io;
 const Allocator = std.mem.Allocator;
 const Mutex = std.Io.Mutex;
 const Version = @import("version.zig").Version;
+const WalTable = @import("wal_table.zig").WalTable;
 
 pub const Manager = struct {
     // Active MemTable
-    active: std.atomic.Value(*MemTable),
+    active: std.atomic.Value(*WalTable),
     // Root folder
     root: fs,
     // Root path
@@ -28,10 +29,11 @@ pub const Manager = struct {
 
     pub fn new(dir: fs, path: []const u8, alloc: Allocator, opts: ?MemTableOpts) !Self {
         const version = try Version.from_file(dir, "MANIFEST", alloc);
+        const new_file_seq = version.new_file_seq();
 
         return .{
             .version = version,
-            .active = std.atomic.Value(*MemTable).init(try MemTable.new(alloc, opts)),
+            .active = std.atomic.Value(*WalTable).init(try WalTable.new(dir, opts, new_file_seq, alloc)),
             .path = path,
             .root = dir,
             .new_table_lock = Mutex.init,
@@ -40,12 +42,13 @@ pub const Manager = struct {
         };
     }
 
-    fn allocate_new_table(self: *Self, old: *MemTable, alloc: Allocator) !void {
+    fn allocate_new_table(self: *Self, old: *WalTable, alloc: Allocator) !void {
         self.new_table_lock.lockUncancelable(io);
         defer self.new_table_lock.unlock(io);
 
         if (self.active.load(.unordered) == old) {
-            const new_table = try MemTable.new(alloc, self.opts);
+            const new_file_seq = self.version.new_file_seq();
+            const new_table = try WalTable.new(self.root, self.opts, new_file_seq, alloc);
 
             // Put current table into the flusher
             self.version.insert(old);
