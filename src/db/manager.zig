@@ -34,7 +34,9 @@ pub const Manager = struct {
 
         return .{
             .version = version,
-            .active = std.atomic.Value(*WalTable).init(try WalTable.new(dir, opts, new_file_seq, io, alloc)),
+            .active = std.atomic.Value(*WalTable).init(
+                try WalTable.new(dir, opts, new_file_seq, io, alloc),
+            ),
             .path = path,
             .root = dir,
             .new_table_lock = Mutex.init,

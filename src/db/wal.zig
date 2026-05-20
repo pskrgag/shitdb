@@ -2,7 +2,6 @@ const std = @import("std");
 const File = std.Io.File;
 const Dir = std.Io.Dir;
 const Allocator = std.mem.Allocator;
-const KeyValue = @import("storage").KeyValue;
 const Io = std.Io;
 const WalTable = @import("wal_table.zig").WalTable;
 
@@ -11,7 +10,11 @@ const RemoveMagic: u8 = 0x12;
 
 pub const WalEntry = union(enum) {
     // Added key value
-    Add: KeyValue,
+    Add: struct {
+        key: []const u8,
+        value: []const u8,
+        seq: usize,
+    },
 
     // Removed key
     Remove: struct {
@@ -21,7 +24,7 @@ pub const WalEntry = union(enum) {
 
     fn full_size(self: *const WalEntry) usize {
         return switch (*self) {
-            .Add => |add| add.full_size(),
+            .Add => |add| @sizeOf(usize) + add.key.len + @sizeOf(usize) + add.value.len + @sizeOf(usize),
             .Remove => |rem| rem.key.len + @sizeOf(usize),
         };
     }
@@ -58,11 +61,12 @@ pub const Wal = struct {
 
         switch (entry) {
             .Add => |add| {
-                const data = add.as_slice();
-
                 try w.writeAll(&std.mem.toBytes(AddMagic));
-                try w.writeAll(&std.mem.toBytes(data.len));
-                try w.writeAll(data);
+                try w.writeAll(&std.mem.toBytes(add.key.len));
+                try w.writeAll(add.key);
+                try w.writeAll(&std.mem.toBytes(add.value.len));
+                try w.writeAll(add.value);
+                try w.writeAll(&std.mem.toBytes(add.seq));
             },
             .Remove => |rem| {
                 try w.writeAll(&std.mem.toBytes(RemoveMagic));
@@ -93,43 +97,50 @@ pub const Wal = struct {
 
         while (iter != size) {
             const magic = mmap[iter];
-
-            std.debug.assert(iter < size);
+            iter += 1;
 
             if (size - iter < @sizeOf(usize))
                 return error.InvalidFormat;
 
-            iter += 1;
-
-            const sz = std.mem.readInt(usize, mmap[iter..][0..@sizeOf(usize)], .little);
+            const key_size = std.mem.readInt(usize, mmap[iter..][0..@sizeOf(usize)], .little);
             iter += @sizeOf(usize);
 
-            if (size - iter < sz)
+            if (size - iter < key_size)
                 return error.InvalidFormat;
+
+            const key = mmap[iter .. iter + key_size];
+            iter += key_size;
 
             switch (magic) {
                 AddMagic => {
-                    const kv = KeyValue.parse(mmap[iter .. iter + sz]) orelse return error.InvalidFormat;
-
-                    if (kv.full_size() > size - iter) {
+                    if (size - iter < @sizeOf(usize))
                         return error.InvalidFormat;
-                    }
 
-                    try to.put(kv.as_key(), kv.as_value().?, kv.as_seq());
+                    const value_size = std.mem.readInt(usize, mmap[iter..][0..@sizeOf(usize)], .little);
+                    iter += @sizeOf(usize);
 
-                    iter += kv.full_size();
-                    std.debug.assert(sz == kv.full_size());
+                    if (size - iter < value_size)
+                        return error.InvalidFormat;
+
+                    const value = mmap[iter .. iter + value_size];
+                    iter += value_size;
+
+                    if (size - iter < @sizeOf(usize))
+                        return error.InvalidFormat;
+
+                    const seq = std.mem.readInt(usize, mmap[iter..][0..@sizeOf(usize)], .little);
+                    iter += @sizeOf(usize);
+
+                    try to.put(key, value, seq);
                 },
                 RemoveMagic => {
-                    const key = mmap[iter .. iter + sz];
-
-                    if (size - iter - sz < @sizeOf(usize))
+                    if (size - iter < @sizeOf(usize))
                         return error.InvalidFormat;
 
-                    const seq = std.mem.readInt(usize, mmap[iter + sz ..][0..@sizeOf(usize)], .little);
+                    const seq = std.mem.readInt(usize, mmap[iter..][0..@sizeOf(usize)], .little);
+                    iter += @sizeOf(usize);
 
                     try to.remove(key, seq);
-                    iter += sz + @sizeOf(usize);
                 },
                 else => return error.InvalidFormat,
             }
@@ -213,22 +224,27 @@ test "WAL serializes add record" {
         };
     }
 
-    var memtable = try @import("storage").MemTable.new(allocator, null);
-    defer memtable.deinit(allocator);
-    try memtable.put("alpha", "one", 7);
-    const kv = memtable.min().?.*;
-
     var wal = try Wal.new(dir, 1, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = kv }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }, testing_io);
 
     const data = try readWalFile(dir, 1, allocator);
     defer allocator.free(data);
 
-    const payload = kv.as_slice();
-    try std.testing.expectEqual(AddMagic, data[0]);
-    try std.testing.expectEqual(payload.len, readUsize(data[1 .. 1 + @sizeOf(usize)]));
-    try std.testing.expectEqualSlices(u8, payload, data[1 + @sizeOf(usize) ..]);
+    var pos: usize = 0;
+    try std.testing.expectEqual(AddMagic, data[pos]);
+    pos += 1;
+    try std.testing.expectEqual(@as(usize, 5), readUsize(data[pos .. pos + @sizeOf(usize)]));
+    pos += @sizeOf(usize);
+    try std.testing.expectEqualSlices(u8, "alpha", data[pos .. pos + 5]);
+    pos += 5;
+    try std.testing.expectEqual(@as(usize, 3), readUsize(data[pos .. pos + @sizeOf(usize)]));
+    pos += @sizeOf(usize);
+    try std.testing.expectEqualSlices(u8, "one", data[pos .. pos + 3]);
+    pos += 3;
+    try std.testing.expectEqual(@as(usize, 7), readUsize(data[pos .. pos + @sizeOf(usize)]));
+    pos += @sizeOf(usize);
+    try std.testing.expectEqual(data.len, pos);
 }
 
 test "WAL serializes remove record" {
@@ -276,15 +292,9 @@ test "WAL serializes records in append order" {
         };
     }
 
-    var memtable = try @import("storage").MemTable.new(allocator, null);
-    defer memtable.deinit(allocator);
-    try memtable.put("alpha", "one", 7);
-    const kv = memtable.min().?.*;
-    const payload = kv.as_slice();
-
     var wal = try Wal.new(dir, 3, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = kv }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }, testing_io);
     try wal.record(.{ .Remove = .{ .key = "alpha", .seq = 8 } }, testing_io);
 
     const data = try readWalFile(dir, 3, allocator);
@@ -293,11 +303,16 @@ test "WAL serializes records in append order" {
     var pos: usize = 0;
     try std.testing.expectEqual(AddMagic, data[pos]);
     pos += 1;
-    const add_size = readUsize(data[pos .. pos + @sizeOf(usize)]);
-    try std.testing.expectEqual(payload.len, add_size);
+    try std.testing.expectEqual(@as(usize, 5), readUsize(data[pos .. pos + @sizeOf(usize)]));
     pos += @sizeOf(usize);
-    try std.testing.expectEqualSlices(u8, payload, data[pos .. pos + add_size]);
-    pos += add_size;
+    try std.testing.expectEqualSlices(u8, "alpha", data[pos .. pos + 5]);
+    pos += 5;
+    try std.testing.expectEqual(@as(usize, 3), readUsize(data[pos .. pos + @sizeOf(usize)]));
+    pos += @sizeOf(usize);
+    try std.testing.expectEqualSlices(u8, "one", data[pos .. pos + 3]);
+    pos += 3;
+    try std.testing.expectEqual(@as(usize, 7), readUsize(data[pos .. pos + @sizeOf(usize)]));
+    pos += @sizeOf(usize);
 
     try std.testing.expectEqual(RemoveMagic, data[pos]);
     pos += 1;
@@ -328,14 +343,9 @@ test "WAL replay restores add record into target table" {
         };
     }
 
-    var source = try @import("storage").MemTable.new(allocator, null);
-    defer source.deinit(allocator);
-    try source.put("alpha", "one", 7);
-    const kv = source.min().?.*;
-
     var wal = try Wal.new(dir, 4, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = kv }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }, testing_io);
 
     var target = try WalTable.new(dir, null, 5, testing_io, allocator);
     defer target.deinit(allocator);
@@ -395,14 +405,9 @@ test "WAL replay applies later remove over earlier add" {
         };
     }
 
-    var source = try @import("storage").MemTable.new(allocator, null);
-    defer source.deinit(allocator);
-    try source.put("alpha", "one", 7);
-    const kv = source.min().?.*;
-
     var wal = try Wal.new(dir, 8, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = kv }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }, testing_io);
     try wal.record(.{ .Remove = .{ .key = "alpha", .seq = 8 } }, testing_io);
 
     var target = try WalTable.new(dir, null, 9, testing_io, allocator);

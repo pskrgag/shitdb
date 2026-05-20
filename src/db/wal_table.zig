@@ -34,6 +34,9 @@ pub const WalTable = struct {
 
     /// Puts value from the memtable and records it into WAL
     pub fn put(self: *WalTable, key: []const u8, value: []const u8, seq: usize) !void {
+        const entry: WalEntry = .{ .Add = .{ .key = key, .value = value, .seq = seq } };
+
+        try self.wal.record(entry, self.io);
         try self.table.put(key, value, seq);
     }
 
