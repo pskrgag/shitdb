@@ -1,7 +1,6 @@
 const std = @import("std");
 const skiplist = @import("skiplist");
 const Arena = skiplist.Arena;
-const utils = @import("utils.zig");
 const Allocator = std.mem.Allocator;
 const Node = std.DoublyLinkedList.Node;
 const test_utils = @import("test_utils");
@@ -21,7 +20,7 @@ pub const KeyValueOwned = struct {
         const full_size = kv.full_size();
         const ptr = try alloc.alloc(u8, full_size);
 
-        @memcpy(ptr, kv.data);
+        @memcpy(ptr, kv.as_slice());
         return .{ .data = ptr };
     }
 
@@ -36,39 +35,85 @@ pub const KeyValueOwned = struct {
 
 /// Key and Value packed together.
 ///
-///    8b      key len bytes      8b          value len bytes    1b        7b
-/// [key len] [     key     ] [value len] [      value       ] [type] [seq-number]
+///    8b      key len bytes      8b          value len bytes     8b
+/// [key len] [     key     ] [value len] [      value       ] [type + seq-number]
 pub const KeyValue = struct {
     data: [*]const u8,
 
-    pub fn as_key(self: *const KeyValue) []const u8 {
-        const self_key_len: [*]align(1) const u64 = @ptrCast(@alignCast(self.data));
+    const IntSize = @sizeOf(u64);
 
-        return (self.data + 8)[0..self_key_len[0]];
+    fn read_u64(data: [*]const u8, offset: usize) u64 {
+        return std.mem.readInt(u64, (data + offset)[0..IntSize], .little);
+    }
+
+    fn key_len(self: *const KeyValue) usize {
+        return read_u64(self.data, 0);
+    }
+
+    pub fn as_key(self: *const KeyValue) []const u8 {
+        return (self.data + IntSize)[0..self.key_len()];
+    }
+
+    pub fn parse(data: []const u8) ?KeyValue {
+        var iter = data;
+
+        // Parse key
+        {
+            if (data.len < @sizeOf(u64)) {
+                return null;
+            }
+
+            const key_size = std.mem.readInt(u64, iter[0..][0..@sizeOf(u64)], .little);
+            iter = iter[@sizeOf(u64)..];
+
+            if (iter.len < key_size) {
+                return null;
+            }
+            iter = iter[key_size..];
+        }
+
+        // Parse value
+        {
+            if (iter.len < @sizeOf(u64)) {
+                return null;
+            }
+
+            const value_size = std.mem.readInt(u64, iter[0..][0..@sizeOf(u64)], .little);
+            iter = iter[@sizeOf(u64)..];
+
+            if (iter.len < value_size) {
+                return null;
+            }
+            iter = iter[value_size..];
+        }
+
+        // Parse other
+        if (iter.len != 8) {
+            return null;
+        }
+
+        return .{ .data = data.ptr };
     }
 
     fn value_len(self: *const KeyValue) usize {
-        const self_key_len: [*]align(1) const u64 = @ptrCast(@alignCast(self.data));
-        const to_skip = utils.round_up(self_key_len[0], 8) + 8;
-        const self_value_len: [*]align(1) const u64 = @ptrCast(@alignCast(self.data + to_skip));
-
-        return self_value_len[0];
+        return read_u64(self.data, IntSize + self.key_len());
     }
 
     pub fn full_size(self: *const KeyValue) usize {
-        return utils.round_up(utils.round_up(self.value_len(), 8) + utils.round_up(self.as_key().len, 8) + 24, 8);
+        return IntSize + self.key_len() + IntSize + self.value_len() + IntSize;
     }
 
     pub fn as_value(self: *const KeyValue) ?[]const u8 {
         if (self.as_type() == .Add) {
-            const self_key_len: [*]const u64 = @ptrCast(@alignCast(self.data));
-            const to_skip = utils.round_up(self_key_len[0], 8) + 8;
-            const self_value_len: [*]const u64 = @ptrCast(@alignCast(self.data + to_skip));
-
-            return (self.data + to_skip + 8)[0..self_value_len[0]];
+            const value_offset = IntSize + self.key_len() + IntSize;
+            return (self.data + value_offset)[0..self.value_len()];
         } else {
             return null;
         }
+    }
+
+    pub fn as_slice(self: *const KeyValue) []const u8 {
+        return (self.data)[0..self.full_size()];
     }
 
     pub fn as_type(self: *const KeyValue) Type {
@@ -79,9 +124,9 @@ pub const KeyValue = struct {
 
     pub fn as_seq(self: *const KeyValue) usize {
         const size = self.full_size();
-        const last_u64: [*]const u64 = @ptrCast(@alignCast(self.data + (size - 8)));
+        const last_u64 = read_u64(self.data, size - IntSize);
 
-        return last_u64[0] & ((1 << 63) - 1);
+        return last_u64 & ((1 << 63) - 1);
     }
 
     fn is_tombstone(self: *const KeyValue) bool {
@@ -89,10 +134,8 @@ pub const KeyValue = struct {
     }
 
     fn new(key: []const u8, value: ?[]const u8, seq: usize, tp: Type, alloc: Allocator) !KeyValue {
-        const key_len_rounded = utils.round_up(key.len, 8);
         const val_len = if (value) |val| val.len else 0;
-        const value_len_rounded = utils.round_up(val_len, 8);
-        const size = utils.round_up(key_len_rounded + value_len_rounded + 24, 8);
+        const size = IntSize + key.len + IntSize + val_len + IntSize;
 
         if (size > sstable.BlockSize)
             return error.TooBig;
@@ -101,15 +144,15 @@ pub const KeyValue = struct {
         const seq_type = (seq & ~(@as(u64, 1) << 63)) | (@as(u64, @intFromEnum(tp)) << 63);
 
         @memmove(ptr.ptr + 0, @as(*const [8]u8, @ptrCast(&key.len)));
-        @memmove(ptr.ptr + 8, key);
+        @memmove(ptr.ptr + IntSize, key);
 
-        @memmove(ptr.ptr + 8 + key_len_rounded, utils.data_as_u8_const_ptr(&val_len));
+        @memmove(ptr.ptr + IntSize + key.len, @as(*const [8]u8, @ptrCast(&val_len)));
 
         // Optional value means tombstone
         if (value) |val|
-            @memmove(ptr.ptr + 16 + key_len_rounded, val);
+            @memmove(ptr.ptr + IntSize + key.len + IntSize, val);
 
-        @memmove(ptr.ptr + 16 + key_len_rounded + value_len_rounded, utils.data_as_u8_const_ptr(&seq_type));
+        @memmove(ptr.ptr + IntSize + key.len + IntSize + val_len, @as(*const [8]u8, @ptrCast(&seq_type)));
         return .{ .data = ptr.ptr };
     }
 

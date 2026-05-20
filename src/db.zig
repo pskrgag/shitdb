@@ -5,9 +5,8 @@ const MemTableOpts = @import("storage").MemTableOpts;
 const Manager = @import("db/manager.zig").Manager;
 const test_utils = @import("test_utils");
 const Dir = std.Io.Dir;
-const io = std.Options.debug_io;
 
-fn openOrCreateDir(path: []const u8) !Dir {
+fn openOrCreateDir(io: std.Io, path: []const u8) !Dir {
     const cwd = Dir.cwd();
     const opts = Dir.OpenOptions{ .iterate = true };
 
@@ -47,10 +46,11 @@ pub const KeyValue = struct {
     }
 
     /// Creates new key value storage at specific directory.
-    pub fn new(path: []const u8, alloc: Allocator, opts: ?KeyValueOptions) !Self {
-        const dir = try openOrCreateDir(path);
+    pub fn new(path: []const u8, alloc: Allocator, io: std.Io, opts: ?KeyValueOptions) !Self {
+        const dir = try openOrCreateDir(io, path);
         const mem_opts = if (opts) |o| o.memtable else null;
-        return .{ .manager = try Manager.new(dir, path, alloc, mem_opts) };
+
+        return .{ .manager = try Manager.new(dir, path, alloc, io, mem_opts) };
     }
 
     /// De-initializes db session
@@ -65,8 +65,9 @@ test "Simple API Test" {
         _ = arena.deinit();
     }
     const allocator = arena.allocator();
+    const io = std.testing.io;
 
-    var new = try KeyValue.new("test_db2", allocator, null);
+    var new = try KeyValue.new("test_db2", allocator, io, null);
     defer {
         new.deinit();
         std.Io.Dir.cwd().deleteTree(io, "test_db2") catch {
@@ -87,6 +88,7 @@ test "Simple API Test" {
 }
 
 test "Test more than one memtable" {
+    const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -94,6 +96,7 @@ test "Test more than one memtable" {
     const tb = try KeyValue.new(
         "test_db1",
         allocator,
+        io,
         KeyValueOptions{ .memtable = .{ .memtable_size = 1000 } },
     );
 
@@ -108,6 +111,7 @@ test "Test more than one memtable" {
 }
 
 test "Shutdown and then boot" {
+    const io = std.testing.io;
     var arena = std.heap.DebugAllocator(.{}){};
     defer {
         _ = arena.deinit();
@@ -115,7 +119,7 @@ test "Shutdown and then boot" {
     const allocator = arena.allocator();
 
     std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {};
-    var old = try KeyValue.new("test_db3", allocator, null);
+    var old = try KeyValue.new("test_db3", allocator, io, null);
     defer {
         std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {
             @panic("gg");
@@ -128,7 +132,7 @@ test "Shutdown and then boot" {
 
     old.deinit();
 
-    var new = try KeyValue.new("test_db3", allocator, null);
+    var new = try KeyValue.new("test_db3", allocator, io, null);
     defer new.deinit();
 
     inline for (1..200) |i| {

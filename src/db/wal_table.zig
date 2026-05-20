@@ -1,6 +1,7 @@
 const std = @import("std");
 const MemTable = @import("storage").MemTable;
 const Wal = @import("wal.zig").Wal;
+const WalEntry = @import("wal.zig").WalEntry;
 const Allocator = std.mem.Allocator;
 const MemTableOpts = @import("storage").MemTableOpts;
 const GetResult = @import("storage").GetResult;
@@ -11,14 +12,22 @@ pub const WalTable = struct {
     table: MemTable,
     wal: Wal,
     seq: usize,
+    io: std.Io,
 
     /// Constructs new WAL+MemTable
-    pub fn new(dir: std.Io.Dir, user_opts: ?MemTableOpts, seq: usize, alloc: Allocator) !*WalTable {
+    pub fn new(
+        dir: std.Io.Dir,
+        user_opts: ?MemTableOpts,
+        seq: usize,
+        io: std.Io,
+        alloc: Allocator,
+    ) !*WalTable {
         const self = try alloc.create(WalTable);
 
         self.table = try MemTable.new(alloc, user_opts);
-        self.wal = try Wal.new(dir, seq, alloc);
+        self.wal = try Wal.new(dir, seq, io, alloc);
         self.seq = seq;
+        self.io = io;
 
         return self;
     }
@@ -30,6 +39,9 @@ pub const WalTable = struct {
 
     /// Removes value from the memtable and records it into WAL
     pub fn remove(self: *WalTable, key: []const u8, seq: usize) !void {
+        const entry: WalEntry = .{ .Remove = .{ .key = key, .seq = seq } };
+
+        try self.wal.record(entry, self.io);
         try self.table.remove(key, seq);
     }
 

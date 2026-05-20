@@ -23,11 +23,16 @@ pub const ThreadSafeArena = struct {
             const current_ptr = self.offset.load(.monotonic);
             const current_ptr_aligned: [*]u8 = @ptrFromInt(alignment.forward(@intFromPtr(current_ptr)));
 
-            const new_offset = current_ptr + n;
+            const new_offset = current_ptr_aligned + n;
             if (@intFromPtr(new_offset) > @intFromPtr(end))
                 return null;
 
-            if (self.offset.cmpxchgWeak(current_ptr_aligned, new_offset, .monotonic, .monotonic) == null)
+            if (self.offset.cmpxchgWeak(
+                current_ptr,
+                new_offset,
+                .monotonic,
+                .monotonic,
+            ) == null)
                 return current_ptr_aligned;
         }
 

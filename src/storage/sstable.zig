@@ -208,7 +208,7 @@ pub const SSTable = struct {
     }
 
     fn read_block_first_key(block: []const u8) []const u8 {
-        const kv: KeyValue = KeyValue{ .data = @ptrCast(@alignCast(block.ptr)) };
+        const kv: KeyValue = KeyValue{ .data = block.ptr };
         return kv.as_key();
     }
 
@@ -281,7 +281,7 @@ pub const SSTable = struct {
         var iter = block_data;
 
         while (iter.len > 0) {
-            var kv: KeyValue = KeyValue{ .data = @ptrCast(@alignCast(iter.ptr)) };
+            var kv: KeyValue = KeyValue{ .data = iter.ptr };
             var current_key = kv.as_key();
 
             // Walk until we find element with biggest sequence number.
@@ -292,7 +292,7 @@ pub const SSTable = struct {
                     if (next.len == 0)
                         break;
 
-                    const next_kv = KeyValue{ .data = @ptrCast(@alignCast(next.ptr)) };
+                    const next_kv = KeyValue{ .data = next.ptr };
                     const next_key = next_kv.as_key();
 
                     if (std.mem.order(u8, next_key, current_key) == .eq) {
