@@ -93,6 +93,7 @@ test "Test more than one memtable" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
+    std.Io.Dir.cwd().deleteTree(io, "test_db1") catch {};
     const tb = try KeyValue.new(
         "test_db1",
         allocator,

@@ -6,6 +6,7 @@ const Io = std.Io;
 const WalTable = @import("wal_table.zig").WalTable;
 const Version = @import("version.zig").Version;
 const VersionEdit = @import("version.zig").VersionEdit;
+const Crc32 = std.hash.Crc32;
 
 const AddMagic: u8 = 0x10;
 const RemoveMagic: u8 = 0x12;
@@ -24,11 +25,22 @@ pub const WalEntry = union(enum) {
         seq: usize,
     },
 
-    fn full_size(self: *const WalEntry) usize {
-        return switch (*self) {
-            .Add => |add| @sizeOf(usize) + add.key.len + @sizeOf(usize) + add.value.len + @sizeOf(usize),
-            .Remove => |rem| rem.key.len + @sizeOf(usize),
-        };
+    fn checksum(self: *const WalEntry) u32 {
+        var hash = Crc32.init();
+
+        switch (self.*) {
+            .Add => |add| {
+                hash.update(add.key);
+                hash.update(add.value);
+                hash.update(&std.mem.toBytes(add.seq));
+            },
+            .Remove => |rem| {
+                hash.update(rem.key);
+                hash.update(&std.mem.toBytes(rem.seq));
+            },
+        }
+
+        return hash.final();
     }
 };
 
@@ -80,12 +92,14 @@ pub const Wal = struct {
                 try w.writeAll(&std.mem.toBytes(add.value.len));
                 try w.writeAll(add.value);
                 try w.writeAll(&std.mem.toBytes(add.seq));
+                try w.writeAll(&std.mem.toBytes(entry.checksum()));
             },
             .Remove => |rem| {
                 try w.writeAll(&std.mem.toBytes(RemoveMagic));
                 try w.writeAll(&std.mem.toBytes(rem.key.len));
                 try w.writeAll(rem.key);
                 try w.writeAll(&std.mem.toBytes(rem.seq));
+                try w.writeAll(&std.mem.toBytes(entry.checksum()));
             },
         }
 
@@ -144,6 +158,16 @@ pub const Wal = struct {
                     const seq = std.mem.readInt(usize, mmap[iter..][0..@sizeOf(usize)], .little);
                     iter += @sizeOf(usize);
 
+                    if (size - iter < @sizeOf(u32))
+                        return error.InvalidFormat;
+
+                    const checksum = std.mem.readInt(u32, mmap[iter..][0..@sizeOf(u32)], .little);
+                    const entry = WalEntry{ .Add = .{ .seq = seq, .key = key, .value = value } };
+
+                    if (checksum != entry.checksum())
+                        return error.InvalidChecksum;
+
+                    iter += @sizeOf(u32);
                     try to.put_but_record(key, value, seq);
                 },
                 RemoveMagic => {
@@ -153,6 +177,16 @@ pub const Wal = struct {
                     const seq = std.mem.readInt(usize, mmap[iter..][0..@sizeOf(usize)], .little);
                     iter += @sizeOf(usize);
 
+                    if (size - iter < @sizeOf(u32))
+                        return error.InvalidFormat;
+
+                    const checksum = std.mem.readInt(u32, mmap[iter..][0..@sizeOf(u32)], .little);
+                    const entry = WalEntry{ .Remove = .{ .seq = seq, .key = key } };
+
+                    if (checksum != entry.checksum())
+                        return error.InvalidChecksum;
+
+                    iter += @sizeOf(u32);
                     try to.remove_but_record(key, seq);
                 },
                 else => return error.InvalidFormat,
@@ -209,6 +243,10 @@ fn readUsize(data: []const u8) usize {
     return std.mem.readInt(usize, data[0..@sizeOf(usize)], .little);
 }
 
+fn readU32(data: []const u8) u32 {
+    return std.mem.readInt(u32, data[0..@sizeOf(u32)], .little);
+}
+
 fn expectReplayInvalidFormat(dir: Dir, seq: usize, data: []const u8, alloc: Allocator) !void {
     try writeWalFile(dir, seq, data, alloc);
 
@@ -257,6 +295,11 @@ test "WAL serializes add record" {
     pos += 3;
     try std.testing.expectEqual(@as(usize, 7), readUsize(data[pos .. pos + @sizeOf(usize)]));
     pos += @sizeOf(usize);
+    try std.testing.expectEqual(
+        (WalEntry{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }).checksum(),
+        readU32(data[pos .. pos + @sizeOf(u32)]),
+    );
+    pos += @sizeOf(u32);
     try std.testing.expectEqual(data.len, pos);
 }
 
@@ -292,6 +335,11 @@ test "WAL serializes remove record" {
     pos += 4;
     try std.testing.expectEqual(@as(usize, 42), readUsize(data[pos .. pos + @sizeOf(usize)]));
     pos += @sizeOf(usize);
+    try std.testing.expectEqual(
+        (WalEntry{ .Remove = .{ .key = "beta", .seq = 42 } }).checksum(),
+        readU32(data[pos .. pos + @sizeOf(u32)]),
+    );
+    pos += @sizeOf(u32);
     try std.testing.expectEqual(data.len, pos);
 }
 
@@ -332,6 +380,11 @@ test "WAL serializes records in append order" {
     pos += 3;
     try std.testing.expectEqual(@as(usize, 7), readUsize(data[pos .. pos + @sizeOf(usize)]));
     pos += @sizeOf(usize);
+    try std.testing.expectEqual(
+        (WalEntry{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }).checksum(),
+        readU32(data[pos .. pos + @sizeOf(u32)]),
+    );
+    pos += @sizeOf(u32);
 
     try std.testing.expectEqual(RemoveMagic, data[pos]);
     pos += 1;
@@ -342,6 +395,11 @@ test "WAL serializes records in append order" {
     pos += remove_size;
     try std.testing.expectEqual(@as(usize, 8), readUsize(data[pos .. pos + @sizeOf(usize)]));
     pos += @sizeOf(usize);
+    try std.testing.expectEqual(
+        (WalEntry{ .Remove = .{ .key = "alpha", .seq = 8 } }).checksum(),
+        readU32(data[pos .. pos + @sizeOf(u32)]),
+    );
+    pos += @sizeOf(u32);
 
     try std.testing.expectEqual(data.len, pos);
 }

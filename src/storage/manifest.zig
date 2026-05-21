@@ -34,6 +34,10 @@ pub const FileMeta = struct {
     }
 };
 
+// The current design of manifest:
+//
+// AddWal(N)  -> there is WAL file for MemTable with file number N
+// AddFile(N) -> that SSTable was created, meaning that Wal(N) is no longer needed (can be eventually deleted)
 pub const ManifestRecord = union(enum) {
     AddFile: FileMeta,
     DeleteFile: struct {
