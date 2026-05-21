@@ -18,7 +18,7 @@ pub const Manager = struct {
     // Mutex that protects new table creation
     new_table_lock: Mutex,
     // MemTable options
-    opts: ?MemTableOpts,
+    opts: MemTableOpts,
     // Current version of db
     version: *Version,
     // Allocator used for owned DB structures
@@ -29,18 +29,19 @@ pub const Manager = struct {
     const Self = @This();
 
     pub fn new(dir: fs, path: []const u8, alloc: Allocator, io: std.Io, opts: ?MemTableOpts) !Self {
-        const version = try Version.from_file(dir, "MANIFEST", alloc);
+        const real_opts = opts orelse MemTableOpts.default();
+        const version = try Version.from_file(dir, "MANIFEST", real_opts, alloc);
         const new_file_seq = version.new_file_seq();
 
         return .{
             .version = version,
             .active = std.atomic.Value(*WalTable).init(
-                try WalTable.new(dir, opts, new_file_seq, io, alloc),
+                try WalTable.new(dir, opts, new_file_seq, version, io, alloc),
             ),
             .path = path,
             .root = dir,
             .new_table_lock = Mutex.init,
-            .opts = opts,
+            .opts = real_opts,
             .alloc = alloc,
             .io = io,
         };
@@ -52,7 +53,14 @@ pub const Manager = struct {
 
         if (self.active.load(.unordered) == old) {
             const new_file_seq = self.version.new_file_seq();
-            const new_table = try WalTable.new(self.root, self.opts, new_file_seq, self.io, alloc);
+            const new_table = try WalTable.new(
+                self.root,
+                self.opts,
+                new_file_seq,
+                self.version,
+                self.io,
+                alloc,
+            );
 
             // Put current table into the flusher
             self.version.insert(old);

@@ -9,6 +9,7 @@ const data_as_u8_const_ptr = utils.data_as_u8_const_ptr;
 const AddMagic = 0x10;
 const NextFileNumberMagic = 0x12;
 const NextSeqNumberMagic = 0x13;
+const AddWalMagic = 0x14;
 
 pub const FileMeta = struct {
     name: []const u8,
@@ -41,6 +42,7 @@ pub const ManifestRecord = union(enum) {
     },
     NextFileNumber: usize,
     NextSeqNumber: usize,
+    AddWal: usize,
 
     const Self = @This();
 
@@ -54,6 +56,9 @@ pub const ManifestRecord = union(enum) {
         switch (self.*) {
             .AddFile => |add| {
                 full = ManifestRecord.string_size(add.name) + @sizeOf(u8) + @sizeOf(usize) + ManifestRecord.string_size(add.max.data) + ManifestRecord.string_size(add.min.data);
+            },
+            .AddWal => |a| {
+                full = @sizeOf(@TypeOf(a));
             },
             .DeleteFile => |a| {
                 full = @sizeOf(@TypeOf(a));
@@ -145,6 +150,10 @@ pub const ManifestRecord = union(enum) {
             .DeleteFile => |add| {
                 _ = add;
             },
+            .AddWal => |wal| {
+                Self.put_int(u8, &data, AddWalMagic);
+                Self.put_int(usize, &data, wal);
+            },
         }
     }
 
@@ -178,6 +187,10 @@ pub const ManifestRecord = union(enum) {
                 NextSeqNumberMagic => {
                     const filenum = Self.get_int(usize, &iter);
                     try res.append(alloc, .{ .NextSeqNumber = filenum });
+                },
+                AddWalMagic => {
+                    const wal = Self.get_int(usize, &iter);
+                    try res.append(alloc, .{ .AddWal = wal });
                 },
                 else => return error.CorruptedData,
             }

@@ -11,6 +11,8 @@ const Value = std.atomic.Value;
 const FileMeta = @import("storage").manifest.FileMeta;
 const io = std.Options.debug_io;
 const WalTable = @import("wal_table.zig").WalTable;
+const Wal = @import("wal.zig").Wal;
+const MemTableOpts = @import("storage").MemTableOpts;
 
 pub const Version = struct {
     // File handle
@@ -21,6 +23,8 @@ pub const Version = struct {
     next_sequence: Value(usize),
     // Alive SSTables
     tables: std.ArrayList(FileMeta),
+    // Alive WALs
+    wals: std.ArrayList(usize),
     // Protects concurrent edit applies
     mutex: Mutex,
     // Flusher that periodically flushes immutable tables
@@ -66,7 +70,7 @@ pub const Version = struct {
         return self.next_file.fetchAdd(1, .monotonic);
     }
 
-    pub fn from_file(dir: std.Io.Dir, path: []const u8, alloc: Allocator) !*Self {
+    pub fn from_file(dir: std.Io.Dir, path: []const u8, opts: MemTableOpts, alloc: Allocator) !*Self {
         const file = dir.openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => try dir.createFile(io, path, .{ .read = true }),
             else => return err,
@@ -84,6 +88,7 @@ pub const Version = struct {
             .next_file = Value(usize).init(0),
             .next_sequence = Value(usize).init(0),
             .mutex = Mutex.init,
+            .wals = try std.ArrayList(usize).initCapacity(alloc, 0),
         };
         errdefer res.deinit(alloc);
 
@@ -100,7 +105,7 @@ pub const Version = struct {
 
             var rep = try manifest.ManifestRecord.deserialize_from(mmap, alloc);
             defer rep.deinit(alloc);
-            try res.replay(rep, alloc);
+            try res.replay(dir, rep, opts, alloc);
         }
 
         return res;
@@ -198,7 +203,9 @@ pub const Version = struct {
 
     fn replay(
         self: *Version,
+        dir: std.Io.Dir,
         edits: std.ArrayList(manifest.ManifestRecord),
+        opts: MemTableOpts,
         alloc: Allocator,
     ) !void {
         for (edits.items) |edit| {
@@ -211,6 +218,16 @@ pub const Version = struct {
                     while (self.next_file.load(.monotonic) <= f.seq) {
                         self.next_file.store(f.seq + 1, .monotonic);
                     }
+
+                    for (self.wals.items, 0..) |wal, idx| {
+                        if (wal == f.seq) {
+                            _ = self.wals.swapRemove(idx);
+                            break;
+                        }
+                    }
+                },
+                .AddWal => |wal| {
+                    try self.wals.append(alloc, wal);
                 },
                 .DeleteFile => |f| {
                     var found = false;
@@ -228,6 +245,12 @@ pub const Version = struct {
                 },
             }
         }
+
+        // Replay from active WALs
+        for (self.wals.items) |wal| {
+            const alive_wal = try WalTable.open(dir, opts, wal, io, alloc);
+            self.insert(alive_wal);
+        }
     }
 
     // De-initializes version
@@ -237,6 +260,7 @@ pub const Version = struct {
         }
 
         self.tables.deinit(alloc);
+        self.wals.deinit(alloc);
         self.flusher.deinit(alloc);
         self.file.close(io);
         alloc.destroy(self);
@@ -247,6 +271,7 @@ pub const VersionEdit = struct {
     next_file: ?usize,
     new_files: std.ArrayList(FileMeta),
     next_seq: ?usize,
+    add_wal: ?usize,
 
     pub fn as_manifest_records(
         self: *const VersionEdit,
@@ -266,6 +291,10 @@ pub const VersionEdit = struct {
             try res.append(alloc, .{ .AddFile = file });
         }
 
+        if (self.add_wal) |wal| {
+            try res.append(alloc, .{ .AddWal = wal });
+        }
+
         return res;
     }
 
@@ -274,9 +303,12 @@ pub const VersionEdit = struct {
             .next_file = null,
             .new_files = try std.ArrayList(FileMeta).initCapacity(alloc, 0),
             .next_seq = null,
+            .add_wal = null,
         };
     }
 };
+
+const testing_memtable_opts = MemTableOpts{ .memtable_size = 1 << 20 };
 
 test "Version serialization" {
     var arena = std.heap.DebugAllocator(.{}){};
@@ -297,7 +329,7 @@ test "Version serialization" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, allocator);
     defer version.deinit(allocator);
 
     {
@@ -389,7 +421,7 @@ test "Version apply persists edits that reopen can replay" {
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", allocator);
+        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, allocator);
         defer version.deinit(allocator);
 
         var edit = try VersionEdit.empty(allocator);
@@ -411,7 +443,7 @@ test "Version apply persists edits that reopen can replay" {
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", allocator);
+        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, allocator);
         defer reopened.deinit(allocator);
 
         try std.testing.expectEqual(@as(usize, 9), reopened.current_seq());

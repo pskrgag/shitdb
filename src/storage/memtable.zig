@@ -185,7 +185,7 @@ pub const FindKey = struct {
 pub const MemTableOpts = struct {
     memtable_size: usize,
 
-    fn default() MemTableOpts {
+    pub fn default() MemTableOpts {
         return .{ .memtable_size = 1 << 20 };
     }
 };

@@ -4,6 +4,8 @@ const Dir = std.Io.Dir;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const WalTable = @import("wal_table.zig").WalTable;
+const Version = @import("version.zig").Version;
+const VersionEdit = @import("version.zig").VersionEdit;
 
 const AddMagic: u8 = 0x10;
 const RemoveMagic: u8 = 0x12;
@@ -39,16 +41,27 @@ pub const Wal = struct {
         return res;
     }
 
-    pub fn new(dir: Dir, seq: usize, io: Io, alloc: Allocator) !Wal {
+    pub fn open(dir: Dir, seq: usize, io: Io, alloc: Allocator) !Wal {
         const name = try Wal.file_name(alloc, seq);
         defer alloc.free(name);
 
-        const file = dir.openFile(io, name, .{ .mode = .read_write }) catch |err| switch (err) {
-            error.FileNotFound => try dir.createFile(io, name, .{
-                .read = true,
-            }),
-            else => return err,
-        };
+        const file = try dir.openFile(io, name, .{ .mode = .read_write });
+        return .{ .file = file };
+    }
+
+    pub fn new(dir: Dir, seq: usize, version: ?*Version, io: Io, alloc: Allocator) !Wal {
+        const name = try Wal.file_name(alloc, seq);
+        defer alloc.free(name);
+
+        const file = try dir.createFile(io, name, .{ .read = true });
+
+        if (version) |v| {
+            var edit = try VersionEdit.empty(alloc);
+
+            edit.add_wal = seq;
+            try v.apply(edit, alloc);
+        }
+
         return .{ .file = file };
     }
 
@@ -131,7 +144,7 @@ pub const Wal = struct {
                     const seq = std.mem.readInt(usize, mmap[iter..][0..@sizeOf(usize)], .little);
                     iter += @sizeOf(usize);
 
-                    try to.put(key, value, seq);
+                    try to.put_but_record(key, value, seq);
                 },
                 RemoveMagic => {
                     if (size - iter < @sizeOf(usize))
@@ -140,15 +153,15 @@ pub const Wal = struct {
                     const seq = std.mem.readInt(usize, mmap[iter..][0..@sizeOf(usize)], .little);
                     iter += @sizeOf(usize);
 
-                    try to.remove(key, seq);
+                    try to.remove_but_record(key, seq);
                 },
                 else => return error.InvalidFormat,
             }
         }
     }
 
-    fn deinit(self: *Wal) void {
-        self.file.close();
+    pub fn deinit(self: *Wal, io: std.Io) void {
+        self.file.close(io);
     }
 };
 
@@ -199,10 +212,10 @@ fn readUsize(data: []const u8) usize {
 fn expectReplayInvalidFormat(dir: Dir, seq: usize, data: []const u8, alloc: Allocator) !void {
     try writeWalFile(dir, seq, data, alloc);
 
-    var wal = try Wal.new(dir, seq, testing_io, alloc);
+    var wal = try Wal.open(dir, seq, testing_io, alloc);
     defer wal.file.close(testing_io);
 
-    var target = try WalTable.new(dir, null, seq + 1000, testing_io, alloc);
+    var target = try WalTable.new(dir, null, seq + 1000, null, testing_io, alloc);
     defer target.deinit(alloc);
 
     try std.testing.expectError(error.InvalidFormat, wal.replay_to(target, testing_io));
@@ -224,7 +237,7 @@ test "WAL serializes add record" {
         };
     }
 
-    var wal = try Wal.new(dir, 1, testing_io, allocator);
+    var wal = try Wal.new(dir, 1, null, testing_io, allocator);
     defer wal.file.close(testing_io);
     try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }, testing_io);
 
@@ -263,17 +276,23 @@ test "WAL serializes remove record" {
         };
     }
 
-    var wal = try Wal.new(dir, 2, testing_io, allocator);
+    var wal = try Wal.new(dir, 2, null, testing_io, allocator);
     defer wal.file.close(testing_io);
     try wal.record(.{ .Remove = .{ .key = "beta", .seq = 42 } }, testing_io);
 
     const data = try readWalFile(dir, 2, allocator);
     defer allocator.free(data);
 
-    try std.testing.expectEqual(RemoveMagic, data[0]);
-    try std.testing.expectEqual(@as(usize, 4), readUsize(data[1 .. 1 + @sizeOf(usize)]));
-    try std.testing.expectEqualSlices(u8, "beta", data[1 + @sizeOf(usize) .. 1 + @sizeOf(usize) + 4]);
-    try std.testing.expectEqual(@as(usize, 42), readUsize(data[1 + @sizeOf(usize) + 4 ..]));
+    var pos: usize = 0;
+    try std.testing.expectEqual(RemoveMagic, data[pos]);
+    pos += 1;
+    try std.testing.expectEqual(@as(usize, 4), readUsize(data[pos .. pos + @sizeOf(usize)]));
+    pos += @sizeOf(usize);
+    try std.testing.expectEqualSlices(u8, "beta", data[pos .. pos + 4]);
+    pos += 4;
+    try std.testing.expectEqual(@as(usize, 42), readUsize(data[pos .. pos + @sizeOf(usize)]));
+    pos += @sizeOf(usize);
+    try std.testing.expectEqual(data.len, pos);
 }
 
 test "WAL serializes records in append order" {
@@ -292,7 +311,7 @@ test "WAL serializes records in append order" {
         };
     }
 
-    var wal = try Wal.new(dir, 3, testing_io, allocator);
+    var wal = try Wal.new(dir, 3, null, testing_io, allocator);
     defer wal.file.close(testing_io);
     try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }, testing_io);
     try wal.record(.{ .Remove = .{ .key = "alpha", .seq = 8 } }, testing_io);
@@ -343,11 +362,11 @@ test "WAL replay restores add record into target table" {
         };
     }
 
-    var wal = try Wal.new(dir, 4, testing_io, allocator);
+    var wal = try Wal.new(dir, 4, null, testing_io, allocator);
     defer wal.file.close(testing_io);
     try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }, testing_io);
 
-    var target = try WalTable.new(dir, null, 5, testing_io, allocator);
+    var target = try WalTable.new(dir, null, 5, null, testing_io, allocator);
     defer target.deinit(allocator);
     try wal.replay_to(target, testing_io);
 
@@ -377,11 +396,11 @@ test "WAL replay restores remove record into target table" {
         };
     }
 
-    var wal = try Wal.new(dir, 6, testing_io, allocator);
+    var wal = try Wal.new(dir, 6, null, testing_io, allocator);
     defer wal.file.close(testing_io);
     try wal.record(.{ .Remove = .{ .key = "alpha", .seq = 8 } }, testing_io);
 
-    var target = try WalTable.new(dir, null, 7, testing_io, allocator);
+    var target = try WalTable.new(dir, null, 7, null, testing_io, allocator);
     defer target.deinit(allocator);
     try wal.replay_to(target, testing_io);
 
@@ -405,12 +424,12 @@ test "WAL replay applies later remove over earlier add" {
         };
     }
 
-    var wal = try Wal.new(dir, 8, testing_io, allocator);
+    var wal = try Wal.new(dir, 8, null, testing_io, allocator);
     defer wal.file.close(testing_io);
     try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }, testing_io);
     try wal.record(.{ .Remove = .{ .key = "alpha", .seq = 8 } }, testing_io);
 
-    var target = try WalTable.new(dir, null, 9, testing_io, allocator);
+    var target = try WalTable.new(dir, null, 9, null, testing_io, allocator);
     defer target.deinit(allocator);
     try wal.replay_to(target, testing_io);
 

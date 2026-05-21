@@ -6,6 +6,9 @@ const Allocator = std.mem.Allocator;
 const MemTableOpts = @import("storage").MemTableOpts;
 const GetResult = @import("storage").GetResult;
 const KeyValue = @import("storage").KeyValue;
+const fi = @import("fault_injection");
+const Version = @import("version.zig").Version;
+const VersionEdit = @import("version.zig").VersionEdit;
 
 /// Memtable + WAL
 pub const WalTable = struct {
@@ -19,17 +22,46 @@ pub const WalTable = struct {
         dir: std.Io.Dir,
         user_opts: ?MemTableOpts,
         seq: usize,
+        version: ?*Version,
         io: std.Io,
         alloc: Allocator,
     ) !*WalTable {
         const self = try alloc.create(WalTable);
 
         self.table = try MemTable.new(alloc, user_opts);
-        self.wal = try Wal.new(dir, seq, io, alloc);
+        self.wal = try Wal.new(dir, seq, version, io, alloc);
         self.seq = seq;
         self.io = io;
 
         return self;
+    }
+
+    /// Opens existing WAL
+    pub fn open(
+        dir: std.Io.Dir,
+        user_opts: MemTableOpts,
+        seq: usize,
+        io: std.Io,
+        alloc: Allocator,
+    ) !*WalTable {
+        const self = try alloc.create(WalTable);
+
+        self.table = try MemTable.new(alloc, user_opts);
+        self.wal = try Wal.open(dir, seq, io, alloc);
+
+        self.seq = seq;
+        self.io = io;
+
+        try self.wal.replay_to(self, io);
+        return self;
+    }
+
+    pub fn put_but_record(self: *WalTable, key: []const u8, value: []const u8, seq: usize) !void {
+        try self.table.put(key, value, seq);
+    }
+
+    pub fn remove_but_record(self: *WalTable, key: []const u8, seq: usize) !void {
+        try self.table.remove(key, seq);
     }
 
     /// Puts value from the memtable and records it into WAL
@@ -38,6 +70,7 @@ pub const WalTable = struct {
 
         try self.wal.record(entry, self.io);
         try self.table.put(key, value, seq);
+        fi.crash("after_wal");
     }
 
     /// Removes value from the memtable and records it into WAL
@@ -46,6 +79,7 @@ pub const WalTable = struct {
 
         try self.wal.record(entry, self.io);
         try self.table.remove(key, seq);
+        fi.crash("after_wal");
     }
 
     /// Retrieves value from the memtable
@@ -65,6 +99,7 @@ pub const WalTable = struct {
 
     /// Deinits table
     pub fn deinit(self: *WalTable, alloc: Allocator) void {
+        self.wal.deinit(self.io);
         self.table.deinit(alloc);
         alloc.destroy(self);
     }

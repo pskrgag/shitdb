@@ -30,8 +30,22 @@ pub const Flusher = struct {
     alloc: std.mem.Allocator,
     // Stop flag
     stop: std.atomic.Value(bool),
+    // DB directory
+    dir: std.Io.Dir,
+    // Version manager
+    version: *Version,
 
-    fn flusher_thread_impl(self: *Flusher, dir: std.Io.Dir, version: *Version) !void {
+    fn flush_one(self: *Flusher) !void {
+        const first = self.list[0].?;
+        try self.version.flush_memtable(first, self.dir, self.alloc);
+        first.deinit(self.alloc);
+
+        @memmove(self.list[0 .. MaxNumTables - 1], self.list[1..MaxNumTables]);
+        self.list[MaxNumTables - 1] = null;
+        self.count -= 1;
+    }
+
+    fn flusher_thread_impl(self: *Flusher) !void {
         while (!self.stop.load(.monotonic)) {
             self.mutex.lockUncancelable(io);
 
@@ -43,20 +57,16 @@ pub const Flusher = struct {
                 return;
             }
 
-            const first = self.list[0].?;
-            try version.flush_memtable(first, dir, self.alloc);
-
-            @memmove(self.list[0 .. MaxNumTables - 1], self.list[1..MaxNumTables]);
-            self.count -= 1;
+            try self.flush_one();
 
             self.full_cv.signal(io);
             self.mutex.unlock(io);
         }
     }
 
-    fn flusher_thread(self: *Flusher, dir: std.Io.Dir, version: *Version) !void {
+    fn flusher_thread(self: *Flusher) !void {
         // TODO: smth better please
-        flusher_thread_impl(self, dir, version) catch @panic("Flusher thread panicked");
+        flusher_thread_impl(self) catch @panic("Flusher thread panicked");
     }
 
     pub fn new(alloc: Allocator, version: *Version, dir: std.Io.Dir) !*Flusher {
@@ -69,13 +79,11 @@ pub const Flusher = struct {
         flusher.full_cv = std.Io.Condition.init;
         flusher.alloc = alloc;
         flusher.stop = std.atomic.Value(bool).init(false);
+        flusher.version = version;
+        flusher.dir = dir;
 
         // Spawning a thread is a release operation, so all writes should be reversed.
-        flusher.thread = try Thread.spawn(
-            .{},
-            Flusher.flusher_thread,
-            .{ flusher, dir, version },
-        );
+        flusher.thread = try Thread.spawn(.{}, Flusher.flusher_thread, .{flusher});
 
         return flusher;
     }
@@ -126,6 +134,9 @@ pub const Flusher = struct {
         self.mutex.unlock(io);
 
         self.thread.join();
+
+        while (self.count > 0)
+            self.flush_one() catch @panic("Failed to flush MemTable during deinit");
 
         alloc.destroy(self);
     }

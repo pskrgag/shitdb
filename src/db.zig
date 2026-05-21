@@ -142,3 +142,71 @@ test "Shutdown and then boot" {
         try std.testing.expectEqualSlices(u8, val, "a" ** i);
     }
 }
+
+test "WAL startup recovery" {
+    const fi = @import("fault_injection");
+    const Repeats = 10;
+
+    // Should crash after 100 additions
+    try fi.enable("after_wal", Repeats);
+    defer fi.clear();
+
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    std.Io.Dir.cwd().deleteTree(io, "test_db4") catch {};
+    const pid = std.posix.system.fork();
+
+    if (pid == -1) {
+        std.debug.print("Failed to fork\n", .{});
+        return error.ForkFailed;
+    }
+
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, "test_db4") catch {
+            @panic("gg");
+        };
+    }
+
+    if (pid == 0) {
+        var new = KeyValue.new("test_db4", allocator, io, null) catch {
+            std.debug.print("Unexpected error returned during create\n", .{});
+            std.posix.system.exit(0);
+        };
+
+        inline for (1..Repeats * 2) |i| {
+            new.put("a" ** i, "a" ** i, allocator) catch {
+                std.debug.print("Unexpected error returned during put\n", .{});
+                std.posix.system.exit(0);
+            };
+        }
+
+        // This is should be unreachable
+        std.posix.system.exit(0);
+    } else {
+        var status: u32 = 0;
+        const res = std.posix.system.waitpid(@intCast(pid), &status, 0);
+
+        if (res == -1) {
+            std.debug.print("Failed to wait\n", .{});
+            return error.WaitPidFailed;
+        }
+
+        try std.testing.expect(status != 0);
+    }
+
+    // Now try to check WAL
+    var new = try KeyValue.new("test_db4", allocator, io, null);
+    defer new.deinit();
+
+    inline for (1..Repeats) |i| {
+        const val = (try new.get("a" ** i, allocator)).?;
+        defer allocator.free(val);
+
+        try std.testing.expectEqualSlices(u8, "a" ** i, val);
+    }
+}

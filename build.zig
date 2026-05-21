@@ -12,6 +12,12 @@ pub fn build(b: *std.Build) void {
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
+
+    const fi = b.addModule("fault_injection", .{
+        .root_source_file = b.path("src/fault_injection/fi.zig"),
+        .target = target,
+    });
+
     const generic_utils = b.addModule("generic_utils", .{
         .root_source_file = b.path("src/generic_utils.zig"),
         .target = target,
@@ -53,6 +59,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "storage", .module = storage },
             .{ .name = "test_utils", .module = test_utils },
+            .{ .name = "fault_injection", .module = fi },
         },
     });
 
