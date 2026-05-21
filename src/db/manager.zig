@@ -30,7 +30,7 @@ pub const Manager = struct {
 
     pub fn new(dir: fs, path: []const u8, alloc: Allocator, io: std.Io, opts: ?MemTableOpts) !Self {
         const real_opts = opts orelse MemTableOpts.default();
-        const version = try Version.from_file(dir, "MANIFEST", real_opts, alloc);
+        const version = try Version.from_file(dir, "MANIFEST", real_opts, io, alloc);
         const new_file_seq = version.new_file_seq();
 
         return .{
@@ -115,7 +115,7 @@ pub const Manager = struct {
             .Removed => return null,
             .NotFound => {
                 // Resolve from other memtables
-                return try self.version.get(key, self.root, alloc);
+                return try self.version.get(key, self.root, self.io, alloc);
             },
         }
     }
@@ -124,12 +124,12 @@ pub const Manager = struct {
         // here we expect that no other user accesses data-base
         const active = self.active.load(.acquire);
 
-        self.version.flush_memtable(active, self.root, self.alloc) catch {
+        self.version.flush_memtable(active, self.io, self.root, self.alloc) catch {
             @panic("failed to flush active memtable");
         };
 
         active.deinit(self.alloc);
-        self.version.deinit(self.alloc);
+        self.version.deinit(self.io, self.alloc);
         self.root.close(self.io);
     }
 };

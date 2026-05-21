@@ -8,7 +8,6 @@ const DoublyLinkedList = std.DoublyLinkedList;
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 const SSTable = @import("storage").sstable.SSTable;
-const io = std.Options.debug_io;
 const WalTable = @import("wal_table.zig").WalTable;
 
 const MaxNumTables: usize = 5;
@@ -32,12 +31,14 @@ pub const Flusher = struct {
     stop: std.atomic.Value(bool),
     // DB directory
     dir: std.Io.Dir,
+    // IO instance
+    io: std.Io,
     // Version manager
     version: *Version,
 
     fn flush_one(self: *Flusher) !void {
         const first = self.list[0].?;
-        try self.version.flush_memtable(first, self.dir, self.alloc);
+        try self.version.flush_memtable(first, self.io, self.dir, self.alloc);
         first.deinit(self.alloc);
 
         @memmove(self.list[0 .. MaxNumTables - 1], self.list[1..MaxNumTables]);
@@ -47,20 +48,20 @@ pub const Flusher = struct {
 
     fn flusher_thread_impl(self: *Flusher) !void {
         while (!self.stop.load(.monotonic)) {
-            self.mutex.lockUncancelable(io);
+            self.mutex.lockUncancelable(self.io);
 
             while (self.count == 0 and !self.stop.load(.monotonic))
-                self.empty_cv.waitUncancelable(io, &self.mutex);
+                self.empty_cv.waitUncancelable(self.io, &self.mutex);
 
             if (self.stop.load(.monotonic)) {
-                self.mutex.unlock(io);
+                self.mutex.unlock(self.io);
                 return;
             }
 
             try self.flush_one();
 
-            self.full_cv.signal(io);
-            self.mutex.unlock(io);
+            self.full_cv.signal(self.io);
+            self.mutex.unlock(self.io);
         }
     }
 
@@ -69,7 +70,7 @@ pub const Flusher = struct {
         flusher_thread_impl(self) catch @panic("Flusher thread panicked");
     }
 
-    pub fn new(alloc: Allocator, version: *Version, dir: std.Io.Dir) !*Flusher {
+    pub fn new(alloc: Allocator, version: *Version, dir: std.Io.Dir, io: std.Io) !*Flusher {
         const flusher = try alloc.create(Flusher);
 
         flusher.list = .{null} ** MaxNumTables;
@@ -81,6 +82,7 @@ pub const Flusher = struct {
         flusher.stop = std.atomic.Value(bool).init(false);
         flusher.version = version;
         flusher.dir = dir;
+        flusher.io = io;
 
         // Spawning a thread is a release operation, so all writes should be reversed.
         flusher.thread = try Thread.spawn(.{}, Flusher.flusher_thread, .{flusher});
@@ -89,17 +91,17 @@ pub const Flusher = struct {
     }
 
     pub fn insert(self: *Flusher, table: *WalTable) void {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (self.count < MaxNumTables) {
             self.list[self.count] = table;
             self.count += 1;
 
-            self.empty_cv.signal(io);
+            self.empty_cv.signal(self.io);
         } else {
             while (self.count == MaxNumTables)
-                self.full_cv.waitUncancelable(io, &self.mutex);
+                self.full_cv.waitUncancelable(self.io, &self.mutex);
 
             self.list[self.count] = table;
             self.count += 1;
@@ -107,8 +109,8 @@ pub const Flusher = struct {
     }
 
     pub fn get(self: *Flusher, key: []const u8, seq: usize, alloc: Allocator) !?[]const u8 {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         for (0..self.count) |i| {
             const table: *WalTable = self.list[i].?;
@@ -127,11 +129,11 @@ pub const Flusher = struct {
     }
 
     pub fn deinit(self: *Flusher, alloc: Allocator) void {
-        self.mutex.lockUncancelable(io);
+        self.mutex.lockUncancelable(self.io);
         self.stop.store(true, .monotonic);
-        self.empty_cv.broadcast(io);
-        self.full_cv.broadcast(io);
-        self.mutex.unlock(io);
+        self.empty_cv.broadcast(self.io);
+        self.full_cv.broadcast(self.io);
+        self.mutex.unlock(self.io);
 
         self.thread.join();
 

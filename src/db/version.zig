@@ -9,7 +9,6 @@ const KeyValueOwned = @import("storage").KeyValueOwned;
 const Mutex = std.Io.Mutex;
 const Value = std.atomic.Value;
 const FileMeta = @import("storage").manifest.FileMeta;
-const io = std.Options.debug_io;
 const WalTable = @import("wal_table.zig").WalTable;
 const Wal = @import("wal.zig").Wal;
 const MemTableOpts = @import("storage").MemTableOpts;
@@ -32,7 +31,7 @@ pub const Version = struct {
 
     const Self = @This();
 
-    pub fn apply(self: *Self, edit: VersionEdit, alloc: Allocator) !void {
+    pub fn apply(self: *Self, edit: VersionEdit, io: std.Io, alloc: Allocator) !void {
         var records = try edit.as_manifest_records(alloc);
         defer records.deinit(alloc);
 
@@ -44,7 +43,10 @@ pub const Version = struct {
         }
 
         const offset = try self.file.length(io);
+
+        // NOTE: writePositionalAll sends all data directly to kernel. Sync makes it go to the disk
         try self.file.writePositionalAll(io, serialized_records.items, offset);
+        try self.file.sync(io);
 
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -70,7 +72,7 @@ pub const Version = struct {
         return self.next_file.fetchAdd(1, .monotonic);
     }
 
-    pub fn from_file(dir: std.Io.Dir, path: []const u8, opts: MemTableOpts, alloc: Allocator) !*Self {
+    pub fn from_file(dir: std.Io.Dir, path: []const u8, opts: MemTableOpts, io: std.Io, alloc: Allocator) !*Self {
         const file = dir.openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => try dir.createFile(io, path, .{ .read = true }),
             else => return err,
@@ -82,7 +84,7 @@ pub const Version = struct {
         const res = try alloc.create(Self);
 
         res.* = .{
-            .flusher = try Flusher.new(alloc, res, dir),
+            .flusher = try Flusher.new(alloc, res, dir, io),
             .file = file,
             .tables = try std.ArrayList(FileMeta).initCapacity(alloc, 0),
             .next_file = Value(usize).init(0),
@@ -90,7 +92,7 @@ pub const Version = struct {
             .mutex = Mutex.init,
             .wals = try std.ArrayList(usize).initCapacity(alloc, 0),
         };
-        errdefer res.deinit(alloc);
+        errdefer res.deinit(io, alloc);
 
         if (size > 0) {
             const mmap = try std.posix.mmap(
@@ -105,7 +107,7 @@ pub const Version = struct {
 
             var rep = try manifest.ManifestRecord.deserialize_from(mmap, alloc);
             defer rep.deinit(alloc);
-            try res.replay(dir, rep, opts, alloc);
+            try res.replay(dir, rep, opts, io, alloc);
         }
 
         return res;
@@ -122,7 +124,7 @@ pub const Version = struct {
     }
 
     // Flushes a memtable synchronously into an SSTable and records it in the manifest.
-    pub fn flush_memtable(self: *Version, table: *WalTable, dir: std.Io.Dir, alloc: Allocator) !void {
+    pub fn flush_memtable(self: *Version, table: *WalTable, io: std.Io, dir: std.Io.Dir, alloc: Allocator) !void {
         if (table.min() == null)
             return;
 
@@ -143,14 +145,14 @@ pub const Version = struct {
         edit.next_file = table.seq + 1;
 
         // TODO: maybe make SSTable::create generic over table type? Accessing table.table is ugly af.
-        var sstable = try SSTable.create(dir, name, &table.table, alloc);
+        var sstable = try SSTable.create(dir, name, &table.table, io, alloc);
         defer sstable.deinit();
 
-        try self.apply(edit, alloc);
+        try self.apply(edit, io, alloc);
     }
 
     // Resolves value request.
-    pub fn get(self: *Self, key: []const u8, dir: std.Io.Dir, alloc: Allocator) !?[]u8 {
+    pub fn get(self: *Self, key: []const u8, dir: std.Io.Dir, io: std.Io, alloc: Allocator) !?[]u8 {
         // Resolved from immutable table
         if (try self.flusher.get(key, self.current_seq(), alloc)) |val| {
             var res = try std.ArrayList(u8).initCapacity(alloc, val.len);
@@ -160,10 +162,10 @@ pub const Version = struct {
         }
 
         // Search sstables on a disk
-        return self.search_disk(key, dir, alloc);
+        return self.search_disk(key, dir, io, alloc);
     }
 
-    fn search_disk(self: *Self, key: []const u8, dir: std.Io.Dir, alloc: Allocator) !?[]u8 {
+    fn search_disk(self: *Self, key: []const u8, dir: std.Io.Dir, io: std.Io, alloc: Allocator) !?[]u8 {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
 
@@ -187,7 +189,7 @@ pub const Version = struct {
         std.mem.sort(FileMeta, candidates.items, {}, FileMeta.less_than);
 
         for (candidates.items) |table| {
-            var ss = try SSTable.open(dir, table.name);
+            var ss = try SSTable.open(dir, io, table.name);
             defer ss.deinit();
             const value = try ss.find_value(key, alloc);
 
@@ -206,6 +208,7 @@ pub const Version = struct {
         dir: std.Io.Dir,
         edits: std.ArrayList(manifest.ManifestRecord),
         opts: MemTableOpts,
+        io: std.Io,
         alloc: Allocator,
     ) !void {
         for (edits.items) |edit| {
@@ -254,7 +257,7 @@ pub const Version = struct {
     }
 
     // De-initializes version
-    pub fn deinit(self: *Version, alloc: Allocator) void {
+    pub fn deinit(self: *Version, io: std.Io, alloc: Allocator) void {
         for (self.tables.items) |*table| {
             table.deinit(alloc);
         }
@@ -316,27 +319,28 @@ test "Version serialization" {
         _ = arena.deinit();
     }
     const allocator = arena.allocator();
+    const testing_io = std.testing.io;
 
     const dirname = "test_db10";
-    try std.Io.Dir.cwd().createDir(io, dirname, .default_dir);
+    try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
-    var dir = try std.Io.Dir.cwd().openDir(io, dirname, .{});
+    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
 
     defer {
-        dir.close(io);
-        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+        dir.close(testing_io);
+        std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("gg");
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, allocator);
-    defer version.deinit(allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, testing_io, allocator);
+    defer version.deinit(testing_io, allocator);
 
     {
         var edit = try VersionEdit.empty(allocator);
         defer edit.new_files.deinit(allocator);
         edit.next_seq = 1;
-        try version.apply(edit, allocator);
+        try version.apply(edit, testing_io, allocator);
     }
 }
 
@@ -407,22 +411,23 @@ test "Version apply persists edits that reopen can replay" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    const testing_io = std.testing.io;
 
     const dirname = "test_db_version_replay";
-    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
-    try std.Io.Dir.cwd().createDir(io, dirname, .default_dir);
+    std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
+    try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
-    var dir = try std.Io.Dir.cwd().openDir(io, dirname, .{});
+    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
     defer {
-        dir.close(io);
-        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+        dir.close(testing_io);
+        std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, allocator);
-        defer version.deinit(allocator);
+        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, testing_io, allocator);
+        defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
         defer edit.new_files.deinit(allocator);
@@ -439,12 +444,12 @@ test "Version apply persists edits that reopen can replay" {
             "v9",
         ));
 
-        try version.apply(edit, allocator);
+        try version.apply(edit, testing_io, allocator);
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, allocator);
-        defer reopened.deinit(allocator);
+        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, testing_io, allocator);
+        defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 9), reopened.current_seq());
         try std.testing.expectEqual(@as(usize, 12), reopened.next_file.load(.monotonic));

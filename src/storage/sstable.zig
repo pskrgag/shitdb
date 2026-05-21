@@ -6,7 +6,6 @@ const KeyValue = @import("memtable.zig").KeyValue;
 const KeyValueOwned = @import("memtable.zig").KeyValueOwned;
 const Allocator = std.mem.Allocator;
 const merging_iterator = @import("merging_iterator");
-const io = std.Options.debug_io;
 
 pub const BlockSize = 4 << 10;
 const Magic: usize = 0xdeadbeefdeadbaba;
@@ -339,7 +338,7 @@ pub const SSTable = struct {
         return .{ .data = self.file[0..mt.index_offset] };
     }
 
-    pub fn open(dir: std.Io.Dir, name: []const u8) !Self {
+    pub fn open(dir: std.Io.Dir, io: std.Io, name: []const u8) !Self {
         const file = try dir.openFile(io, name, .{});
         defer file.close(io);
 
@@ -349,7 +348,7 @@ pub const SSTable = struct {
         return .{ .path = name, .file = mmap, .lvl = 0 };
     }
 
-    pub fn create(dir: std.Io.Dir, name: []const u8, tbl: *const MemTable, alloc: Allocator) !Self {
+    pub fn create(dir: std.Io.Dir, name: []const u8, tbl: *const MemTable, io: std.Io, alloc: Allocator) !Self {
         const file = try dir.createFile(io, name, .{
             .truncate = true,
             .read = true,
@@ -383,6 +382,7 @@ pub const SSTable = struct {
             .magic = Magic,
         });
 
+        try std.posix.msync(mmap_copy, std.posix.MSF.SYNC);
         return .{ .path = name, .file = mmap_copy, .lvl = 0 };
     }
 
@@ -402,7 +402,7 @@ pub const SSTable = struct {
         return .NotFound;
     }
 
-    pub fn merge(dir: *std.Io.Dir, name: []const u8, self: Self, other: Self) !Self {
+    pub fn merge(dir: *std.Io.Dir, name: []const u8, io: std.Io, self: Self, other: Self) !Self {
         const iters = [_]merging_iterator.IteratorWrapper(KeyValue){ self.iterator(), other.iterator() };
         const iter = merging_iterator.MergeIterator(KeyValue).new(iters);
         const file = try dir.createFile(io, name, .{
@@ -430,7 +430,6 @@ pub const SSTable = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        // alloc.free(self.path);
         std.posix.munmap(@ptrCast(@alignCast(self.file)));
     }
 };
@@ -449,6 +448,8 @@ fn repeatChar(allocator: std.mem.Allocator, char: u8, count: usize) ![]u8 {
     return result;
 }
 
+const testing_io = std.testing.io;
+
 test "Simple find and create" {
     var arena = std.heap.DebugAllocator(.{}){};
     defer {
@@ -457,15 +458,15 @@ test "Simple find and create" {
     const allocator = arena.allocator();
 
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, "test_db");
+    try cwd.createDirPath(testing_io, "test_db");
     defer {
-        std.Io.Dir.cwd().deleteTree(io, "test_db") catch {
+        std.Io.Dir.cwd().deleteTree(testing_io, "test_db") catch {
             @panic("gg");
         };
     }
 
-    var dir = try cwd.openDir(io, "test_db", .{});
-    defer dir.close(io);
+    var dir = try cwd.openDir(testing_io, "test_db", .{});
+    defer dir.close(testing_io);
 
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
@@ -476,7 +477,7 @@ test "Simple find and create" {
         try tb.put("a" ** i, "a" ** i, 0);
     }
 
-    var table = try SSTable.create(dir, name, &tb, allocator);
+    var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
     defer table.deinit();
     const to_find = [_][]const u8{ "a" ** 1, "a" ** 20, "a" ** 51, "a" ** 100, "a" ** 150, "a" ** 132 };
 
@@ -520,15 +521,15 @@ test "Merge" {
     const allocator = arena.allocator();
 
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, "test_db");
+    try cwd.createDirPath(testing_io, "test_db");
     defer {
-        std.Io.Dir.cwd().deleteTree(io, "test_db") catch {
+        std.Io.Dir.cwd().deleteTree(testing_io, "test_db") catch {
             @panic("gg");
         };
     }
 
-    var dir = try cwd.openDir(io, "test_db", .{});
-    defer dir.close(io);
+    var dir = try cwd.openDir(testing_io, "test_db", .{});
+    defer dir.close(testing_io);
 
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
@@ -538,7 +539,7 @@ test "Merge" {
     inline for (1..200) |i| {
         try tb.put("a" ** (i * 2 + 1), "a" ** (i * 2 + 1), i);
     }
-    var table = try SSTable.create(dir, name, &tb, allocator);
+    var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
     defer table.deinit();
 
     var tb1 = try MemTable.new(allocator, null);
@@ -549,7 +550,7 @@ test "Merge" {
     }
     const name1 = try generate_lvl_name(allocator, 201);
     defer allocator.free(name1);
-    var table1 = try SSTable.create(dir, name1, &tb, allocator);
+    var table1 = try SSTable.create(dir, name1, &tb, testing_io, allocator);
     defer table1.deinit();
 }
 
@@ -561,14 +562,14 @@ test "Remove" {
     const allocator = arena.allocator();
 
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, "test_db");
+    try cwd.createDirPath(testing_io, "test_db");
     defer {
-        std.Io.Dir.cwd().deleteTree(io, "test_db") catch {
+        std.Io.Dir.cwd().deleteTree(testing_io, "test_db") catch {
             @panic("gg");
         };
     }
-    var dir = try cwd.openDir(io, "test_db", .{});
-    defer dir.close(io);
+    var dir = try cwd.openDir(testing_io, "test_db", .{});
+    defer dir.close(testing_io);
 
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
@@ -578,7 +579,7 @@ test "Remove" {
     try tb.put("b" ** 10, "b" ** 10, 1);
     try tb.remove("b" ** 10, 2);
 
-    var table = try SSTable.create(dir, name, &tb, allocator);
+    var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
     defer table.deinit();
 
     const val = try table.find_value("b" ** 10, allocator);
@@ -599,14 +600,14 @@ test "Remove more than one block" {
     const allocator = arena.allocator();
 
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, "test_db");
+    try cwd.createDirPath(testing_io, "test_db");
     defer {
-        std.Io.Dir.cwd().deleteTree(io, "test_db") catch {
+        std.Io.Dir.cwd().deleteTree(testing_io, "test_db") catch {
             @panic("gg");
         };
     }
-    var dir = try cwd.openDir(io, "test_db", .{});
-    defer dir.close(io);
+    var dir = try cwd.openDir(testing_io, "test_db", .{});
+    defer dir.close(testing_io);
 
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
@@ -619,7 +620,7 @@ test "Remove more than one block" {
     {
         const name = try generate_lvl_name(allocator, 0);
         defer allocator.free(name);
-        var table = try SSTable.create(dir, name, &tb, allocator);
+        var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
         defer table.deinit();
 
         const val = try table.find_value("b" ** (BlockSize / 4), allocator);
@@ -641,7 +642,7 @@ test "Remove more than one block" {
 
         try tb.remove("b" ** (BlockSize / 4), 5);
 
-        var table = try SSTable.create(dir, name, &tb, allocator);
+        var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
         defer table.deinit();
 
         const val = try table.find_value("b" ** (BlockSize / 4), allocator);

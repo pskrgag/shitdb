@@ -71,7 +71,7 @@ pub const Wal = struct {
             var edit = try VersionEdit.empty(alloc);
 
             edit.add_wal = seq;
-            try v.apply(edit, alloc);
+            try v.apply(edit, io, alloc);
         }
 
         return .{ .file = file };
