@@ -9,21 +9,23 @@ const KeyValueOwned = @import("storage").KeyValueOwned;
 const Mutex = std.Io.Mutex;
 const Value = std.atomic.Value;
 const FileMeta = @import("storage").manifest.FileMeta;
+const FileSeq = @import("storage").manifest.FileSeq;
 const WalTable = @import("wal_table.zig").WalTable;
 const Wal = @import("wal.zig").Wal;
 const MemTableOpts = @import("storage").MemTableOpts;
+const KVSeq = @import("storage").KVSeq;
 
 pub const Version = struct {
     // File handle
     file: File,
     // Next file number
-    next_file: Value(usize),
+    next_file: Value(FileSeq),
     // Next sequence number
-    next_sequence: Value(usize),
+    next_sequence: Value(KVSeq),
     // Alive SSTables
     tables: std.ArrayList(FileMeta),
     // Alive WALs
-    wals: std.ArrayList(usize),
+    wals: std.ArrayList(FileSeq),
     // Protects concurrent edit applies
     mutex: Mutex,
     // Flusher that periodically flushes immutable tables
@@ -42,34 +44,34 @@ pub const Version = struct {
             try rec.serialize_to(&serialized_records, alloc);
         }
 
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+
         const offset = try self.file.length(io);
 
         // NOTE: writePositionalAll sends all data directly to kernel. Sync makes it go to the disk
         try self.file.writePositionalAll(io, serialized_records.items, offset);
         try self.file.sync(io);
 
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
-
         for (edit.new_files.items) |file| {
             try self.tables.append(alloc, file);
         }
 
-        // if (edit.next_file) |next_file| {
-        //     self.next_file = Value(usize).init(next_file);
-        // }
+        if (edit.next_file) |next_file| {
+            self.next_file = Value(FileSeq).init(next_file);
+        }
     }
 
-    pub fn next_seq(self: *Self) usize {
-        return self.next_sequence.fetchAdd(1, .monotonic);
+    pub fn next_seq(self: *Self) KVSeq {
+        return self.next_sequence.fetchAdd(KVSeq.init(1), .monotonic);
     }
 
-    pub fn current_seq(self: *Self) usize {
+    pub fn current_seq(self: *Self) KVSeq {
         return self.next_sequence.load(.monotonic);
     }
 
-    pub fn new_file_seq(self: *Self) usize {
-        return self.next_file.fetchAdd(1, .monotonic);
+    pub fn new_file_seq(self: *Self) FileSeq {
+        return self.next_file.fetchAdd(FileSeq.init(1), .monotonic);
     }
 
     pub fn from_file(dir: std.Io.Dir, path: []const u8, opts: MemTableOpts, io: std.Io, alloc: Allocator) !*Self {
@@ -87,10 +89,10 @@ pub const Version = struct {
             .flusher = try Flusher.new(alloc, res, dir, io),
             .file = file,
             .tables = try std.ArrayList(FileMeta).initCapacity(alloc, 0),
-            .next_file = Value(usize).init(0),
-            .next_sequence = Value(usize).init(0),
+            .next_file = Value(FileSeq).init(FileSeq.init(0)),
+            .next_sequence = Value(KVSeq).init(KVSeq.init(0)),
             .mutex = Mutex.init,
-            .wals = try std.ArrayList(usize).initCapacity(alloc, 0),
+            .wals = try std.ArrayList(FileSeq).initCapacity(alloc, 0),
         };
         errdefer res.deinit(io, alloc);
 
@@ -118,8 +120,8 @@ pub const Version = struct {
         self.flusher.insert(table);
     }
 
-    fn file_name(seq: usize, alloc: Allocator) ![]const u8 {
-        const res = std.fmt.allocPrint(alloc, "memtable{}.sst", .{seq});
+    fn file_name(seq: FileSeq, alloc: Allocator) ![]const u8 {
+        const res = std.fmt.allocPrint(alloc, "memtable{}.sst", .{seq.get()});
         return res;
     }
 
@@ -140,9 +142,9 @@ pub const Version = struct {
             .name = name,
             .max = max,
             .min = min,
-            .seq = table.seq,
+            .file_seq = table.seq,
+            .value_seq = table.max_seq(),
         });
-        edit.next_file = table.seq + 1;
 
         // TODO: maybe make SSTable::create generic over table type? Accessing table.table is ugly af.
         var sstable = try SSTable.create(dir, name, &table.table, io, alloc);
@@ -214,16 +216,20 @@ pub const Version = struct {
         for (edits.items) |edit| {
             switch (edit) {
                 .NextFileNumber => |next| self.next_file.store(next, .monotonic),
-                .NextSeqNumber => |next| self.next_sequence.store(next, .monotonic),
+                .NextSeqNumber => |next| self.next_sequence.store(KVSeq.init(next), .monotonic),
                 .AddFile => |f| {
                     try self.tables.append(alloc, f);
 
-                    while (self.next_file.load(.monotonic) <= f.seq) {
-                        self.next_file.store(f.seq + 1, .monotonic);
+                    if (self.next_file.load(.monotonic).get() <= f.file_seq.get()) {
+                        self.next_file.store(FileSeq.init(f.file_seq.get() + 1), .monotonic);
+                    }
+
+                    if (self.next_sequence.load(.monotonic).get() <= f.value_seq.get()) {
+                        self.next_sequence.store(KVSeq.init(f.value_seq.get() + 1), .monotonic);
                     }
 
                     for (self.wals.items, 0..) |wal, idx| {
-                        if (wal == f.seq) {
+                        if (wal.get() == f.file_seq.get()) {
                             _ = self.wals.swapRemove(idx);
                             break;
                         }
@@ -236,7 +242,7 @@ pub const Version = struct {
                     var found = false;
 
                     for (self.tables.items, 0..) |file, idx| {
-                        if (file.seq == f.seq and file.lvl == f.lvl) {
+                        if (file.file_seq == f.seq and file.lvl == f.lvl) {
                             _ = self.tables.swapRemove(idx);
                             found = true;
                             break;
@@ -271,10 +277,10 @@ pub const Version = struct {
 };
 
 pub const VersionEdit = struct {
-    next_file: ?usize,
+    next_file: ?FileSeq,
     new_files: std.ArrayList(FileMeta),
-    next_seq: ?usize,
-    add_wal: ?usize,
+    next_seq: ?KVSeq,
+    add_wal: ?FileSeq,
 
     pub fn as_manifest_records(
         self: *const VersionEdit,
@@ -283,7 +289,7 @@ pub const VersionEdit = struct {
         var res = try std.ArrayList(manifest.ManifestRecord).initCapacity(alloc, 0);
 
         if (self.next_seq) |seq| {
-            try res.append(alloc, .{ .NextSeqNumber = seq });
+            try res.append(alloc, .{ .NextSeqNumber = seq.get() });
         }
 
         if (self.next_file) |file| {
@@ -339,7 +345,7 @@ test "Version serialization" {
     {
         var edit = try VersionEdit.empty(allocator);
         defer edit.new_files.deinit(allocator);
-        edit.next_seq = 1;
+        edit.next_seq = KVSeq.init(1);
         try version.apply(edit, testing_io, allocator);
     }
 }
@@ -357,15 +363,16 @@ fn test_file_meta(
     var memtable = try MemTable.new(alloc, null);
     defer memtable.deinit(alloc);
 
-    try memtable.put(min_key, min_value, seq);
-    try memtable.put(max_key, max_value, seq + 1);
+    try memtable.put(min_key, min_value, KVSeq.init(seq));
+    try memtable.put(max_key, max_value, KVSeq.init(seq + 1));
 
     return .{
         .name = try alloc.dupe(u8, name),
         .lvl = lvl,
-        .seq = seq,
+        .file_seq = FileSeq.init(seq),
         .min = try KeyValueOwned.from_kv(memtable.min().?, alloc),
         .max = try KeyValueOwned.from_kv(memtable.max().?, alloc),
+        .value_seq = KVSeq.init(seq + 1),
     };
 }
 
@@ -375,8 +382,8 @@ test "VersionEdit serializes manifest records in replay order" {
     const allocator = arena.allocator();
 
     var edit = try VersionEdit.empty(allocator);
-    edit.next_seq = 17;
-    edit.next_file = 42;
+    edit.next_seq = KVSeq.init(17);
+    edit.next_file = FileSeq.init(42);
     try edit.new_files.append(allocator, try test_file_meta(
         allocator,
         "memtable42.sst",
@@ -391,7 +398,7 @@ test "VersionEdit serializes manifest records in replay order" {
     const records = try edit.as_manifest_records(allocator);
     try std.testing.expectEqual(@as(usize, 3), records.items.len);
     try std.testing.expectEqual(@as(usize, 17), records.items[0].NextSeqNumber);
-    try std.testing.expectEqual(@as(usize, 42), records.items[1].NextFileNumber);
+    try std.testing.expectEqual(@as(usize, 42), records.items[1].NextFileNumber.get());
     try std.testing.expectEqualSlices(u8, "memtable42.sst", records.items[2].AddFile.name);
 
     var serialized = try std.ArrayList(u8).initCapacity(allocator, 0);
@@ -402,7 +409,7 @@ test "VersionEdit serializes manifest records in replay order" {
     const deserialized = try manifest.ManifestRecord.deserialize_from(serialized.items, allocator);
     try std.testing.expectEqual(@as(usize, 3), deserialized.items.len);
     try std.testing.expectEqual(@as(usize, 17), deserialized.items[0].NextSeqNumber);
-    try std.testing.expectEqual(@as(usize, 42), deserialized.items[1].NextFileNumber);
+    try std.testing.expectEqual(@as(usize, 42), deserialized.items[1].NextFileNumber.get());
     try std.testing.expectEqualSlices(u8, "memtable42.sst", deserialized.items[2].AddFile.name);
     try std.testing.expectEqual(@as(u8, 0), deserialized.items[2].AddFile.lvl);
 }
@@ -431,8 +438,8 @@ test "Version apply persists edits that reopen can replay" {
 
         var edit = try VersionEdit.empty(allocator);
         defer edit.new_files.deinit(allocator);
-        edit.next_seq = 9;
-        edit.next_file = 11;
+        edit.next_seq = KVSeq.init(9);
+        edit.next_file = FileSeq.init(11);
         try edit.new_files.append(allocator, try test_file_meta(
             allocator,
             "memtable11.sst",
@@ -451,8 +458,8 @@ test "Version apply persists edits that reopen can replay" {
         var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
-        try std.testing.expectEqual(@as(usize, 9), reopened.current_seq());
-        try std.testing.expectEqual(@as(usize, 12), reopened.next_file.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 13), reopened.current_seq().get());
+        try std.testing.expectEqual(@as(usize, 12), reopened.next_file.load(.monotonic).get());
         try std.testing.expectEqual(@as(usize, 1), reopened.tables.items.len);
         try std.testing.expectEqualSlices(u8, "memtable11.sst", reopened.tables.items[0].name);
     }

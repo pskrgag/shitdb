@@ -67,6 +67,7 @@ test "Simple API Test" {
     const allocator = arena.allocator();
     const io = std.testing.io;
 
+    std.Io.Dir.cwd().deleteTree(io, "test_db2") catch {};
     var new = try KeyValue.new("test_db2", allocator, io, null);
     defer {
         new.deinit();

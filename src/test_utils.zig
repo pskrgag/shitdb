@@ -119,6 +119,14 @@ pub fn test_hash_table_equavalance(c: anytype, debug: bool, steps: usize) !void 
                                         try container.put(i.key.items, i.value.items, seq);
                                         seq += 1;
                                     },
+                                    .@"struct" => |s| {
+                                        if (comptime @hasDecl(f.params[3].type.?, "init") and s.fields.len == 1) {
+                                            try container.put(i.key.items, i.value.items, f.params[3].type.?.init(seq));
+                                            seq += 1;
+                                        } else {
+                                            try container.put(i.key.items, i.value.items, allocator);
+                                        }
+                                    },
                                     else => try container.put(i.key.items, i.value.items, allocator),
                                 }
                             },
@@ -146,6 +154,14 @@ pub fn test_hash_table_equavalance(c: anytype, debug: bool, steps: usize) !void 
                                         try container.remove(rm.key.items, seq);
                                         seq += 1;
                                     },
+                                    .@"struct" => |s| {
+                                        if (comptime @hasDecl(f.params[2].type.?, "init") and s.fields.len == 1) {
+                                            try container.remove(rm.key.items, f.params[2].type.?.init(seq));
+                                            seq += 1;
+                                        } else {
+                                            try container.remove(rm.key.items, allocator);
+                                        }
+                                    },
                                     else => try container.remove(rm.key.items, allocator),
                                 }
                             },
@@ -170,7 +186,20 @@ pub fn test_hash_table_equavalance(c: anytype, debug: bool, steps: usize) !void 
                 .@"fn" => |f| {
                     const value = switch (f.params.len) {
                         3 => container.get(next.key_ptr.*, allocator),
-                        4 => container.get(next.key_ptr.*, seq, allocator),
+                        4 => blk: {
+                            const seq_param = f.params[2].type.?;
+                            switch (@typeInfo(seq_param)) {
+                                .int => break :blk container.get(next.key_ptr.*, seq, allocator),
+                                .@"struct" => |s| {
+                                    if (comptime @hasDecl(seq_param, "init") and s.fields.len == 1) {
+                                        break :blk container.get(next.key_ptr.*, seq_param.init(seq), allocator);
+                                    } else {
+                                        @compileError("unsupported get sequence parameter");
+                                    }
+                                },
+                                else => @compileError("unsupported get sequence parameter"),
+                            }
+                        },
                         else => @compileError("ohhh2"),
                     };
 

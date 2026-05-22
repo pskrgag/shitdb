@@ -4,6 +4,7 @@ const MemTable = @import("memtable.zig").MemTable;
 const GetResult = @import("memtable.zig").GetResult;
 const KeyValue = @import("memtable.zig").KeyValue;
 const KeyValueOwned = @import("memtable.zig").KeyValueOwned;
+const KVSeq = @import("memtable.zig").KVSeq;
 const Allocator = std.mem.Allocator;
 const merging_iterator = @import("merging_iterator");
 
@@ -382,7 +383,11 @@ pub const SSTable = struct {
             .magic = Magic,
         });
 
+        // Sync data
         try std.posix.msync(mmap_copy, std.posix.MSF.SYNC);
+        // Sync file metadata as well
+        try file.sync(io);
+
         return .{ .path = name, .file = mmap_copy, .lvl = 0 };
     }
 
@@ -474,7 +479,7 @@ test "Simple find and create" {
     defer allocator.free(name);
 
     inline for (1..200) |i| {
-        try tb.put("a" ** i, "a" ** i, 0);
+        try tb.put("a" ** i, "a" ** i, KVSeq.init(0));
     }
 
     var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
@@ -537,7 +542,7 @@ test "Merge" {
     defer allocator.free(name);
 
     inline for (1..200) |i| {
-        try tb.put("a" ** (i * 2 + 1), "a" ** (i * 2 + 1), i);
+        try tb.put("a" ** (i * 2 + 1), "a" ** (i * 2 + 1), KVSeq.init(i));
     }
     var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
     defer table.deinit();
@@ -546,7 +551,7 @@ test "Merge" {
     defer tb1.deinit(allocator);
 
     inline for (1..200) |i| {
-        try tb1.put("ab" ** (i * 2), "ba" ** (i * 2), i);
+        try tb1.put("ab" ** (i * 2), "ba" ** (i * 2), KVSeq.init(i));
     }
     const name1 = try generate_lvl_name(allocator, 201);
     defer allocator.free(name1);
@@ -576,8 +581,8 @@ test "Remove" {
     const name = try generate_lvl_name(allocator, 0);
     defer allocator.free(name);
 
-    try tb.put("b" ** 10, "b" ** 10, 1);
-    try tb.remove("b" ** 10, 2);
+    try tb.put("b" ** 10, "b" ** 10, KVSeq.init(1));
+    try tb.remove("b" ** 10, KVSeq.init(2));
 
     var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
     defer table.deinit();
@@ -612,10 +617,10 @@ test "Remove more than one block" {
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
 
-    try tb.put("b" ** (BlockSize / 4), "b" ** (BlockSize / 4), 1);
-    try tb.put("b" ** (BlockSize / 4), "d" ** (BlockSize / 4), 2);
-    try tb.put("b" ** (BlockSize / 4), "c" ** (BlockSize / 4), 3);
-    try tb.put("b" ** (BlockSize / 4), "d" ** (BlockSize / 4), 4);
+    try tb.put("b" ** (BlockSize / 4), "b" ** (BlockSize / 4), KVSeq.init(1));
+    try tb.put("b" ** (BlockSize / 4), "d" ** (BlockSize / 4), KVSeq.init(2));
+    try tb.put("b" ** (BlockSize / 4), "c" ** (BlockSize / 4), KVSeq.init(3));
+    try tb.put("b" ** (BlockSize / 4), "d" ** (BlockSize / 4), KVSeq.init(4));
 
     {
         const name = try generate_lvl_name(allocator, 0);
@@ -640,7 +645,7 @@ test "Remove more than one block" {
         const name = try generate_lvl_name(allocator, 1);
         defer allocator.free(name);
 
-        try tb.remove("b" ** (BlockSize / 4), 5);
+        try tb.remove("b" ** (BlockSize / 4), KVSeq.init(5));
 
         var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
         defer table.deinit();

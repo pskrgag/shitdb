@@ -2,6 +2,7 @@ const std = @import("std");
 const utils = @import("utils.zig");
 const KeyValueOwned = @import("memtable.zig").KeyValueOwned;
 const KeyValue = @import("memtable.zig").KeyValue;
+const KVSeq = @import("memtable.zig").KVSeq;
 const Writer = std.Io.File.Writer;
 const Allocator = std.mem.Allocator;
 const data_as_u8_const_ptr = utils.data_as_u8_const_ptr;
@@ -11,12 +12,25 @@ const NextFileNumberMagic = 0x12;
 const NextSeqNumberMagic = 0x13;
 const AddWalMagic = 0x14;
 
+pub const FileSeq = packed struct(usize) {
+    value: usize,
+
+    pub fn init(v: usize) FileSeq {
+        return .{ .value = v };
+    }
+
+    pub fn get(self: *const FileSeq) usize {
+        return self.value;
+    }
+};
+
 pub const FileMeta = struct {
     name: []const u8,
     max: KeyValueOwned,
     min: KeyValueOwned,
     lvl: u8,
-    seq: usize,
+    file_seq: FileSeq,
+    value_seq: KVSeq,
 
     pub fn deinit(self: *FileMeta, alloc: Allocator) void {
         alloc.free(self.name);
@@ -30,7 +44,7 @@ pub const FileMeta = struct {
         if (lhs.lvl != rhs.lvl)
             return lhs.lvl < rhs.lvl;
 
-        return lhs.seq > rhs.seq;
+        return lhs.file_seq.get() > rhs.file_seq.get();
     }
 };
 
@@ -41,12 +55,12 @@ pub const FileMeta = struct {
 pub const ManifestRecord = union(enum) {
     AddFile: FileMeta,
     DeleteFile: struct {
-        seq: usize,
+        seq: FileSeq,
         lvl: u8,
     },
-    NextFileNumber: usize,
+    NextFileNumber: FileSeq,
     NextSeqNumber: usize,
-    AddWal: usize,
+    AddWal: FileSeq,
 
     const Self = @This();
 
@@ -59,7 +73,7 @@ pub const ManifestRecord = union(enum) {
 
         switch (self.*) {
             .AddFile => |add| {
-                full = ManifestRecord.string_size(add.name) + @sizeOf(u8) + @sizeOf(usize) + ManifestRecord.string_size(add.max.data) + ManifestRecord.string_size(add.min.data);
+                full = ManifestRecord.string_size(add.name) + @sizeOf(u8) + @sizeOf(usize) + @sizeOf(usize) + ManifestRecord.string_size(add.max.data) + ManifestRecord.string_size(add.min.data);
             },
             .AddWal => |a| {
                 full = @sizeOf(@TypeOf(a));
@@ -137,7 +151,8 @@ pub const ManifestRecord = union(enum) {
             .AddFile => |add| {
                 Self.put_int(u8, &data, AddMagic);
                 Self.put_int(u8, &data, add.lvl);
-                Self.put_int(usize, &data, add.seq);
+                Self.put_int(usize, &data, add.file_seq.get());
+                Self.put_int(usize, &data, add.value_seq.get());
 
                 Self.put_slice(&data, add.name);
                 Self.put_slice(&data, add.max.data);
@@ -145,7 +160,7 @@ pub const ManifestRecord = union(enum) {
             },
             .NextFileNumber => |next| {
                 Self.put_int(u8, &data, NextFileNumberMagic);
-                Self.put_int(usize, &data, next);
+                Self.put_int(usize, &data, next.get());
             },
             .NextSeqNumber => |next| {
                 Self.put_int(u8, &data, NextSeqNumberMagic);
@@ -156,7 +171,7 @@ pub const ManifestRecord = union(enum) {
             },
             .AddWal => |wal| {
                 Self.put_int(u8, &data, AddWalMagic);
-                Self.put_int(usize, &data, wal);
+                Self.put_int(usize, &data, wal.get());
             },
         }
     }
@@ -171,7 +186,8 @@ pub const ManifestRecord = union(enum) {
             switch (magic) {
                 AddMagic => {
                     const lvl = Self.get_int(u8, &iter);
-                    const seq = Self.get_int(usize, &iter);
+                    const file_seq = FileSeq.init(Self.get_int(usize, &iter));
+                    const value_seq = KVSeq.init(Self.get_int(usize, &iter));
                     const name = Self.get_slice(&iter);
                     const max = Self.get_slice(&iter);
                     const min = Self.get_slice(&iter);
@@ -181,11 +197,12 @@ pub const ManifestRecord = union(enum) {
                         .name = try alloc.dupe(u8, name),
                         .min = try KeyValueOwned.from_kv(&KeyValue{ .data = min.ptr }, alloc),
                         .max = try KeyValueOwned.from_kv(&KeyValue{ .data = max.ptr }, alloc),
-                        .seq = seq,
+                        .file_seq = file_seq,
+                        .value_seq = value_seq,
                     } });
                 },
                 NextFileNumberMagic => {
-                    const filenum = Self.get_int(usize, &iter);
+                    const filenum = FileSeq.init(Self.get_int(usize, &iter));
                     try res.append(alloc, .{ .NextFileNumber = filenum });
                 },
                 NextSeqNumberMagic => {
@@ -193,7 +210,7 @@ pub const ManifestRecord = union(enum) {
                     try res.append(alloc, .{ .NextSeqNumber = filenum });
                 },
                 AddWalMagic => {
-                    const wal = Self.get_int(usize, &iter);
+                    const wal = FileSeq.init(Self.get_int(usize, &iter));
                     try res.append(alloc, .{ .AddWal = wal });
                 },
                 else => return error.CorruptedData,

@@ -9,6 +9,7 @@ const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 const SSTable = @import("storage").sstable.SSTable;
 const WalTable = @import("wal_table.zig").WalTable;
+const KVSeq = @import("storage").KVSeq;
 
 const MaxNumTables: usize = 5;
 
@@ -108,7 +109,7 @@ pub const Flusher = struct {
         }
     }
 
-    pub fn get(self: *Flusher, key: []const u8, seq: usize, alloc: Allocator) !?[]const u8 {
+    pub fn get(self: *Flusher, key: []const u8, seq: KVSeq, alloc: Allocator) !?[]const u8 {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 

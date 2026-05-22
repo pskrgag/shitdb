@@ -6,6 +6,8 @@ const Allocator = std.mem.Allocator;
 const MemTableOpts = @import("storage").MemTableOpts;
 const GetResult = @import("storage").GetResult;
 const KeyValue = @import("storage").KeyValue;
+const KVSeq = @import("storage").KVSeq;
+const FileSeq = @import("storage").manifest.FileSeq;
 const fi = @import("fault_injection");
 const Version = @import("version.zig").Version;
 const VersionEdit = @import("version.zig").VersionEdit;
@@ -14,14 +16,14 @@ const VersionEdit = @import("version.zig").VersionEdit;
 pub const WalTable = struct {
     table: MemTable,
     wal: Wal,
-    seq: usize,
+    seq: FileSeq,
     io: std.Io,
 
     /// Constructs new WAL+MemTable
     pub fn new(
         dir: std.Io.Dir,
         user_opts: ?MemTableOpts,
-        seq: usize,
+        seq: FileSeq,
         version: ?*Version,
         io: std.Io,
         alloc: Allocator,
@@ -40,7 +42,7 @@ pub const WalTable = struct {
     pub fn open(
         dir: std.Io.Dir,
         user_opts: MemTableOpts,
-        seq: usize,
+        seq: FileSeq,
         io: std.Io,
         alloc: Allocator,
     ) !*WalTable {
@@ -56,16 +58,16 @@ pub const WalTable = struct {
         return self;
     }
 
-    pub fn put_but_record(self: *WalTable, key: []const u8, value: []const u8, seq: usize) !void {
+    pub fn put_but_record(self: *WalTable, key: []const u8, value: []const u8, seq: KVSeq) !void {
         try self.table.put(key, value, seq);
     }
 
-    pub fn remove_but_record(self: *WalTable, key: []const u8, seq: usize) !void {
+    pub fn remove_but_record(self: *WalTable, key: []const u8, seq: KVSeq) !void {
         try self.table.remove(key, seq);
     }
 
     /// Puts value from the memtable and records it into WAL
-    pub fn put(self: *WalTable, key: []const u8, value: []const u8, seq: usize) !void {
+    pub fn put(self: *WalTable, key: []const u8, value: []const u8, seq: KVSeq) !void {
         const entry: WalEntry = .{ .Add = .{ .key = key, .value = value, .seq = seq } };
 
         try self.wal.record(entry, self.io);
@@ -74,7 +76,7 @@ pub const WalTable = struct {
     }
 
     /// Removes value from the memtable and records it into WAL
-    pub fn remove(self: *WalTable, key: []const u8, seq: usize) !void {
+    pub fn remove(self: *WalTable, key: []const u8, seq: KVSeq) !void {
         const entry: WalEntry = .{ .Remove = .{ .key = key, .seq = seq } };
 
         try self.wal.record(entry, self.io);
@@ -83,7 +85,7 @@ pub const WalTable = struct {
     }
 
     /// Retrieves value from the memtable
-    pub fn get(self: *WalTable, key: []const u8, seq: usize, alloc: Allocator) !GetResult {
+    pub fn get(self: *WalTable, key: []const u8, seq: KVSeq, alloc: Allocator) !GetResult {
         return try self.table.get(key, seq, alloc);
     }
 
@@ -95,6 +97,11 @@ pub const WalTable = struct {
     /// Returns minimal key
     pub fn min(self: *WalTable) ?*const KeyValue {
         return self.table.min();
+    }
+
+    /// Returns minimal key
+    pub fn max_seq(self: *WalTable) KVSeq {
+        return self.table.max_seq;
     }
 
     /// Deinits table

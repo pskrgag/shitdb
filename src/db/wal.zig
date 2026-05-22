@@ -7,6 +7,8 @@ const WalTable = @import("wal_table.zig").WalTable;
 const Version = @import("version.zig").Version;
 const VersionEdit = @import("version.zig").VersionEdit;
 const Crc32 = std.hash.Crc32;
+const KVSeq = @import("storage").KVSeq;
+const FileSeq = @import("storage").manifest.FileSeq;
 
 const AddMagic: u8 = 0x10;
 const RemoveMagic: u8 = 0x12;
@@ -16,13 +18,13 @@ pub const WalEntry = union(enum) {
     Add: struct {
         key: []const u8,
         value: []const u8,
-        seq: usize,
+        seq: KVSeq,
     },
 
     // Removed key
     Remove: struct {
         key: []const u8,
-        seq: usize,
+        seq: KVSeq,
     },
 
     fn checksum(self: *const WalEntry) u32 {
@@ -32,11 +34,11 @@ pub const WalEntry = union(enum) {
             .Add => |add| {
                 hash.update(add.key);
                 hash.update(add.value);
-                hash.update(&std.mem.toBytes(add.seq));
+                hash.update(&std.mem.toBytes(add.seq.get()));
             },
             .Remove => |rem| {
                 hash.update(rem.key);
-                hash.update(&std.mem.toBytes(rem.seq));
+                hash.update(&std.mem.toBytes(rem.seq.get()));
             },
         }
 
@@ -48,12 +50,12 @@ pub const Wal = struct {
     // WAL file
     file: File,
 
-    fn file_name(alloc: Allocator, seq: usize) ![]const u8 {
-        const res = std.fmt.allocPrint(alloc, "WAL{}.sst", .{seq});
+    fn file_name(alloc: Allocator, seq: FileSeq) ![]const u8 {
+        const res = std.fmt.allocPrint(alloc, "WAL{}.sst", .{seq.get()});
         return res;
     }
 
-    pub fn open(dir: Dir, seq: usize, io: Io, alloc: Allocator) !Wal {
+    pub fn open(dir: Dir, seq: FileSeq, io: Io, alloc: Allocator) !Wal {
         const name = try Wal.file_name(alloc, seq);
         defer alloc.free(name);
 
@@ -61,7 +63,7 @@ pub const Wal = struct {
         return .{ .file = file };
     }
 
-    pub fn new(dir: Dir, seq: usize, version: ?*Version, io: Io, alloc: Allocator) !Wal {
+    pub fn new(dir: Dir, seq: FileSeq, version: ?*Version, io: Io, alloc: Allocator) !Wal {
         const name = try Wal.file_name(alloc, seq);
         defer alloc.free(name);
 
@@ -91,24 +93,28 @@ pub const Wal = struct {
                 try w.writeAll(add.key);
                 try w.writeAll(&std.mem.toBytes(add.value.len));
                 try w.writeAll(add.value);
-                try w.writeAll(&std.mem.toBytes(add.seq));
+                try w.writeAll(&std.mem.toBytes(add.seq.get()));
                 try w.writeAll(&std.mem.toBytes(entry.checksum()));
             },
             .Remove => |rem| {
                 try w.writeAll(&std.mem.toBytes(RemoveMagic));
                 try w.writeAll(&std.mem.toBytes(rem.key.len));
                 try w.writeAll(rem.key);
-                try w.writeAll(&std.mem.toBytes(rem.seq));
+                try w.writeAll(&std.mem.toBytes(rem.seq.get()));
                 try w.writeAll(&std.mem.toBytes(entry.checksum()));
             },
         }
 
         try w.flush();
+        try self.file.sync(io);
     }
 
     pub fn replay_to(self: *const Wal, to: *WalTable, io: std.Io) !void {
         const stat = try self.file.stat(io);
         const size = stat.size;
+
+        if (size == 0)
+            return;
 
         const mmap = try std.posix.mmap(
             null,
@@ -155,7 +161,7 @@ pub const Wal = struct {
                     if (size - iter < @sizeOf(usize))
                         return error.InvalidFormat;
 
-                    const seq = std.mem.readInt(usize, mmap[iter..][0..@sizeOf(usize)], .little);
+                    const seq = KVSeq.init(std.mem.readInt(usize, mmap[iter..][0..@sizeOf(usize)], .little));
                     iter += @sizeOf(usize);
 
                     if (size - iter < @sizeOf(u32))
@@ -174,7 +180,7 @@ pub const Wal = struct {
                     if (size - iter < @sizeOf(usize))
                         return error.InvalidFormat;
 
-                    const seq = std.mem.readInt(usize, mmap[iter..][0..@sizeOf(usize)], .little);
+                    const seq = KVSeq.init(std.mem.readInt(usize, mmap[iter..][0..@sizeOf(usize)], .little));
                     iter += @sizeOf(usize);
 
                     if (size - iter < @sizeOf(u32))
@@ -212,7 +218,7 @@ fn openTestDir(dirname: []const u8) !Dir {
 }
 
 fn readWalFile(dir: Dir, seq: usize, alloc: Allocator) ![]u8 {
-    const name = try Wal.file_name(alloc, seq);
+    const name = try Wal.file_name(alloc, FileSeq.init(seq));
     defer alloc.free(name);
 
     const file = try dir.openFile(testing_io, name, .{});
@@ -227,7 +233,7 @@ fn readWalFile(dir: Dir, seq: usize, alloc: Allocator) ![]u8 {
 }
 
 fn writeWalFile(dir: Dir, seq: usize, data: []const u8, alloc: Allocator) !void {
-    const name = try Wal.file_name(alloc, seq);
+    const name = try Wal.file_name(alloc, FileSeq.init(seq));
     defer alloc.free(name);
 
     const file = try dir.createFile(testing_io, name, .{
@@ -250,10 +256,10 @@ fn readU32(data: []const u8) u32 {
 fn expectReplayInvalidFormat(dir: Dir, seq: usize, data: []const u8, alloc: Allocator) !void {
     try writeWalFile(dir, seq, data, alloc);
 
-    var wal = try Wal.open(dir, seq, testing_io, alloc);
+    var wal = try Wal.open(dir, FileSeq.init(seq), testing_io, alloc);
     defer wal.file.close(testing_io);
 
-    var target = try WalTable.new(dir, null, seq + 1000, null, testing_io, alloc);
+    var target = try WalTable.new(dir, null, FileSeq.init(seq + 1000), null, testing_io, alloc);
     defer target.deinit(alloc);
 
     try std.testing.expectError(error.InvalidFormat, wal.replay_to(target, testing_io));
@@ -275,9 +281,9 @@ test "WAL serializes add record" {
         };
     }
 
-    var wal = try Wal.new(dir, 1, null, testing_io, allocator);
+    var wal = try Wal.new(dir, FileSeq.init(1), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
 
     const data = try readWalFile(dir, 1, allocator);
     defer allocator.free(data);
@@ -296,7 +302,7 @@ test "WAL serializes add record" {
     try std.testing.expectEqual(@as(usize, 7), readUsize(data[pos .. pos + @sizeOf(usize)]));
     pos += @sizeOf(usize);
     try std.testing.expectEqual(
-        (WalEntry{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }).checksum(),
+        (WalEntry{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }).checksum(),
         readU32(data[pos .. pos + @sizeOf(u32)]),
     );
     pos += @sizeOf(u32);
@@ -319,9 +325,9 @@ test "WAL serializes remove record" {
         };
     }
 
-    var wal = try Wal.new(dir, 2, null, testing_io, allocator);
+    var wal = try Wal.new(dir, FileSeq.init(2), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Remove = .{ .key = "beta", .seq = 42 } }, testing_io);
+    try wal.record(.{ .Remove = .{ .key = "beta", .seq = KVSeq.init(42) } }, testing_io);
 
     const data = try readWalFile(dir, 2, allocator);
     defer allocator.free(data);
@@ -336,7 +342,7 @@ test "WAL serializes remove record" {
     try std.testing.expectEqual(@as(usize, 42), readUsize(data[pos .. pos + @sizeOf(usize)]));
     pos += @sizeOf(usize);
     try std.testing.expectEqual(
-        (WalEntry{ .Remove = .{ .key = "beta", .seq = 42 } }).checksum(),
+        (WalEntry{ .Remove = .{ .key = "beta", .seq = KVSeq.init(42) } }).checksum(),
         readU32(data[pos .. pos + @sizeOf(u32)]),
     );
     pos += @sizeOf(u32);
@@ -359,10 +365,10 @@ test "WAL serializes records in append order" {
         };
     }
 
-    var wal = try Wal.new(dir, 3, null, testing_io, allocator);
+    var wal = try Wal.new(dir, FileSeq.init(3), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }, testing_io);
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = 8 } }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
+    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, testing_io);
 
     const data = try readWalFile(dir, 3, allocator);
     defer allocator.free(data);
@@ -381,7 +387,7 @@ test "WAL serializes records in append order" {
     try std.testing.expectEqual(@as(usize, 7), readUsize(data[pos .. pos + @sizeOf(usize)]));
     pos += @sizeOf(usize);
     try std.testing.expectEqual(
-        (WalEntry{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }).checksum(),
+        (WalEntry{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }).checksum(),
         readU32(data[pos .. pos + @sizeOf(u32)]),
     );
     pos += @sizeOf(u32);
@@ -396,7 +402,7 @@ test "WAL serializes records in append order" {
     try std.testing.expectEqual(@as(usize, 8), readUsize(data[pos .. pos + @sizeOf(usize)]));
     pos += @sizeOf(usize);
     try std.testing.expectEqual(
-        (WalEntry{ .Remove = .{ .key = "alpha", .seq = 8 } }).checksum(),
+        (WalEntry{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }).checksum(),
         readU32(data[pos .. pos + @sizeOf(u32)]),
     );
     pos += @sizeOf(u32);
@@ -420,15 +426,15 @@ test "WAL replay restores add record into target table" {
         };
     }
 
-    var wal = try Wal.new(dir, 4, null, testing_io, allocator);
+    var wal = try Wal.new(dir, FileSeq.init(4), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
 
-    var target = try WalTable.new(dir, null, 5, null, testing_io, allocator);
+    var target = try WalTable.new(dir, null, FileSeq.init(5), null, testing_io, allocator);
     defer target.deinit(allocator);
     try wal.replay_to(target, testing_io);
 
-    const value = try target.get("alpha", 7, allocator);
+    const value = try target.get("alpha", KVSeq.init(7), allocator);
     switch (value) {
         .Found => |v| {
             defer allocator.free(v);
@@ -454,15 +460,15 @@ test "WAL replay restores remove record into target table" {
         };
     }
 
-    var wal = try Wal.new(dir, 6, null, testing_io, allocator);
+    var wal = try Wal.new(dir, FileSeq.init(6), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = 8 } }, testing_io);
+    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, testing_io);
 
-    var target = try WalTable.new(dir, null, 7, null, testing_io, allocator);
+    var target = try WalTable.new(dir, null, FileSeq.init(7), null, testing_io, allocator);
     defer target.deinit(allocator);
     try wal.replay_to(target, testing_io);
 
-    const value = try target.get("alpha", 8, allocator);
+    const value = try target.get("alpha", KVSeq.init(8), allocator);
     try std.testing.expectEqual(@as(@TypeOf(value), .Removed), value);
 }
 
@@ -482,19 +488,19 @@ test "WAL replay applies later remove over earlier add" {
         };
     }
 
-    var wal = try Wal.new(dir, 8, null, testing_io, allocator);
+    var wal = try Wal.new(dir, FileSeq.init(8), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = 7 } }, testing_io);
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = 8 } }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
+    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, testing_io);
 
-    var target = try WalTable.new(dir, null, 9, null, testing_io, allocator);
+    var target = try WalTable.new(dir, null, FileSeq.init(9), null, testing_io, allocator);
     defer target.deinit(allocator);
     try wal.replay_to(target, testing_io);
 
-    const removed = try target.get("alpha", 8, allocator);
+    const removed = try target.get("alpha", KVSeq.init(8), allocator);
     try std.testing.expectEqual(@as(@TypeOf(removed), .Removed), removed);
 
-    const old_value = try target.get("alpha", 7, allocator);
+    const old_value = try target.get("alpha", KVSeq.init(7), allocator);
     switch (old_value) {
         .Found => |v| {
             defer allocator.free(v);

@@ -13,6 +13,18 @@ const Type = enum(u1) {
     Add = 1,
 };
 
+pub const KVSeq = packed struct(usize) {
+    value: usize,
+
+    pub fn init(v: usize) KVSeq {
+        return .{ .value = v };
+    }
+
+    pub fn get(self: *const KVSeq) usize {
+        return self.value;
+    }
+};
+
 pub const KeyValueOwned = struct {
     data: []const u8,
 
@@ -122,18 +134,18 @@ pub const KeyValue = struct {
         return @enumFromInt((self.data[size - 1] & (1 << 7)) >> 7);
     }
 
-    pub fn as_seq(self: *const KeyValue) usize {
+    pub fn as_seq(self: *const KeyValue) KVSeq {
         const size = self.full_size();
         const last_u64 = read_u64(self.data, size - IntSize);
 
-        return last_u64 & ((1 << 63) - 1);
+        return KVSeq.init(last_u64 & ((1 << 63) - 1));
     }
 
     fn is_tombstone(self: *const KeyValue) bool {
         return self.as_type() == .Delete;
     }
 
-    fn new(key: []const u8, value: ?[]const u8, seq: usize, tp: Type, alloc: Allocator) !KeyValue {
+    fn new(key: []const u8, value: ?[]const u8, seq: KVSeq, tp: Type, alloc: Allocator) !KeyValue {
         const val_len = if (value) |val| val.len else 0;
         const size = IntSize + key.len + IntSize + val_len + IntSize;
 
@@ -141,7 +153,7 @@ pub const KeyValue = struct {
             return error.TooBig;
 
         const ptr = try alloc.alignedAlloc(u8, std.mem.Alignment.@"8", size);
-        const seq_type = (seq & ~(@as(u64, 1) << 63)) | (@as(u64, @intFromEnum(tp)) << 63);
+        const seq_type = (seq.get() & ~(@as(u64, 1) << 63)) | (@as(u64, @intFromEnum(tp)) << 63);
 
         @memmove(ptr.ptr + 0, @as(*const [8]u8, @ptrCast(&key.len)));
         @memmove(ptr.ptr + IntSize, key);
@@ -160,7 +172,7 @@ pub const KeyValue = struct {
         const res = std.mem.order(u8, self.as_key(), other.as_key());
 
         if (res == .eq) {
-            return std.math.order(self.as_seq(), other.as_seq());
+            return std.math.order(self.as_seq().get(), other.as_seq().get());
         } else {
             return res;
         }
@@ -170,16 +182,16 @@ pub const KeyValue = struct {
         const res = std.mem.order(u8, self.as_key(), other.key);
 
         if (res == .eq) {
-            return std.math.order(self.as_seq(), other.seq);
+            return std.math.order(self.as_seq().get(), other.seq.get());
         } else {
             return res;
         }
     }
 };
 
-pub const FindKey = struct {
+const FindKey = struct {
     key: []const u8,
-    seq: usize,
+    seq: KVSeq,
 };
 
 pub const MemTableOpts = struct {
@@ -208,6 +220,7 @@ pub const GetResult = union(enum) {
 pub const MemTable = struct {
     table: skiplist.SkipList(KeyValue),
     arena: Arena,
+    max_seq: KVSeq,
 
     const Self = @This();
 
@@ -221,30 +234,38 @@ pub const MemTable = struct {
         //
         // So here I just try to guess enough memory for skiplist itself.
         const table = try skiplist.SkipList(KeyValue).new(alloc, opts.memtable_size * 10);
-        return .{ .arena = arena, .table = table };
+        return .{ .arena = arena, .table = table, .max_seq = KVSeq.init(0) };
     }
 
     /// Inserts new value into MemTable
-    pub fn put(self: *Self, key: []const u8, value: []const u8, seq: usize) !void {
+    pub fn put(self: *Self, key: []const u8, value: []const u8, seq: KVSeq) !void {
         const kv = try KeyValue.new(key, value, seq, Type.Add, self.arena.allocator());
 
         if (value.len == 0)
             return error.InvalidValue;
 
         std.debug.assert(!kv.is_tombstone());
+        // This extra = for tests
+        std.debug.assert(seq.get() >= self.max_seq.get());
+
+        self.max_seq = seq;
         _ = try self.table.insert(kv);
     }
 
     // Removes value from MemTable
-    pub fn remove(self: *Self, key: []const u8, seq: usize) !void {
+    pub fn remove(self: *Self, key: []const u8, seq: KVSeq) !void {
         const kv = try KeyValue.new(key, "", seq, Type.Delete, self.arena.allocator());
 
         std.debug.assert(kv.is_tombstone());
+        // This extra = for tests
+        std.debug.assert(seq.get() >= self.max_seq.get());
+
+        self.max_seq = seq;
         _ = try self.table.insert(kv);
     }
 
     /// Retries value from MemTable
-    pub fn get(self: *Self, key: []const u8, seq: usize, alloc: Allocator) !GetResult {
+    pub fn get(self: *Self, key: []const u8, seq: KVSeq, alloc: Allocator) !GetResult {
         const found = self.table.find_greater_or_eq(FindKey, FindKey{ .seq = seq, .key = key });
 
         if (found) |value| {
@@ -292,14 +313,14 @@ test "Basic test" {
     defer tb.deinit(allocator);
 
     {
-        try tb.put("hello", "world", 0);
-        var val = try tb.get("hello", 0, allocator);
+        try tb.put("hello", "world", KVSeq.init(0));
+        var val = try tb.get("hello", KVSeq.init(0), allocator);
         defer allocator.free(val.as_key().?);
         try std.testing.expectEqualSlices(u8, val.as_key().?, "world");
     }
 
     {
-        const val = try tb.get("world", 1, allocator);
+        const val = try tb.get("world", KVSeq.init(1), allocator);
         switch (val) {
             .NotFound => {},
             else => {
@@ -309,10 +330,10 @@ test "Basic test" {
         }
     }
 
-    try tb.remove("hello", 2);
+    try tb.remove("hello", KVSeq.init(2));
 
     {
-        const val = try tb.get("hello", 2, allocator);
+        const val = try tb.get("hello", KVSeq.init(2), allocator);
         switch (val) {
             .Removed => {},
             else => @panic("Wrong"),
@@ -321,8 +342,8 @@ test "Basic test" {
 
     {
         // Try to insert one more time
-        try tb.put("hello", "bob", 3);
-        const val = try tb.get("hello", 3, allocator);
+        try tb.put("hello", "bob", KVSeq.init(3));
+        const val = try tb.get("hello", KVSeq.init(3), allocator);
         defer allocator.free(val.as_key().?);
         try std.testing.expectEqualSlices(u8, val.as_key().?, "bob");
     }
@@ -338,32 +359,32 @@ test "Try overwriting the key" {
     var tb = try MemTable.new(allocator, null);
     defer tb.deinit(allocator);
 
-    try tb.put("hello", "world", 0);
-    try tb.put("hello", "bob", 1);
+    try tb.put("hello", "world", KVSeq.init(0));
+    try tb.put("hello", "bob", KVSeq.init(1));
 
     {
-        var val = try tb.get("hello", 1, allocator);
+        var val = try tb.get("hello", KVSeq.init(1), allocator);
         defer allocator.free(val.as_key().?);
         try std.testing.expectEqualSlices(u8, val.as_key().?, "bob");
     }
 
     {
-        try tb.put("hello", "bibi", 3);
-        var val = try tb.get("hello", 3, allocator);
+        try tb.put("hello", "bibi", KVSeq.init(3));
+        var val = try tb.get("hello", KVSeq.init(3), allocator);
         defer allocator.free(val.as_key().?);
         try std.testing.expectEqualSlices(u8, val.as_key().?, "bibi");
     }
 
     {
-        try tb.put("hello", "kiki", 4);
-        var val = try tb.get("hello", 4, allocator);
+        try tb.put("hello", "kiki", KVSeq.init(4));
+        var val = try tb.get("hello", KVSeq.init(4), allocator);
         defer allocator.free(val.as_key().?);
         try std.testing.expectEqualSlices(u8, val.as_key().?, "kiki");
     }
 
     {
-        try tb.remove("hello", 5);
-        const val = try tb.get("hello", 5, allocator);
+        try tb.remove("hello", KVSeq.init(5));
+        const val = try tb.get("hello", KVSeq.init(5), allocator);
         switch (val) {
             .Removed => {},
             else => @panic("Wrong"),
