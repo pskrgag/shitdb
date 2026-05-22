@@ -205,6 +205,9 @@ test "WAL startup recovery" {
     var new = try KeyValue.new("test_db4", allocator, io, null);
     defer new.deinit();
 
+    try std.testing.expectEqual(new.manager.version.current_seq().get(), Repeats);
+    try std.testing.expect(new.manager.version.current_file_seq().get() != 0);
+
     inline for (1..Repeats) |i| {
         const val = (try new.get("a" ** i, allocator)).?;
         defer allocator.free(val);

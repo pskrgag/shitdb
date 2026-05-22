@@ -70,6 +70,10 @@ pub const Version = struct {
         return self.next_sequence.load(.monotonic);
     }
 
+    pub fn current_file_seq(self: *Self) FileSeq {
+        return self.next_file.load(.monotonic);
+    }
+
     pub fn new_file_seq(self: *Self) FileSeq {
         return self.next_file.fetchAdd(FileSeq.init(1), .monotonic);
     }
@@ -258,19 +262,26 @@ pub const Version = struct {
         // Replay from active WALs
         for (self.wals.items) |wal| {
             const alive_wal = try WalTable.open(dir, opts, wal, io, alloc);
+
+            if (alive_wal.max_seq().get() > self.next_sequence.load(.monotonic).get()) {
+                self.next_sequence.store(KVSeq.init(alive_wal.max_seq().get() + 1), .monotonic);
+            }
+
             self.insert(alive_wal);
         }
     }
 
     // De-initializes version
     pub fn deinit(self: *Version, io: std.Io, alloc: Allocator) void {
+        // It's required to destroy flusher first, since it may want to apply some changes to version.
+        self.flusher.deinit(alloc);
+
         for (self.tables.items) |*table| {
             table.deinit(alloc);
         }
 
         self.tables.deinit(alloc);
         self.wals.deinit(alloc);
-        self.flusher.deinit(alloc);
         self.file.close(io);
         alloc.destroy(self);
     }
