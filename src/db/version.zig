@@ -15,6 +15,9 @@ const Wal = @import("wal.zig").Wal;
 const MemTableOpts = @import("storage").MemTableOpts;
 const KVSeq = @import("storage").KVSeq;
 
+const MaxLevel: usize = 2;
+const MaxTablesLVL: usize = 4;
+
 pub const Version = struct {
     // File handle
     file: File,
@@ -30,6 +33,8 @@ pub const Version = struct {
     mutex: Mutex,
     // Flusher that periodically flushes immutable tables
     flusher: *Flusher,
+    // Active tables on each lvl
+    active_tables: [MaxLevel]u8,
 
     const Self = @This();
 
@@ -55,6 +60,19 @@ pub const Version = struct {
 
         for (edit.new_files.items) |file| {
             try self.tables.append(alloc, file);
+
+            std.debug.assert(file.lvl < MaxLevel);
+            self.active_tables[file.lvl] += 1;
+        }
+
+        // it's n^2, but len(deleted_files) should be small (2)
+        for (edit.deleted_files.items) |seq| {
+            for (self.tables.items, 0..) |f, i| {
+                if (f.file_seq.get() == seq.get()) {
+                    _ = self.tables.swapRemove(i);
+                    break;
+                }
+            }
         }
 
         if (edit.next_file) |next_file| {
@@ -97,6 +115,7 @@ pub const Version = struct {
             .next_sequence = Value(KVSeq).init(KVSeq.init(0)),
             .mutex = Mutex.init,
             .wals = try std.ArrayList(FileSeq).initCapacity(alloc, 0),
+            .active_tables = [_]u8{0} ** MaxLevel,
         };
         errdefer res.deinit(io, alloc);
 
@@ -129,6 +148,62 @@ pub const Version = struct {
         return res;
     }
 
+    fn compact_lvl0(self: *Version, dir: std.Io.Dir, io: std.Io, alloc: Allocator) !void {
+        std.debug.assert(self.tables.items.len >= MaxLevel);
+        std.debug.assert(MaxLevel >= 2);
+
+        var tables: [2]struct { meta: FileMeta, idx: usize } = undefined;
+        var found: usize = 0;
+
+        {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+
+            for (self.tables.items, 0..) |file, idx| {
+                if (file.lvl == 0) {
+                    tables[found] = .{ .meta = file, .idx = idx };
+                    found += 1;
+                    if (found == 2) break;
+                }
+            }
+        }
+
+        std.debug.assert(found == 2);
+
+        const merged_seq = self.new_file_seq();
+        // name will be freed later, since it will be added to tables array
+        const name = try Self.file_name(merged_seq, alloc);
+
+        const first = try SSTable.open(dir, io, tables[0].meta.name);
+        defer first.deinit();
+        const second = try SSTable.open(dir, io, tables[1].meta.name);
+        defer second.deinit();
+
+        const new = try SSTable.merge(dir, name, io, first, second, alloc);
+        defer new.deinit();
+
+        var edit = try VersionEdit.empty(alloc);
+        defer edit.deinit(alloc);
+
+        try edit.new_files.append(alloc, FileMeta{
+            .lvl = 1,
+            .name = name,
+            .max = try KeyValueOwned.from_kv(&new.max().?, alloc),
+            .min = try KeyValueOwned.from_kv(&new.min().?, alloc),
+            .file_seq = merged_seq,
+            .value_seq = new.maximum_seq().?,
+        });
+
+        try edit.deleted_files.append(alloc, tables[0].meta.file_seq);
+        try edit.deleted_files.append(alloc, tables[1].meta.file_seq);
+
+        try self.apply(edit, io, alloc);
+
+        // NOTE: this should be safe to access without lock, since it's updated only from flusher thread.
+        // tho it's better be moved to apply, but we don't store lvl there...
+        self.active_tables[0] -= 2;
+    }
+
     // Flushes a memtable synchronously into an SSTable and records it in the manifest.
     pub fn flush_memtable(self: *Version, table: *WalTable, io: std.Io, dir: std.Io.Dir, alloc: Allocator) !void {
         if (table.min() == null)
@@ -139,7 +214,7 @@ pub const Version = struct {
 
         const name = try Self.file_name(table.seq, alloc);
         var edit = try VersionEdit.empty(alloc);
-        defer edit.new_files.deinit(alloc);
+        defer edit.deinit(alloc);
 
         try edit.new_files.append(alloc, FileMeta{
             .lvl = 0,
@@ -155,6 +230,9 @@ pub const Version = struct {
         defer sstable.deinit();
 
         try self.apply(edit, io, alloc);
+
+        if (self.active_tables[0] > MaxTablesLVL)
+            try self.compact_lvl0(dir, io, alloc);
     }
 
     // Resolves value request.
@@ -223,6 +301,8 @@ pub const Version = struct {
                 .NextSeqNumber => |next| self.next_sequence.store(KVSeq.init(next), .monotonic),
                 .AddFile => |f| {
                     try self.tables.append(alloc, f);
+                    std.debug.assert(f.lvl < MaxLevel);
+                    self.active_tables[f.lvl] += 1;
 
                     if (self.next_file.load(.monotonic).get() <= f.file_seq.get()) {
                         self.next_file.store(FileSeq.init(f.file_seq.get() + 1), .monotonic);
@@ -246,7 +326,7 @@ pub const Version = struct {
                     var found = false;
 
                     for (self.tables.items, 0..) |file, idx| {
-                        if (file.file_seq == f.seq and file.lvl == f.lvl) {
+                        if (file.file_seq.get() == f.get()) {
                             _ = self.tables.swapRemove(idx);
                             found = true;
                             break;
@@ -290,6 +370,7 @@ pub const Version = struct {
 pub const VersionEdit = struct {
     next_file: ?FileSeq,
     new_files: std.ArrayList(FileMeta),
+    deleted_files: std.ArrayList(FileSeq),
     next_seq: ?KVSeq,
     add_wal: ?FileSeq,
 
@@ -311,6 +392,10 @@ pub const VersionEdit = struct {
             try res.append(alloc, .{ .AddFile = file });
         }
 
+        for (self.deleted_files.items) |file| {
+            try res.append(alloc, .{ .DeleteFile = file });
+        }
+
         if (self.add_wal) |wal| {
             try res.append(alloc, .{ .AddWal = wal });
         }
@@ -318,10 +403,16 @@ pub const VersionEdit = struct {
         return res;
     }
 
+    pub fn deinit(self: *VersionEdit, alloc: Allocator) void {
+        self.new_files.deinit(alloc);
+        self.deleted_files.deinit(alloc);
+    }
+
     pub fn empty(alloc: Allocator) !VersionEdit {
         return .{
             .next_file = null,
             .new_files = try std.ArrayList(FileMeta).initCapacity(alloc, 0),
+            .deleted_files = try std.ArrayList(FileSeq).initCapacity(alloc, 0),
             .next_seq = null,
             .add_wal = null,
         };
@@ -355,7 +446,7 @@ test "Version serialization" {
 
     {
         var edit = try VersionEdit.empty(allocator);
-        defer edit.new_files.deinit(allocator);
+        defer edit.deinit(allocator);
         edit.next_seq = KVSeq.init(1);
         try version.apply(edit, testing_io, allocator);
     }
@@ -448,7 +539,7 @@ test "Version apply persists edits that reopen can replay" {
         defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
-        defer edit.new_files.deinit(allocator);
+        defer edit.deinit(allocator);
         edit.next_seq = KVSeq.init(9);
         edit.next_file = FileSeq.init(11);
         try edit.new_files.append(allocator, try test_file_meta(

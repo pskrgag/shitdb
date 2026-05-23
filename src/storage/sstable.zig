@@ -98,9 +98,11 @@ pub const Iterator = struct {
 };
 
 pub const SSTable = struct {
-    path: []const u8,
     file: []u8,
     lvl: usize,
+    min_key: ?KeyValue,
+    max_key: ?KeyValue,
+    max_seq: ?KVSeq,
 
     const Self = @This();
 
@@ -120,6 +122,9 @@ pub const SSTable = struct {
         last: []const u8,
         block_written: usize,
         data_size: usize,
+        min: ?KeyValue,
+        max: ?KeyValue,
+        max_seq: ?KVSeq,
 
         fn init(file: [*]u8, alloc: Allocator) !WriteKVIter {
             return .{
@@ -128,11 +133,34 @@ pub const SSTable = struct {
                 .block_written = 0,
                 .data_size = 0,
                 .blocks = try std.ArrayList(BlockMeta).initCapacity(alloc, 0),
+                .min = null,
+                .max = null,
+                .max_seq = null,
             };
         }
 
         fn write_one(self: *WriteKVIter, key: *const KeyValue, alloc: Allocator) !void {
             const key_value_size = key.full_size();
+
+            if (self.max_seq == null) {
+                self.max_seq = key.as_seq();
+            } else {
+                if (self.max_seq.?.get() < key.as_seq().get())
+                    self.max_seq = key.as_seq();
+            }
+
+            if (self.min == null) {
+                std.debug.assert(self.max == null);
+
+                self.min = KeyValue{ .data = self.file };
+                self.max = self.min;
+            } else if (key.as_type() == .Add) {
+                if (self.min.?.cmp(key) == .gt) {
+                    self.min = KeyValue{ .data = self.file };
+                } else if (self.max.?.cmp(key) == .lt) {
+                    self.max = KeyValue{ .data = self.file };
+                }
+            }
 
             @memcpy(self.file[0..key_value_size], key.data[0..key_value_size]);
             self.file = self.file[key_value_size..];
@@ -374,12 +402,14 @@ pub const SSTable = struct {
         return .NotFound;
     }
 
+    /// Return an iterator over key-value pairs
     pub fn iterator(self: *const Self) Iterator {
         const mt = self.meta();
 
         return .{ .data = self.file[0..mt.index_offset] };
     }
 
+    /// Opens existing SSTable in read-only mode
     pub fn open(dir: std.Io.Dir, io: std.Io, name: []const u8) !Self {
         const file = try dir.openFile(io, name, .{});
         defer file.close(io);
@@ -387,9 +417,10 @@ pub const SSTable = struct {
         const stat = try file.stat(io);
 
         const mmap = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
-        return .{ .path = name, .file = mmap, .lvl = 0 };
+        return .{ .file = mmap, .lvl = 0, .min_key = null, .max_key = null, .max_seq = null };
     }
 
+    /// Creates new SSTable with given name
     pub fn create(dir: std.Io.Dir, name: []const u8, tbl: *const MemTable, io: std.Io, alloc: Allocator) !Self {
         const file = try dir.createFile(io, name, .{
             .truncate = true,
@@ -414,9 +445,16 @@ pub const SSTable = struct {
         const iter = try Self.write_values(tbl, mmap.ptr, alloc);
         try Self.finalize_table(iter, file, mmap, io, alloc);
 
-        return .{ .path = name, .file = mmap, .lvl = 0 };
+        return .{
+            .file = mmap,
+            .lvl = 0,
+            .min_key = iter.min,
+            .max_key = iter.max,
+            .max_seq = iter.max_seq,
+        };
     }
 
+    /// Finds value in SSTable
     pub fn find_value(self: *const Self, key: []const u8, alloc: Allocator) !GetResult {
         const meta_block = self.meta();
 
@@ -433,6 +471,7 @@ pub const SSTable = struct {
         return .NotFound;
     }
 
+    /// Merges two SSTables into one
     pub fn merge(dir: std.Io.Dir, name: []const u8, io: std.Io, self: Self, other: Self, alloc: Allocator) !Self {
         var self_iter = self.iterator();
         var other_iter = other.iterator();
@@ -485,11 +524,35 @@ pub const SSTable = struct {
         if (prev) |p|
             try write_iter.write_one(&p, alloc);
 
+        // This might happen with empty tables, but don't care for now
+        std.debug.assert(write_iter.max_seq != null);
+        std.debug.assert(write_iter.max != null);
+        std.debug.assert(write_iter.min != null);
+
         try Self.finalize_table(write_iter, file, mmap, io, alloc);
-        return .{ .file = mmap, .path = name, .lvl = self.lvl + 1 };
+        return .{
+            .file = mmap,
+            .lvl = self.lvl + 1,
+            .min_key = write_iter.min,
+            .max_key = write_iter.max,
+            .max_seq = write_iter.max_seq,
+        };
     }
 
-    pub fn deinit(self: *Self) void {
+    pub fn min(self: *const SSTable) ?KeyValue {
+        return self.min_key;
+    }
+
+    pub fn max(self: *const SSTable) ?KeyValue {
+        return self.max_key;
+    }
+
+    pub fn maximum_seq(self: *const SSTable) ?KVSeq {
+        return self.max_seq;
+    }
+
+    /// Closes SSTable
+    pub fn deinit(self: *const Self) void {
         std.posix.munmap(@ptrCast(@alignCast(self.file)));
     }
 };

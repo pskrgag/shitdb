@@ -11,6 +11,7 @@ const AddMagic = 0x10;
 const NextFileNumberMagic = 0x12;
 const NextSeqNumberMagic = 0x13;
 const AddWalMagic = 0x14;
+const DeleteFileMagic = 0x15;
 
 pub const FileSeq = packed struct(usize) {
     value: usize,
@@ -24,6 +25,7 @@ pub const FileSeq = packed struct(usize) {
     }
 };
 
+// TODO: I really think storing filename is overkill. We can generate it from sequence+lvl
 pub const FileMeta = struct {
     name: []const u8,
     max: KeyValueOwned,
@@ -54,10 +56,7 @@ pub const FileMeta = struct {
 // AddFile(N) -> that SSTable was created, meaning that Wal(N) is no longer needed (can be eventually deleted)
 pub const ManifestRecord = union(enum) {
     AddFile: FileMeta,
-    DeleteFile: struct {
-        seq: FileSeq,
-        lvl: u8,
-    },
+    DeleteFile: FileSeq,
     NextFileNumber: FileSeq,
     NextSeqNumber: usize,
     AddWal: FileSeq,
@@ -166,8 +165,9 @@ pub const ManifestRecord = union(enum) {
                 Self.put_int(u8, &data, NextSeqNumberMagic);
                 Self.put_int(usize, &data, next);
             },
-            .DeleteFile => |add| {
-                _ = add;
+            .DeleteFile => |del| {
+                Self.put_int(u8, &data, DeleteFileMagic);
+                Self.put_int(usize, &data, del.get());
             },
             .AddWal => |wal| {
                 Self.put_int(u8, &data, AddWalMagic);
@@ -212,6 +212,10 @@ pub const ManifestRecord = union(enum) {
                 AddWalMagic => {
                     const wal = FileSeq.init(Self.get_int(usize, &iter));
                     try res.append(alloc, .{ .AddWal = wal });
+                },
+                DeleteFileMagic => {
+                    const deleted = FileSeq.init(Self.get_int(usize, &iter));
+                    try res.append(alloc, .{ .DeleteFile = deleted });
                 },
                 else => return error.CorruptedData,
             }

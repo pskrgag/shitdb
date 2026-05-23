@@ -71,6 +71,7 @@ pub const Wal = struct {
 
         if (version) |v| {
             var edit = try VersionEdit.empty(alloc);
+            defer edit.deinit(alloc);
 
             edit.add_wal = seq;
             try v.apply(edit, io, alloc);
