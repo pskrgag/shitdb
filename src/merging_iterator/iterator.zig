@@ -7,7 +7,7 @@ pub fn IteratorWrapper(comptime T: type) type {
         next_fn: *const fn (ptr: *anyopaque) ?T,
         peek_fn: *const fn (ptr: *anyopaque) ?T,
 
-        fn init(ptr: anytype) IteratorWrapper(T) {
+        pub fn init(ptr: anytype) IteratorWrapper(T) {
             const Ptr = @TypeOf(ptr);
             const gen = struct {
                 fn next(p: *anyopaque) ?T {

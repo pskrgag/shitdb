@@ -114,6 +114,48 @@ pub const SSTable = struct {
         data_size: usize,
     };
 
+    const WriteKVIter = struct {
+        blocks: std.ArrayList(BlockMeta),
+        file: [*]u8,
+        last: []const u8,
+        block_written: usize,
+        data_size: usize,
+
+        fn init(file: [*]u8, alloc: Allocator) !WriteKVIter {
+            return .{
+                .file = file,
+                .last = undefined,
+                .block_written = 0,
+                .data_size = 0,
+                .blocks = try std.ArrayList(BlockMeta).initCapacity(alloc, 0),
+            };
+        }
+
+        fn write_one(self: *WriteKVIter, key: *const KeyValue, alloc: Allocator) !void {
+            const key_value_size = key.full_size();
+
+            @memcpy(self.file[0..key_value_size], key.data[0..key_value_size]);
+            self.file = self.file[key_value_size..];
+
+            self.last = key.as_key();
+            self.data_size += key_value_size;
+            self.block_written += key_value_size;
+
+            if (self.block_written > BlockSize) {
+                try self.blocks.append(alloc, BlockMeta{ .last_key = self.last, .size = self.block_written });
+                self.block_written = 0;
+            }
+        }
+
+        fn finalize(self: *WriteKVIter, alloc: Allocator) !ValuesMeta {
+            if (self.block_written != 0) {
+                try self.blocks.append(alloc, BlockMeta{ .last_key = self.last, .size = self.block_written });
+            }
+
+            return .{ .data_size = self.data_size, .blocks = self.blocks };
+        }
+    };
+
     fn meta(self: *const Self) MetaBlock {
         var mt: MetaBlock = undefined;
 
@@ -148,51 +190,50 @@ pub const SSTable = struct {
         return total_size + @sizeOf(MetaBlock);
     }
 
-    fn write_values(tbl: *const MemTable, file: *[]u8, alloc: Allocator) !ValuesMeta {
-        var block_written: usize = 0;
-        var data_size: usize = 0;
-        var blocks = try std.ArrayList(BlockMeta).initCapacity(alloc, 0);
-        var last: []const u8 = undefined;
+    fn write_values(tbl: *const MemTable, file: [*]u8, alloc: Allocator) !WriteKVIter {
         var iter = tbl.table.iterator();
+        var write_iter = try WriteKVIter.init(file, alloc);
 
         while (iter.next()) |key| {
-            const key_value_size = key.full_size();
-
-            @memcpy(file.*[0..key_value_size], key.data[0..key_value_size]);
-            file.* = file.*[key_value_size..];
-
-            last = key.as_key();
-            data_size += key_value_size;
-            block_written += key_value_size;
-
-            // Finalize block
-            if (block_written > BlockSize) {
-                try blocks.append(alloc, BlockMeta{ .last_key = last, .size = block_written });
-                block_written = 0;
-            }
+            try write_iter.write_one(key, alloc);
         }
 
-        if (block_written != 0) {
-            try blocks.append(alloc, BlockMeta{ .last_key = last, .size = block_written });
-        }
-
-        return .{ .data_size = data_size, .blocks = blocks };
+        return write_iter;
     }
 
-    fn write_index(value_meta: ValuesMeta, file: *[]u8) usize {
+    fn finalize_table(iter: WriteKVIter, file: std.Io.File, file_data: []u8, io: std.Io, alloc: Allocator) !void {
+        var i = iter;
+        var values_meta = try i.finalize(alloc);
+        const index_size = write_index(values_meta, file_data.ptr + iter.data_size);
+
+        try Self.write_meta(file_data.ptr + file_data.len - @sizeOf(MetaBlock), MetaBlock{
+            .index_offset = values_meta.data_size,
+            .index_size = index_size,
+            .magic = Magic,
+        });
+
+        // Sync data
+        try std.posix.msync(@alignCast(file_data), std.posix.MSF.SYNC);
+        // Sync file metadata as well
+        try file.sync(io);
+
+        values_meta.blocks.deinit(alloc);
+    }
+
+    fn write_index(value_meta: ValuesMeta, file_: [*]u8) usize {
         var index_size: usize = 0;
         var offset: usize = 0;
+        var file = file_;
 
-        // Data blocks are written. Now create index block
         for (value_meta.blocks.items) |mt| {
             const block_idx = BlockIndex{ .size = mt.size, .offset = offset, .key_size = mt.last_key.len };
             const block_idx_ptr = utils.data_as_u8_const_ptr(&block_idx);
 
-            @memcpy(file.*[0..@sizeOf(BlockIndex)], block_idx_ptr);
-            file.* = file.*[@sizeOf(BlockIndex)..];
+            @memcpy(file[0..@sizeOf(BlockIndex)], block_idx_ptr);
+            file = file[@sizeOf(BlockIndex)..];
 
-            @memcpy(file.*[0..mt.last_key.len], mt.last_key);
-            file.* = file.*[mt.last_key.len..];
+            @memcpy(file[0..mt.last_key.len], mt.last_key);
+            file = file[mt.last_key.len..];
 
             offset += mt.size;
 
@@ -203,8 +244,8 @@ pub const SSTable = struct {
         return index_size;
     }
 
-    fn write_meta(file: *[]u8, m: MetaBlock) !void {
-        @memcpy(file.*[0..@sizeOf(MetaBlock)], utils.data_as_u8_const_ptr(&m));
+    fn write_meta(file: [*]u8, m: MetaBlock) !void {
+        @memcpy(file[0..@sizeOf(MetaBlock)], utils.data_as_u8_const_ptr(&m));
     }
 
     fn read_block_first_key(block: []const u8) []const u8 {
@@ -333,7 +374,7 @@ pub const SSTable = struct {
         return .NotFound;
     }
 
-    pub fn iterator(self: *Self) Iterator {
+    pub fn iterator(self: *const Self) Iterator {
         const mt = self.meta();
 
         return .{ .data = self.file[0..mt.index_offset] };
@@ -361,7 +402,7 @@ pub const SSTable = struct {
         const total_size = Self.calculate_file_size(tbl);
         try file.setLength(io, total_size);
 
-        var mmap = try std.posix.mmap(
+        const mmap = try std.posix.mmap(
             null,
             total_size,
             .{ .READ = true, .WRITE = true },
@@ -369,26 +410,11 @@ pub const SSTable = struct {
             file.handle,
             0,
         );
-        const mmap_copy = mmap;
 
-        var values_meta = try Self.write_values(tbl, @ptrCast(&mmap), alloc);
-        defer values_meta.blocks.deinit(alloc);
+        const iter = try Self.write_values(tbl, mmap.ptr, alloc);
+        try Self.finalize_table(iter, file, mmap, io, alloc);
 
-        const index_size = write_index(values_meta, @ptrCast(&mmap));
-
-        // Create metablock
-        try Self.write_meta(@ptrCast(&mmap), MetaBlock{
-            .index_offset = values_meta.data_size,
-            .index_size = index_size,
-            .magic = Magic,
-        });
-
-        // Sync data
-        try std.posix.msync(mmap_copy, std.posix.MSF.SYNC);
-        // Sync file metadata as well
-        try file.sync(io);
-
-        return .{ .path = name, .file = mmap_copy, .lvl = 0 };
+        return .{ .path = name, .file = mmap, .lvl = 0 };
     }
 
     pub fn find_value(self: *const Self, key: []const u8, alloc: Allocator) !GetResult {
@@ -407,31 +433,60 @@ pub const SSTable = struct {
         return .NotFound;
     }
 
-    pub fn merge(dir: *std.Io.Dir, name: []const u8, io: std.Io, self: Self, other: Self) !Self {
-        const iters = [_]merging_iterator.IteratorWrapper(KeyValue){ self.iterator(), other.iterator() };
-        const iter = merging_iterator.MergeIterator(KeyValue).new(iters);
+    pub fn merge(dir: std.Io.Dir, name: []const u8, io: std.Io, self: Self, other: Self, alloc: Allocator) !Self {
+        var self_iter = self.iterator();
+        var other_iter = other.iterator();
+
+        var iters = [_]merging_iterator.IteratorWrapper(KeyValue){
+            merging_iterator.IteratorWrapper(KeyValue).init(&self_iter),
+            merging_iterator.IteratorWrapper(KeyValue).init(&other_iter),
+        };
+        var iter = merging_iterator.MergeIterator(KeyValue).new(&iters);
         const file = try dir.createFile(io, name, .{
             .truncate = true,
             .read = true,
         });
-        defer file.close(io);
+        errdefer file.close(io);
 
         std.debug.assert(self.lvl == other.lvl);
 
         const total_size = self.file.len + other.file.len;
         try file.setLength(io, total_size);
 
-        var mmap = try std.posix.mmap(null, total_size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, file.handle, 0);
-        const mmap_copy = mmap;
+        const mmap: []u8 = @alignCast(try std.posix.mmap(
+            null,
+            total_size,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
+            file.handle,
+            0,
+        ));
+        var write_iter = try WriteKVIter.init(mmap.ptr, alloc);
+        var prev: ?KeyValue = null;
 
         while (iter.next()) |key| {
-            const key_value_size = key.full_size();
-
-            @memcpy(mmap[0..key_value_size], key.data[0..key_value_size]);
-            mmap = mmap[key_value_size..];
+            if (prev) |p| {
+                // Case 1: key == prev_key. Need to keep the newest value (with bigger seq)
+                // Case 2: key != prev_key. Since iterator produces sorted values we won't see this key.
+                if (std.mem.eql(u8, p.as_key(), key.as_key())) {
+                    if (key.as_seq().get() > p.as_seq().get()) {
+                        prev = key;
+                    }
+                } else {
+                    // Dump value to the new SSTable.
+                    try write_iter.write_one(&p, alloc);
+                    prev = key;
+                }
+            } else {
+                prev = key;
+            }
         }
 
-        return .{ .file = mmap_copy, .path = name, .lvl = self.lvl + 1 };
+        if (prev) |p|
+            try write_iter.write_one(&p, alloc);
+
+        try Self.finalize_table(write_iter, file, mmap, io, alloc);
+        return .{ .file = mmap, .path = name, .lvl = self.lvl + 1 };
     }
 
     pub fn deinit(self: *Self) void {
@@ -463,6 +518,7 @@ test "Simple find and create" {
     const allocator = arena.allocator();
 
     const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(testing_io, "test_db") catch {};
     try cwd.createDirPath(testing_io, "test_db");
     defer {
         std.Io.Dir.cwd().deleteTree(testing_io, "test_db") catch {
@@ -489,13 +545,7 @@ test "Simple find and create" {
     for (to_find) |i| {
         const val = try table.find_value(i, allocator);
 
-        switch (val) {
-            .Found => |v| {
-                try std.testing.expectEqualSlices(u8, i, v);
-                defer allocator.free(v);
-            },
-            else => @panic("Unexpected return"),
-        }
+        try expect_founded_value(val, i, allocator);
     }
 
     const to_find_non_present = [_][]const u8{ "a" ** 201, "b", "c", "d" ** 100 };
@@ -518,47 +568,6 @@ test "Simple find and create" {
     try std.testing.expectEqual(i, 200);
 }
 
-test "Merge" {
-    var arena = std.heap.DebugAllocator(.{}){};
-    defer {
-        _ = arena.deinit();
-    }
-    const allocator = arena.allocator();
-
-    const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(testing_io, "test_db");
-    defer {
-        std.Io.Dir.cwd().deleteTree(testing_io, "test_db") catch {
-            @panic("gg");
-        };
-    }
-
-    var dir = try cwd.openDir(testing_io, "test_db", .{});
-    defer dir.close(testing_io);
-
-    var tb = try MemTable.new(allocator, null);
-    defer tb.deinit(allocator);
-    const name = try generate_lvl_name(allocator, 0);
-    defer allocator.free(name);
-
-    inline for (1..200) |i| {
-        try tb.put("a" ** (i * 2 + 1), "a" ** (i * 2 + 1), KVSeq.init(i));
-    }
-    var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
-    defer table.deinit();
-
-    var tb1 = try MemTable.new(allocator, null);
-    defer tb1.deinit(allocator);
-
-    inline for (1..200) |i| {
-        try tb1.put("ab" ** (i * 2), "ba" ** (i * 2), KVSeq.init(i));
-    }
-    const name1 = try generate_lvl_name(allocator, 201);
-    defer allocator.free(name1);
-    var table1 = try SSTable.create(dir, name1, &tb, testing_io, allocator);
-    defer table1.deinit();
-}
-
 test "Remove" {
     var arena = std.heap.DebugAllocator(.{}){};
     defer {
@@ -567,6 +576,7 @@ test "Remove" {
     const allocator = arena.allocator();
 
     const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(testing_io, "test_db") catch {};
     try cwd.createDirPath(testing_io, "test_db");
     defer {
         std.Io.Dir.cwd().deleteTree(testing_io, "test_db") catch {
@@ -605,6 +615,7 @@ test "Remove more than one block" {
     const allocator = arena.allocator();
 
     const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(testing_io, "test_db") catch {};
     try cwd.createDirPath(testing_io, "test_db");
     defer {
         std.Io.Dir.cwd().deleteTree(testing_io, "test_db") catch {
@@ -629,16 +640,7 @@ test "Remove more than one block" {
         defer table.deinit();
 
         const val = try table.find_value("b" ** (BlockSize / 4), allocator);
-        switch (val) {
-            .Found => |v| {
-                try std.testing.expectEqualSlices(u8, "d" ** (BlockSize / 4), v);
-                defer allocator.free(v);
-            },
-            else => {
-                std.debug.print("val {}\n", .{val});
-                @panic("Unexpected return");
-            },
-        }
+        try expect_founded_value(val, "d" ** (BlockSize / 4), allocator);
     }
 
     {
@@ -651,12 +653,151 @@ test "Remove more than one block" {
         defer table.deinit();
 
         const val = try table.find_value("b" ** (BlockSize / 4), allocator);
-        switch (val) {
-            .Removed => {},
-            else => {
-                std.debug.print("val {}\n", .{val});
-                @panic("Unexpected return");
-            },
+        try expect_deleted(val);
+    }
+}
+
+test "Merge" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+    const Repeats: usize = 150;
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(testing_io, "test_db") catch {};
+    try cwd.createDirPath(testing_io, "test_db");
+    defer {
+        std.Io.Dir.cwd().deleteTree(testing_io, "test_db") catch {
+            @panic("gg");
+        };
+    }
+
+    var dir = try cwd.openDir(testing_io, "test_db", .{});
+    defer dir.close(testing_io);
+
+    var tb = try MemTable.new(allocator, null);
+    defer tb.deinit(allocator);
+    const name = try generate_lvl_name(allocator, 0);
+    defer allocator.free(name);
+
+    inline for (1..Repeats) |i| {
+        try tb.put("ab" ** ((i * 2) - 1), "ba" ** ((i * 2) - 1), KVSeq.init(i));
+    }
+
+    var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+    defer table.deinit();
+
+    var tb1 = try MemTable.new(allocator, null);
+    defer tb1.deinit(allocator);
+
+    inline for (1..Repeats) |i| {
+        try tb1.put("ab" ** (i * 2), "ba" ** (i * 2), KVSeq.init(Repeats + i));
+    }
+
+    const name1 = try generate_lvl_name(allocator, 0);
+    defer allocator.free(name1);
+    var table1 = try SSTable.create(dir, name1, &tb1, testing_io, allocator);
+    defer table1.deinit();
+
+    const name_merged = try generate_lvl_name(allocator, 1);
+    defer allocator.free(name_merged);
+    var merged = try SSTable.merge(dir, name_merged, testing_io, table, table1, allocator);
+    defer merged.deinit();
+
+    {
+        inline for (1..Repeats) |i| {
+            const val = try merged.find_value("ab" ** i, allocator);
+            try expect_founded_value(val, "ba" ** i, allocator);
         }
     }
+}
+
+fn expect_founded_value(val: GetResult, expected: []const u8, allocator: Allocator) !void {
+    switch (val) {
+        .Found => |v| {
+            try std.testing.expectEqualSlices(u8, v, expected);
+            defer allocator.free(v);
+        },
+        else => {
+            // std.debug.print("Failed to find value on iter {}\n", .{i});
+            try std.testing.expect(false);
+        },
+    }
+}
+
+fn expect_deleted(val: GetResult) !void {
+    switch (val) {
+        .Removed => {},
+        else => {
+            // std.debug.print("Failed to find value on iter {}\n", .{i});
+            try std.testing.expect(false);
+        },
+    }
+}
+
+fn expect_notfound(val: GetResult) !void {
+    switch (val) {
+        .NotFound => {},
+        else => {
+            // std.debug.print("Failed to find value on iter {}\n", .{i});
+            try std.testing.expect(false);
+        },
+    }
+}
+
+test "Merge with remove and overlapping regions" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(testing_io, "test_db") catch {};
+    try cwd.createDirPath(testing_io, "test_db");
+    defer {
+        std.Io.Dir.cwd().deleteTree(testing_io, "test_db") catch {
+            @panic("gg");
+        };
+    }
+
+    var dir = try cwd.openDir(testing_io, "test_db", .{});
+    defer dir.close(testing_io);
+
+    var tb = try MemTable.new(allocator, null);
+    var tb1 = try MemTable.new(allocator, null);
+    defer tb.deinit(allocator);
+    defer tb1.deinit(allocator);
+
+    const name = try generate_lvl_name(allocator, 0);
+    const name1 = try generate_lvl_name(allocator, 0);
+    const merged_name = try generate_lvl_name(allocator, 1);
+    defer allocator.free(name);
+    defer allocator.free(name1);
+    defer allocator.free(merged_name);
+
+    try tb.put("a", "a", KVSeq.init(0));
+    try tb.put("b", "b", KVSeq.init(1));
+    try tb.put("c", "c", KVSeq.init(2));
+    try tb.remove("b", KVSeq.init(3));
+
+    try tb1.put("b", "b", KVSeq.init(5));
+    try tb1.remove("a", KVSeq.init(6));
+    try tb1.put("c", "cc", KVSeq.init(7));
+
+    var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+    defer table.deinit();
+    var table1 = try SSTable.create(dir, name1, &tb1, testing_io, allocator);
+    defer table1.deinit();
+
+    const merged = try SSTable.merge(dir, merged_name, testing_io, table, table1, allocator);
+
+    try expect_founded_value(try merged.find_value("b", allocator), "b", allocator);
+    try expect_deleted(try merged.find_value("a", allocator));
+    try expect_deleted(try merged.find_value("a", allocator));
+    try expect_founded_value(try merged.find_value("c", allocator), "cc", allocator);
+    try expect_notfound(try merged.find_value("aaa", allocator));
+    try expect_notfound(try merged.find_value("bb", allocator));
 }
