@@ -74,7 +74,7 @@ pub const Wal = struct {
             defer edit.deinit(alloc);
 
             edit.add_wal = seq;
-            try v.apply(edit, io, alloc);
+            try v.apply(edit, dir, io, alloc);
         }
 
         return .{ .file = file };
