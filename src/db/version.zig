@@ -17,7 +17,68 @@ const MemTableOpts = @import("storage").MemTableOpts;
 const KVSeq = @import("storage").KVSeq;
 
 const MaxLevel: usize = 2;
-const MaxTablesLVL: usize = 4;
+const MaxTablesLVL: usize = 1;
+
+const CompactionPlan = struct {
+    input_files: std.ArrayList(FoundFile),
+    overlap_files: std.ArrayList(FoundFile),
+    dst_lvl: u8,
+
+    const FoundFile = struct {
+        meta: FileMeta,
+        idx: usize,
+    };
+
+    fn find_cadidates(files: []FileMeta, alloc: Allocator, lvl: u8) !std.ArrayList(FoundFile) {
+        var res = try std.ArrayList(FoundFile).initCapacity(alloc, 2);
+        var found: usize = 0;
+
+        for (files, 0..) |file, idx| {
+            if (file.lvl == lvl) {
+                try res.append(alloc, .{ .meta = file, .idx = idx });
+                found += 1;
+
+                if (found == 2)
+                    break;
+            }
+        }
+
+        std.debug.assert(found == 2);
+        return res;
+    }
+
+    pub fn new(files: []FileMeta, lvl: u8, alloc: Allocator) !CompactionPlan {
+        // Step 1: find 2 lvl0 tables to compact. Basically take first 2 in a list
+        var candidates = try CompactionPlan.find_cadidates(files, alloc, lvl);
+        errdefer candidates.deinit(alloc);
+
+        var next_lvl_files = try std.ArrayList(FoundFile).initCapacity(alloc, 0);
+        errdefer next_lvl_files.deinit(alloc);
+
+        // Step 2: once we've found them. Find all lvl1 tables that have overlapping key ranges
+        for (files, 0..) |file, idx| {
+            if (file.lvl == lvl + 1) {
+                var should_consider = false;
+
+                for (candidates.items) |candidate| {
+                    should_consider |= file.key_range_overlap(candidate.meta.min.data, candidate.meta.max.data);
+                    if (should_consider)
+                        break;
+                }
+
+                if (should_consider)
+                    try next_lvl_files.append(alloc, .{ .meta = file, .idx = idx });
+            }
+        }
+
+        return .{ .dst_lvl = lvl + 1, .input_files = candidates, .overlap_files = next_lvl_files };
+    }
+
+    fn deinit(self: *CompactionPlan, alloc: Allocator) void {
+        self.overlap_files.deinit(alloc);
+        self.input_files.deinit(alloc);
+    }
+};
 
 pub const Version = struct {
     // File handle
@@ -160,41 +221,14 @@ pub const Version = struct {
         std.debug.assert(self.tables.items.len >= MaxLevel);
         std.debug.assert(MaxLevel >= 2);
 
-        var lvl0_tables: [2]struct { meta: FileMeta, idx: usize } = undefined;
-        var lvl1_tables = try std.ArrayList(struct { meta: FileMeta, idx: usize }).initCapacity(alloc, 0);
         var opened_tables = try std.ArrayList(SSTable).initCapacity(alloc, 0);
-        var found: usize = 0;
 
-        defer lvl1_tables.deinit(alloc);
+        self.mutex.lockUncancelable(io);
+        errdefer self.mutex.unlock(io);
 
-        {
-            self.mutex.lockUncancelable(io);
-            defer self.mutex.unlock(io);
-
-            // Step 1: find 2 lvl0 tables to compact. Basically take first 2 in a list
-            for (self.tables.items, 0..) |file, idx| {
-                if (file.lvl == 0) {
-                    lvl0_tables[found] = .{ .meta = file, .idx = idx };
-                    found += 1;
-
-                    if (found == 2)
-                        break;
-                }
-            }
-
-            std.debug.assert(found == 2);
-
-            // Step 2: once we've found them. Find all lvl1 tables that have overlapping key ranges
-            for (self.tables.items, 0..) |file, idx| {
-                if (file.lvl == 1) {
-                    const first_overlap = file.key_range_overlap(lvl0_tables[0].meta.min.data, lvl0_tables[0].meta.max.data);
-                    const second_overlap = file.key_range_overlap(lvl0_tables[1].meta.min.data, lvl0_tables[1].meta.max.data);
-
-                    if (first_overlap or second_overlap)
-                        try lvl1_tables.append(alloc, .{ .meta = file, .idx = idx });
-                }
-            }
-        }
+        var plan = try CompactionPlan.new(self.tables.items, 0, alloc);
+        defer plan.deinit(alloc);
+        self.mutex.unlock(io);
 
         const merged_seq = self.new_file_seq();
         // name will be freed later, since it will be added to tables array
@@ -207,10 +241,11 @@ pub const Version = struct {
             opened_tables.deinit(alloc);
         }
 
-        try opened_tables.append(alloc, try SSTable.open(dir, io, lvl0_tables[0].meta.name));
-        try opened_tables.append(alloc, try SSTable.open(dir, io, lvl0_tables[1].meta.name));
+        for (plan.overlap_files.items) |lvl1| {
+            try opened_tables.append(alloc, try SSTable.open(dir, io, lvl1.meta.name));
+        }
 
-        for (lvl1_tables.items) |lvl1| {
+        for (plan.input_files.items) |lvl1| {
             try opened_tables.append(alloc, try SSTable.open(dir, io, lvl1.meta.name));
         }
 
@@ -229,10 +264,11 @@ pub const Version = struct {
             .value_seq = new.maximum_seq(),
         });
 
-        try edit.deleted_files.append(alloc, .{ .file = lvl0_tables[0].meta.file_seq, .lvl = 0 });
-        try edit.deleted_files.append(alloc, .{ .file = lvl0_tables[1].meta.file_seq, .lvl = 0 });
+        for (plan.input_files.items) |lvl1| {
+            try edit.deleted_files.append(alloc, .{ .file = lvl1.meta.file_seq, .lvl = 0 });
+        }
 
-        for (lvl1_tables.items) |lvl1| {
+        for (plan.overlap_files.items) |lvl1| {
             try edit.deleted_files.append(alloc, .{ .file = lvl1.meta.file_seq, .lvl = 1 });
         }
 
