@@ -552,6 +552,43 @@ fn create_test_sstable(
     };
 }
 
+fn expect_l1_non_overlapping(version: *const Version) !void {
+    for (version.tables.items, 0..) |lhs, lhs_idx| {
+        if (lhs.lvl != 1)
+            continue;
+
+        for (version.tables.items[lhs_idx + 1 ..]) |rhs| {
+            if (rhs.lvl != 1)
+                continue;
+
+            try std.testing.expect(!lhs.key_range_overlap(rhs.min.data, rhs.max.data));
+        }
+    }
+}
+
+test "FileMeta key range overlap includes shared boundary keys" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const meta = try test_file_meta(
+        allocator,
+        "memtable1.sst",
+        1,
+        1,
+        "c",
+        "first",
+        "m",
+        "last",
+    );
+
+    try std.testing.expect(meta.key_range_overlap("a", "c"));
+    try std.testing.expect(meta.key_range_overlap("m", "z"));
+    try std.testing.expect(meta.key_range_overlap("d", "e"));
+    try std.testing.expect(!meta.key_range_overlap("a", "b"));
+    try std.testing.expect(!meta.key_range_overlap("n", "z"));
+}
+
 test "VersionEdit serializes manifest records in replay order" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -716,6 +753,7 @@ test "lvl0 compaction merges overlapping lvl1 table" {
     try std.testing.expectEqual(@as(u8, 0), version.active_tables[0]);
     try std.testing.expectEqual(@as(u8, 1), version.active_tables[1]);
     try std.testing.expectEqual(@as(u8, 1), version.tables.items[0].lvl);
+    try expect_l1_non_overlapping(version);
 
     try std.testing.expectEqual(null, try version.get("b", dir, testing_io, allocator));
 
@@ -797,6 +835,7 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
     try std.testing.expectEqual(@as(usize, 2), version.tables.items.len);
     try std.testing.expectEqual(@as(u8, 0), version.active_tables[0]);
     try std.testing.expectEqual(@as(u8, 2), version.active_tables[1]);
+    try expect_l1_non_overlapping(version);
 
     const old = (try version.get("z", dir, testing_io, allocator)).?;
     try std.testing.expectEqualSlices(u8, "old", old);
@@ -806,4 +845,273 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
 
     const fresh_b = (try version.get("b", dir, testing_io, allocator)).?;
     try std.testing.expectEqualSlices(u8, "fresh-b", fresh_b);
+}
+
+test "lvl0 compaction includes lvl1 table that shares boundary key" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const testing_io = std.testing.io;
+
+    const dirname = "test_db_l0_compaction_boundary_l1";
+    std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
+    try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
+
+    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    defer {
+        dir.close(testing_io);
+        std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, testing_io, allocator);
+    defer version.deinit(testing_io, allocator);
+
+    var edit = try VersionEdit.empty(allocator);
+    defer edit.deinit(allocator);
+    edit.next_file = FileSeq.init(4);
+
+    try edit.new_files.append(
+        allocator,
+        try create_test_sstable(
+            dir,
+            testing_io,
+            allocator,
+            "memtable1.sst",
+            1,
+            1,
+            &[_]TestSSTableKV{
+                .{ .key = "b", .value = "old", .seq = 1 },
+            },
+        ),
+    );
+    try edit.new_files.append(
+        allocator,
+        try create_test_sstable(
+            dir,
+            testing_io,
+            allocator,
+            "memtable2.sst",
+            0,
+            2,
+            &[_]TestSSTableKV{
+                .{ .key = "a", .value = "fresh-a", .seq = 2 },
+                .{ .key = "b", .value = null, .seq = 3 },
+            },
+        ),
+    );
+    try edit.new_files.append(
+        allocator,
+        try create_test_sstable(
+            dir,
+            testing_io,
+            allocator,
+            "memtable3.sst",
+            0,
+            3,
+            &[_]TestSSTableKV{
+                .{ .key = "c", .value = "fresh-c", .seq = 4 },
+            },
+        ),
+    );
+
+    try version.apply(edit, testing_io, allocator);
+    try version.compact_lvl0(dir, testing_io, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), version.tables.items.len);
+    try std.testing.expectEqual(@as(u8, 0), version.active_tables[0]);
+    try std.testing.expectEqual(@as(u8, 1), version.active_tables[1]);
+    try expect_l1_non_overlapping(version);
+
+    try std.testing.expectEqual(null, try version.get("b", dir, testing_io, allocator));
+
+    const fresh_a = (try version.get("a", dir, testing_io, allocator)).?;
+    try std.testing.expectEqualSlices(u8, "fresh-a", fresh_a);
+
+    const fresh_c = (try version.get("c", dir, testing_io, allocator)).?;
+    try std.testing.expectEqualSlices(u8, "fresh-c", fresh_c);
+}
+
+test "lvl0 compaction manifest replay restores live tables and counts" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const testing_io = std.testing.io;
+
+    const dirname = "test_db_l0_compaction_replay";
+    std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
+    try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
+
+    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    defer {
+        dir.close(testing_io);
+        std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    {
+        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, testing_io, allocator);
+        defer version.deinit(testing_io, allocator);
+
+        var edit = try VersionEdit.empty(allocator);
+        defer edit.deinit(allocator);
+        edit.next_file = FileSeq.init(4);
+
+        try edit.new_files.append(
+            allocator,
+            try create_test_sstable(
+                dir,
+                testing_io,
+                allocator,
+                "memtable1.sst",
+                1,
+                1,
+                &[_]TestSSTableKV{
+                    .{ .key = "b", .value = "old", .seq = 1 },
+                },
+            ),
+        );
+        try edit.new_files.append(
+            allocator,
+            try create_test_sstable(
+                dir,
+                testing_io,
+                allocator,
+                "memtable2.sst",
+                0,
+                2,
+                &[_]TestSSTableKV{
+                    .{ .key = "b", .value = null, .seq = 2 },
+                },
+            ),
+        );
+        try edit.new_files.append(
+            allocator,
+            try create_test_sstable(
+                dir,
+                testing_io,
+                allocator,
+                "memtable3.sst",
+                0,
+                3,
+                &[_]TestSSTableKV{
+                    .{ .key = "a", .value = "fresh", .seq = 3 },
+                },
+            ),
+        );
+
+        try version.apply(edit, testing_io, allocator);
+        try version.compact_lvl0(dir, testing_io, allocator);
+    }
+
+    {
+        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, testing_io, allocator);
+        defer reopened.deinit(testing_io, allocator);
+
+        try std.testing.expectEqual(@as(usize, 1), reopened.tables.items.len);
+        try std.testing.expectEqual(@as(u8, 0), reopened.active_tables[0]);
+        try std.testing.expectEqual(@as(u8, 1), reopened.active_tables[1]);
+        try std.testing.expectEqual(@as(u8, 1), reopened.tables.items[0].lvl);
+        try expect_l1_non_overlapping(reopened);
+
+        try std.testing.expectEqual(null, try reopened.get("b", dir, testing_io, allocator));
+
+        const value = (try reopened.get("a", dir, testing_io, allocator)).?;
+        try std.testing.expectEqualSlices(u8, "fresh", value);
+    }
+}
+
+test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const testing_io = std.testing.io;
+
+    const dirname = "test_db_l0_compaction_replay_non_overlapping_l1";
+    std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
+    try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
+
+    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    defer {
+        dir.close(testing_io);
+        std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    {
+        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, testing_io, allocator);
+        defer version.deinit(testing_io, allocator);
+
+        var edit = try VersionEdit.empty(allocator);
+        defer edit.deinit(allocator);
+        edit.next_file = FileSeq.init(4);
+
+        try edit.new_files.append(
+            allocator,
+            try create_test_sstable(
+                dir,
+                testing_io,
+                allocator,
+                "memtable1.sst",
+                1,
+                1,
+                &[_]TestSSTableKV{
+                    .{ .key = "z", .value = "old", .seq = 1 },
+                },
+            ),
+        );
+        try edit.new_files.append(
+            allocator,
+            try create_test_sstable(
+                dir,
+                testing_io,
+                allocator,
+                "memtable2.sst",
+                0,
+                2,
+                &[_]TestSSTableKV{
+                    .{ .key = "a", .value = "fresh-a", .seq = 2 },
+                },
+            ),
+        );
+        try edit.new_files.append(
+            allocator,
+            try create_test_sstable(
+                dir,
+                testing_io,
+                allocator,
+                "memtable3.sst",
+                0,
+                3,
+                &[_]TestSSTableKV{
+                    .{ .key = "b", .value = "fresh-b", .seq = 3 },
+                },
+            ),
+        );
+
+        try version.apply(edit, testing_io, allocator);
+        try version.compact_lvl0(dir, testing_io, allocator);
+    }
+
+    {
+        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, testing_io, allocator);
+        defer reopened.deinit(testing_io, allocator);
+
+        try std.testing.expectEqual(@as(usize, 2), reopened.tables.items.len);
+        try std.testing.expectEqual(@as(u8, 0), reopened.active_tables[0]);
+        try std.testing.expectEqual(@as(u8, 2), reopened.active_tables[1]);
+        try expect_l1_non_overlapping(reopened);
+
+        const old = (try reopened.get("z", dir, testing_io, allocator)).?;
+        try std.testing.expectEqualSlices(u8, "old", old);
+
+        const fresh_a = (try reopened.get("a", dir, testing_io, allocator)).?;
+        try std.testing.expectEqualSlices(u8, "fresh-a", fresh_a);
+
+        const fresh_b = (try reopened.get("b", dir, testing_io, allocator)).?;
+        try std.testing.expectEqualSlices(u8, "fresh-b", fresh_b);
+    }
 }

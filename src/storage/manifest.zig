@@ -63,7 +63,7 @@ pub const FileMeta = struct {
         const first = std.mem.order(u8, min, self.max.data);
         const second = std.mem.order(u8, self.min.data, max);
 
-        return (first == .lt or first == .eq) and (second == .lt or first == .eq);
+        return (first == .lt or first == .eq) and (second == .lt or second == .eq);
     }
 
     pub fn deinit(self: *FileMeta, alloc: Allocator) void {
