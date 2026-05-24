@@ -25,8 +25,15 @@ var Lvl0Count: u64 = 0;
 // +-----------------------+
 // |         Index         |
 // +-----------------------+
+// |         Utility       |
+// |                       |
+// |      min_key          |
+// |      max_key          |
+// +-----------------------+
 // |         Meta          |
 // |                       |
+// |   min_size            |
+// |   max_size            |
 // |   index_offset        |
 // |   index_size          |
 // |   magic               |
@@ -64,6 +71,8 @@ const BlockIndex = packed struct {
 };
 
 const MetaBlock = extern struct {
+    min_size: usize,
+    max_size: usize,
     index_offset: usize,
     index_size: usize,
     magic: usize,
@@ -100,8 +109,8 @@ pub const Iterator = struct {
 pub const SSTable = struct {
     file: []u8,
     lvl: usize,
-    min_key: ?KeyValue,
-    max_key: ?KeyValue,
+    min_key: []const u8,
+    max_key: []const u8,
     max_seq: ?KVSeq,
 
     const Self = @This();
@@ -154,7 +163,7 @@ pub const SSTable = struct {
 
                 self.min = KeyValue{ .data = self.file };
                 self.max = self.min;
-            } else if (key.as_type() == .Add) {
+            } else {
                 if (self.min.?.cmp(key) == .gt) {
                     self.min = KeyValue{ .data = self.file };
                 } else if (self.max.?.cmp(key) == .lt) {
@@ -184,11 +193,15 @@ pub const SSTable = struct {
         }
     };
 
-    fn meta(self: *const Self) MetaBlock {
+    fn meta_from_file(file: []const u8) MetaBlock {
         var mt: MetaBlock = undefined;
 
-        @memcpy(utils.data_as_u8_ptr(&mt), self.file[self.file.len - @sizeOf(MetaBlock) ..]);
+        @memcpy(utils.data_as_u8_ptr(&mt), file[file.len - @sizeOf(MetaBlock) ..]);
         return mt;
+    }
+
+    fn meta(self: *const Self) MetaBlock {
+        return Self.meta_from_file(self.file);
     }
 
     fn calculate_file_size(tbl: *const MemTable) usize {
@@ -215,7 +228,7 @@ pub const SSTable = struct {
             total_size += BlockIndex.total_size(last.as_key().len);
         }
 
-        return total_size + @sizeOf(MetaBlock);
+        return total_size + @sizeOf(MetaBlock) + tbl.max().?.as_key().len + tbl.min().?.as_key().len;
     }
 
     fn write_values(tbl: *const MemTable, file: [*]u8, alloc: Allocator) !WriteKVIter {
@@ -229,23 +242,52 @@ pub const SSTable = struct {
         return write_iter;
     }
 
-    fn finalize_table(iter: WriteKVIter, file: std.Io.File, file_data: []u8, io: std.Io, alloc: Allocator) !void {
+    fn min_key_from_file(file: []const u8) []const u8 {
+        const mt = Self.meta_from_file(file);
+
+        return file[file.len - @sizeOf(MetaBlock) - mt.max_size - mt.min_size .. file.len - @sizeOf(MetaBlock) - mt.max_size];
+    }
+
+    fn max_key_from_file(file: []const u8) []const u8 {
+        const mt = Self.meta_from_file(file);
+
+        return file[file.len - @sizeOf(MetaBlock) - mt.max_size .. file.len - @sizeOf(MetaBlock)];
+    }
+
+    fn write_min_max(iter: WriteKVIter, file: [*]u8) usize {
+        const min_len = iter.min.?.as_key().len;
+        const max_len = iter.max.?.as_key().len;
+
+        @memcpy(file, iter.min.?.as_key());
+        @memcpy(file + min_len, iter.max.?.as_key());
+
+        return min_len + max_len;
+    }
+
+    fn finalize_table(iter: WriteKVIter, file: std.Io.File, file_data: []u8, io: std.Io, alloc: Allocator) !usize {
         var i = iter;
         var values_meta = try i.finalize(alloc);
         const index_size = write_index(values_meta, file_data.ptr + iter.data_size);
+        const min_max_size = write_min_max(iter, file_data.ptr + iter.data_size + index_size);
 
-        try Self.write_meta(file_data.ptr + file_data.len - @sizeOf(MetaBlock), MetaBlock{
+        try Self.write_meta(file_data.ptr + iter.data_size + index_size + min_max_size, MetaBlock{
             .index_offset = values_meta.data_size,
             .index_size = index_size,
+            .min_size = iter.min.?.as_key().len,
+            .max_size = iter.max.?.as_key().len,
             .magic = Magic,
         });
 
+        const file_size = iter.data_size + index_size + min_max_size + @sizeOf(MetaBlock);
+        // Set real size of the file
+        try file.setLength(io, file_size);
         // Sync data
         try std.posix.msync(@alignCast(file_data), std.posix.MSF.SYNC);
         // Sync file metadata as well
         try file.sync(io);
 
         values_meta.blocks.deinit(alloc);
+        return file_size;
     }
 
     fn write_index(value_meta: ValuesMeta, file_: [*]u8) usize {
@@ -417,7 +459,13 @@ pub const SSTable = struct {
         const stat = try file.stat(io);
 
         const mmap = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
-        return .{ .file = mmap, .lvl = 0, .min_key = null, .max_key = null, .max_seq = null };
+        return .{
+            .file = mmap,
+            .lvl = 0,
+            .min_key = Self.min_key_from_file(mmap),
+            .max_key = Self.max_key_from_file(mmap),
+            .max_seq = null,
+        };
     }
 
     /// Creates new SSTable with given name
@@ -443,13 +491,17 @@ pub const SSTable = struct {
         );
 
         const iter = try Self.write_values(tbl, mmap.ptr, alloc);
-        try Self.finalize_table(iter, file, mmap, io, alloc);
+        const real_size = try Self.finalize_table(iter, file, mmap, io, alloc);
+
+        std.debug.assert(real_size == mmap.len);
+        std.debug.assert(iter.min.?.cmp(&tbl.min().?) == .eq);
+        std.debug.assert(iter.max.?.cmp(&tbl.max().?) == .eq);
 
         return .{
             .file = mmap,
             .lvl = 0,
-            .min_key = iter.min,
-            .max_key = iter.max,
+            .min_key = iter.min.?.as_key(),
+            .max_key = iter.max.?.as_key(),
             .max_seq = iter.max_seq,
         };
     }
@@ -529,21 +581,21 @@ pub const SSTable = struct {
         std.debug.assert(write_iter.max != null);
         std.debug.assert(write_iter.min != null);
 
-        try Self.finalize_table(write_iter, file, mmap, io, alloc);
+        const real_size = try Self.finalize_table(write_iter, file, mmap, io, alloc);
         return .{
-            .file = mmap,
+            .file = mmap[0..real_size],
             .lvl = self.lvl + 1,
-            .min_key = write_iter.min,
-            .max_key = write_iter.max,
+            .min_key = Self.min_key_from_file(mmap[0..real_size]),
+            .max_key = Self.max_key_from_file(mmap[0..real_size]),
             .max_seq = write_iter.max_seq,
         };
     }
 
-    pub fn min(self: *const SSTable) ?KeyValue {
+    pub fn min(self: *const SSTable) []const u8 {
         return self.min_key;
     }
 
-    pub fn max(self: *const SSTable) ?KeyValue {
+    pub fn max(self: *const SSTable) []const u8 {
         return self.max_key;
     }
 
@@ -629,6 +681,98 @@ test "Simple find and create" {
     }
 
     try std.testing.expectEqual(i, 200);
+}
+
+test "SSTable persists min and max keys" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(testing_io, "test_sstable_min_max") catch {};
+    try cwd.createDirPath(testing_io, "test_sstable_min_max");
+    defer {
+        std.Io.Dir.cwd().deleteTree(testing_io, "test_sstable_min_max") catch {
+            @panic("gg");
+        };
+    }
+
+    var dir = try cwd.openDir(testing_io, "test_sstable_min_max", .{});
+    defer dir.close(testing_io);
+
+    var tb = try MemTable.new(allocator, null);
+    defer tb.deinit(allocator);
+
+    try tb.put("m", "middle", KVSeq.init(1));
+    try tb.put("z", "last", KVSeq.init(2));
+    try tb.put("a", "first", KVSeq.init(3));
+
+    const name = try generate_lvl_name(allocator, 0);
+    defer allocator.free(name);
+
+    {
+        var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+        defer table.deinit();
+
+        try std.testing.expectEqualSlices(u8, "a", table.min());
+        try std.testing.expectEqualSlices(u8, "z", table.max());
+    }
+
+    {
+        var table = try SSTable.open(dir, testing_io, name);
+        defer table.deinit();
+
+        try std.testing.expectEqualSlices(u8, "a", table.min());
+        try std.testing.expectEqualSlices(u8, "z", table.max());
+    }
+}
+
+test "SSTable min and max keys include tombstones" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(testing_io, "test_sstable_min_max_tombstones") catch {};
+    try cwd.createDirPath(testing_io, "test_sstable_min_max_tombstones");
+    defer {
+        std.Io.Dir.cwd().deleteTree(testing_io, "test_sstable_min_max_tombstones") catch {
+            @panic("gg");
+        };
+    }
+
+    var dir = try cwd.openDir(testing_io, "test_sstable_min_max_tombstones", .{});
+    defer dir.close(testing_io);
+
+    var tb = try MemTable.new(allocator, null);
+    defer tb.deinit(allocator);
+
+    try tb.remove("a", KVSeq.init(1));
+    try tb.put("m", "middle", KVSeq.init(2));
+    try tb.remove("z", KVSeq.init(3));
+
+    const name = try generate_lvl_name(allocator, 0);
+    defer allocator.free(name);
+
+    {
+        var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+        defer table.deinit();
+
+        try std.testing.expectEqualSlices(u8, "a", table.min());
+        try std.testing.expectEqualSlices(u8, "z", table.max());
+    }
+
+    {
+        var table = try SSTable.open(dir, testing_io, name);
+        defer table.deinit();
+
+        try std.testing.expectEqualSlices(u8, "a", table.min());
+        try std.testing.expectEqualSlices(u8, "z", table.max());
+    }
 }
 
 test "Remove" {
@@ -774,6 +918,64 @@ test "Merge" {
             const val = try merged.find_value("ab" ** i, allocator);
             try expect_founded_value(val, "ba" ** i, allocator);
         }
+    }
+}
+
+test "Merged SSTable persists min and max keys" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(testing_io, "test_sstable_merge_min_max") catch {};
+    try cwd.createDirPath(testing_io, "test_sstable_merge_min_max");
+    defer {
+        std.Io.Dir.cwd().deleteTree(testing_io, "test_sstable_merge_min_max") catch {
+            @panic("gg");
+        };
+    }
+
+    var dir = try cwd.openDir(testing_io, "test_sstable_merge_min_max", .{});
+    defer dir.close(testing_io);
+
+    var tb = try MemTable.new(allocator, null);
+    defer tb.deinit(allocator);
+    try tb.put("b", "left", KVSeq.init(1));
+    try tb.put("m", "middle", KVSeq.init(2));
+
+    var tb1 = try MemTable.new(allocator, null);
+    defer tb1.deinit(allocator);
+    try tb1.remove("a", KVSeq.init(3));
+    try tb1.put("z", "right", KVSeq.init(4));
+
+    const name = try generate_lvl_name(allocator, 0);
+    const name1 = try generate_lvl_name(allocator, 0);
+    const merged_name = try generate_lvl_name(allocator, 1);
+    defer allocator.free(name);
+    defer allocator.free(name1);
+    defer allocator.free(merged_name);
+
+    var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+    defer table.deinit();
+    var table1 = try SSTable.create(dir, name1, &tb1, testing_io, allocator);
+    defer table1.deinit();
+
+    {
+        var merged = try SSTable.merge(dir, merged_name, testing_io, table, table1, allocator);
+        defer merged.deinit();
+
+        try std.testing.expectEqualSlices(u8, "a", merged.min());
+        try std.testing.expectEqualSlices(u8, "z", merged.max());
+    }
+
+    {
+        var merged = try SSTable.open(dir, testing_io, merged_name);
+        defer merged.deinit();
+
+        try std.testing.expectEqualSlices(u8, "a", merged.min());
+        try std.testing.expectEqualSlices(u8, "z", merged.max());
     }
 }
 

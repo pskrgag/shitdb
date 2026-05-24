@@ -10,6 +10,7 @@ const Mutex = std.Io.Mutex;
 const Value = std.atomic.Value;
 const FileMeta = @import("storage").manifest.FileMeta;
 const FileSeq = @import("storage").manifest.FileSeq;
+const KeyOwned = @import("storage").manifest.KeyOwned;
 const WalTable = @import("wal_table.zig").WalTable;
 const Wal = @import("wal.zig").Wal;
 const MemTableOpts = @import("storage").MemTableOpts;
@@ -188,8 +189,8 @@ pub const Version = struct {
         try edit.new_files.append(alloc, FileMeta{
             .lvl = 1,
             .name = name,
-            .max = try KeyValueOwned.from_kv(&new.max().?, alloc),
-            .min = try KeyValueOwned.from_kv(&new.min().?, alloc),
+            .max = try KeyOwned.from_raw(new.max(), alloc),
+            .min = try KeyOwned.from_raw(new.min(), alloc),
             .file_seq = merged_seq,
             .value_seq = new.maximum_seq().?,
         });
@@ -209,8 +210,8 @@ pub const Version = struct {
         if (table.min() == null)
             return;
 
-        const min = try KeyValueOwned.from_kv(table.min().?, alloc);
-        const max = try KeyValueOwned.from_kv(table.max().?, alloc);
+        const min = try KeyOwned.from_kv(table.min().?, alloc);
+        const max = try KeyOwned.from_kv(table.max().?, alloc);
 
         const name = try Self.file_name(table.seq, alloc);
         var edit = try VersionEdit.empty(alloc);
@@ -257,10 +258,10 @@ pub const Version = struct {
         defer candidates.deinit(alloc);
 
         for (self.tables.items) |table| {
-            const min = table.min.as_kv().as_key();
-            const max = table.max.as_kv().as_key();
-            const cmp_min = std.mem.order(u8, min, key);
-            const cmp_max = std.mem.order(u8, max, key);
+            const min = table.min;
+            const max = table.max;
+            const cmp_min = std.mem.order(u8, min.data, key);
+            const cmp_max = std.mem.order(u8, max.data, key);
 
             if ((cmp_min == .lt or cmp_min == .eq) and (cmp_max == .gt or cmp_max == .eq)) {
                 try candidates.append(alloc, table);
@@ -472,8 +473,8 @@ fn test_file_meta(
         .name = try alloc.dupe(u8, name),
         .lvl = lvl,
         .file_seq = FileSeq.init(seq),
-        .min = try KeyValueOwned.from_kv(memtable.min().?, alloc),
-        .max = try KeyValueOwned.from_kv(memtable.max().?, alloc),
+        .min = try KeyOwned.from_kv(memtable.min().?, alloc),
+        .max = try KeyOwned.from_kv(memtable.max().?, alloc),
         .value_seq = KVSeq.init(seq + 1),
     };
 }

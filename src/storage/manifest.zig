@@ -25,11 +25,35 @@ pub const FileSeq = packed struct(usize) {
     }
 };
 
+pub const KeyOwned = struct {
+    data: []const u8,
+
+    pub fn from_kv(kv: KeyValue, alloc: Allocator) !KeyOwned {
+        const full_size = kv.as_key().len;
+        const ptr = try alloc.alloc(u8, full_size);
+
+        @memcpy(ptr, kv.as_key());
+        return .{ .data = ptr };
+    }
+
+    pub fn from_raw(data: []const u8, alloc: Allocator) !KeyOwned {
+        const full_size = data.len;
+        const ptr = try alloc.alloc(u8, full_size);
+
+        @memcpy(ptr, data);
+        return .{ .data = ptr };
+    }
+
+    pub fn deinit(self: *KeyOwned, alloc: Allocator) void {
+        alloc.free(self.data);
+    }
+};
+
 // TODO: I really think storing filename is overkill. We can generate it from sequence+lvl
 pub const FileMeta = struct {
     name: []const u8,
-    max: KeyValueOwned,
-    min: KeyValueOwned,
+    max: KeyOwned,
+    min: KeyOwned,
     lvl: u8,
     file_seq: FileSeq,
     value_seq: KVSeq,
@@ -47,6 +71,15 @@ pub const FileMeta = struct {
             return lhs.lvl < rhs.lvl;
 
         return lhs.file_seq.get() > rhs.file_seq.get();
+    }
+
+    pub fn serialize_size(self: *const FileMeta) usize {
+        return ManifestRecord.string_size(self.name) +
+            ManifestRecord.string_size(self.max.data) +
+            ManifestRecord.string_size(self.min.data) +
+            @sizeOf(@TypeOf(self.lvl)) +
+            @sizeOf(@TypeOf(self.file_seq)) +
+            @sizeOf(@TypeOf(self.value_seq));
     }
 };
 
@@ -72,7 +105,7 @@ pub const ManifestRecord = union(enum) {
 
         switch (self.*) {
             .AddFile => |add| {
-                full = ManifestRecord.string_size(add.name) + @sizeOf(u8) + @sizeOf(usize) + @sizeOf(usize) + ManifestRecord.string_size(add.max.data) + ManifestRecord.string_size(add.min.data);
+                full = add.serialize_size();
             },
             .AddWal => |a| {
                 full = @sizeOf(@TypeOf(a));
@@ -195,8 +228,8 @@ pub const ManifestRecord = union(enum) {
                     try res.append(alloc, .{ .AddFile = .{
                         .lvl = lvl,
                         .name = try alloc.dupe(u8, name),
-                        .min = try KeyValueOwned.from_kv(&KeyValue{ .data = min.ptr }, alloc),
-                        .max = try KeyValueOwned.from_kv(&KeyValue{ .data = max.ptr }, alloc),
+                        .min = try KeyOwned.from_raw(min, alloc),
+                        .max = try KeyOwned.from_raw(max, alloc),
                         .file_seq = file_seq,
                         .value_seq = value_seq,
                     } });

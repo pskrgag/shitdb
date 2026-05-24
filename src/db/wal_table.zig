@@ -90,12 +90,12 @@ pub const WalTable = struct {
     }
 
     /// Returns maximum key
-    pub fn max(self: *WalTable) ?*const KeyValue {
+    pub fn max(self: *WalTable) ?KeyValue {
         return self.table.max();
     }
 
     /// Returns minimal key
-    pub fn min(self: *WalTable) ?*const KeyValue {
+    pub fn min(self: *WalTable) ?KeyValue {
         return self.table.min();
     }
 

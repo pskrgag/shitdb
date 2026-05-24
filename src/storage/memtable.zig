@@ -28,7 +28,7 @@ pub const KVSeq = packed struct(usize) {
 pub const KeyValueOwned = struct {
     data: []const u8,
 
-    pub fn from_kv(kv: *const KeyValue, alloc: Allocator) !KeyValueOwned {
+    pub fn from_kv(kv: KeyValue, alloc: Allocator) !KeyValueOwned {
         const full_size = kv.full_size();
         const ptr = try alloc.alloc(u8, full_size);
 
@@ -287,13 +287,17 @@ pub const MemTable = struct {
     }
 
     /// Returns maximum key
-    pub fn max(self: *Self) ?*const KeyValue {
-        return self.table.max();
+    pub fn max(self: *const Self) ?KeyValue {
+        const res = self.table.max();
+
+        return if (res) |r| r.* else null;
     }
 
     /// Returns minimal key
-    pub fn min(self: *Self) ?*const KeyValue {
-        return self.table.min();
+    pub fn min(self: *const Self) ?KeyValue {
+        const res = self.table.min();
+
+        return if (res) |r| r.* else null;
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
