@@ -58,6 +58,14 @@ pub const FileMeta = struct {
     file_seq: FileSeq,
     value_seq: KVSeq,
 
+    // min < self.max && self.min < max
+    pub fn key_range_overlap(self: *const FileMeta, min: []const u8, max: []const u8) bool {
+        const first = std.mem.order(u8, min, self.max.data);
+        const second = std.mem.order(u8, self.min.data, max);
+
+        return (first == .lt or first == .eq) and (second == .lt or first == .eq);
+    }
+
     pub fn deinit(self: *FileMeta, alloc: Allocator) void {
         alloc.free(self.name);
         self.max.deinit(alloc);

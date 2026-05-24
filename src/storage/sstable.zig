@@ -36,6 +36,7 @@ var Lvl0Count: u64 = 0;
 // |   max_size            |
 // |   index_offset        |
 // |   index_size          |
+// |   lvl                 |
 // |   magic               |
 // +-----------------------+
 //
@@ -70,12 +71,13 @@ const BlockIndex = packed struct {
     }
 };
 
-const MetaBlock = extern struct {
+const MetaBlock = packed struct {
     min_size: usize,
     max_size: usize,
     index_offset: usize,
     index_size: usize,
     magic: usize,
+    lvl: u8,
 };
 
 const Block = struct {
@@ -264,7 +266,7 @@ pub const SSTable = struct {
         return min_len + max_len;
     }
 
-    fn finalize_table(iter: WriteKVIter, file: std.Io.File, file_data: []u8, io: std.Io, alloc: Allocator) !usize {
+    fn finalize_table(iter: WriteKVIter, file: std.Io.File, file_data: []u8, lvl: u8, io: std.Io, alloc: Allocator) !usize {
         var i = iter;
         var values_meta = try i.finalize(alloc);
         const index_size = write_index(values_meta, file_data.ptr + iter.data_size);
@@ -276,6 +278,7 @@ pub const SSTable = struct {
             .min_size = iter.min.?.as_key().len,
             .max_size = iter.max.?.as_key().len,
             .magic = Magic,
+            .lvl = lvl,
         });
 
         const file_size = iter.data_size + index_size + min_max_size + @sizeOf(MetaBlock);
@@ -459,9 +462,10 @@ pub const SSTable = struct {
         const stat = try file.stat(io);
 
         const mmap = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
+        const mt = Self.meta_from_file(mmap);
         return .{
             .file = mmap,
-            .lvl = 0,
+            .lvl = @intCast(mt.lvl),
             .min_key = Self.min_key_from_file(mmap),
             .max_key = Self.max_key_from_file(mmap),
             .max_seq = null,
@@ -469,7 +473,7 @@ pub const SSTable = struct {
     }
 
     /// Creates new SSTable with given name
-    pub fn create(dir: std.Io.Dir, name: []const u8, tbl: *const MemTable, io: std.Io, alloc: Allocator) !Self {
+    pub fn create(dir: std.Io.Dir, name: []const u8, tbl: *const MemTable, lvl: u8, io: std.Io, alloc: Allocator) !Self {
         const file = try dir.createFile(io, name, .{
             .truncate = true,
             .read = true,
@@ -491,7 +495,7 @@ pub const SSTable = struct {
         );
 
         const iter = try Self.write_values(tbl, mmap.ptr, alloc);
-        const real_size = try Self.finalize_table(iter, file, mmap, io, alloc);
+        const real_size = try Self.finalize_table(iter, file, mmap, lvl, io, alloc);
 
         std.debug.assert(real_size == mmap.len);
         std.debug.assert(iter.min.?.cmp(&tbl.min().?) == .eq);
@@ -499,7 +503,7 @@ pub const SSTable = struct {
 
         return .{
             .file = mmap,
-            .lvl = 0,
+            .lvl = @intCast(lvl),
             .min_key = iter.min.?.as_key(),
             .max_key = iter.max.?.as_key(),
             .max_seq = iter.max_seq,
@@ -523,25 +527,33 @@ pub const SSTable = struct {
         return .NotFound;
     }
 
-    /// Merges two SSTables into one
-    pub fn merge(dir: std.Io.Dir, name: []const u8, io: std.Io, self: Self, other: Self, alloc: Allocator) !Self {
-        var self_iter = self.iterator();
-        var other_iter = other.iterator();
+    /// Merges SSTables into one
+    pub fn merge(dir: std.Io.Dir, name: []const u8, io: std.Io, tables: []const SSTable, merged_lvl: u8, alloc: Allocator) !Self {
+        var iters = try std.ArrayList(merging_iterator.IteratorWrapper(KeyValue)).initCapacity(alloc, 0);
+        var iter_wrappers = try std.ArrayList(Iterator).initCapacity(alloc, 0);
+        var total_size: usize = 0;
 
-        var iters = [_]merging_iterator.IteratorWrapper(KeyValue){
-            merging_iterator.IteratorWrapper(KeyValue).init(&self_iter),
-            merging_iterator.IteratorWrapper(KeyValue).init(&other_iter),
-        };
-        var iter = merging_iterator.MergeIterator(KeyValue).new(&iters);
+        defer iters.deinit(alloc);
+        defer iter_wrappers.deinit(alloc);
+
+        for (tables) |i| {
+            // We need extra array, since IteratorWrapper accepts pointer
+            try iter_wrappers.append(alloc, i.iterator());
+            try iters.append(
+                alloc,
+                merging_iterator.IteratorWrapper(KeyValue).init(&iter_wrappers.items[iter_wrappers.items.len - 1]),
+            );
+
+            total_size += i.file.len;
+        }
+
+        var iter = merging_iterator.MergeIterator(KeyValue).new(iters.items);
         const file = try dir.createFile(io, name, .{
             .truncate = true,
             .read = true,
         });
         errdefer file.close(io);
 
-        std.debug.assert(self.lvl == other.lvl);
-
-        const total_size = self.file.len + other.file.len;
         try file.setLength(io, total_size);
 
         const mmap: []u8 = @alignCast(try std.posix.mmap(
@@ -581,10 +593,10 @@ pub const SSTable = struct {
         std.debug.assert(write_iter.max != null);
         std.debug.assert(write_iter.min != null);
 
-        const real_size = try Self.finalize_table(write_iter, file, mmap, io, alloc);
+        const real_size = try Self.finalize_table(write_iter, file, mmap, merged_lvl, io, alloc);
         return .{
             .file = mmap[0..real_size],
-            .lvl = self.lvl + 1,
+            .lvl = merged_lvl,
             .min_key = Self.min_key_from_file(mmap[0..real_size]),
             .max_key = Self.max_key_from_file(mmap[0..real_size]),
             .max_seq = write_iter.max_seq,
@@ -599,8 +611,8 @@ pub const SSTable = struct {
         return self.max_key;
     }
 
-    pub fn maximum_seq(self: *const SSTable) ?KVSeq {
-        return self.max_seq;
+    pub fn maximum_seq(self: *const SSTable) KVSeq {
+        return self.max_seq.?;
     }
 
     /// Closes SSTable
@@ -653,7 +665,7 @@ test "Simple find and create" {
         try tb.put("a" ** i, "a" ** i, KVSeq.init(0));
     }
 
-    var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+    var table = try SSTable.create(dir, name, &tb, 0, testing_io, allocator);
     defer table.deinit();
     const to_find = [_][]const u8{ "a" ** 1, "a" ** 20, "a" ** 51, "a" ** 100, "a" ** 150, "a" ** 132 };
 
@@ -713,7 +725,7 @@ test "SSTable persists min and max keys" {
     defer allocator.free(name);
 
     {
-        var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+        var table = try SSTable.create(dir, name, &tb, 0, testing_io, allocator);
         defer table.deinit();
 
         try std.testing.expectEqualSlices(u8, "a", table.min());
@@ -759,7 +771,7 @@ test "SSTable min and max keys include tombstones" {
     defer allocator.free(name);
 
     {
-        var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+        var table = try SSTable.create(dir, name, &tb, 0, testing_io, allocator);
         defer table.deinit();
 
         try std.testing.expectEqualSlices(u8, "a", table.min());
@@ -801,7 +813,7 @@ test "Remove" {
     try tb.put("b" ** 10, "b" ** 10, KVSeq.init(1));
     try tb.remove("b" ** 10, KVSeq.init(2));
 
-    var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+    var table = try SSTable.create(dir, name, &tb, 0, testing_io, allocator);
     defer table.deinit();
 
     const val = try table.find_value("b" ** 10, allocator);
@@ -843,7 +855,7 @@ test "Remove more than one block" {
     {
         const name = try generate_lvl_name(allocator, 0);
         defer allocator.free(name);
-        var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+        var table = try SSTable.create(dir, name, &tb, 0, testing_io, allocator);
         defer table.deinit();
 
         const val = try table.find_value("b" ** (BlockSize / 4), allocator);
@@ -856,7 +868,7 @@ test "Remove more than one block" {
 
         try tb.remove("b" ** (BlockSize / 4), KVSeq.init(5));
 
-        var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+        var table = try SSTable.create(dir, name, &tb, 0, testing_io, allocator);
         defer table.deinit();
 
         const val = try table.find_value("b" ** (BlockSize / 4), allocator);
@@ -893,7 +905,7 @@ test "Merge" {
         try tb.put("ab" ** ((i * 2) - 1), "ba" ** ((i * 2) - 1), KVSeq.init(i));
     }
 
-    var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+    var table = try SSTable.create(dir, name, &tb, 0, testing_io, allocator);
     defer table.deinit();
 
     var tb1 = try MemTable.new(allocator, null);
@@ -905,12 +917,12 @@ test "Merge" {
 
     const name1 = try generate_lvl_name(allocator, 0);
     defer allocator.free(name1);
-    var table1 = try SSTable.create(dir, name1, &tb1, testing_io, allocator);
+    var table1 = try SSTable.create(dir, name1, &tb1, 0, testing_io, allocator);
     defer table1.deinit();
 
     const name_merged = try generate_lvl_name(allocator, 1);
     defer allocator.free(name_merged);
-    var merged = try SSTable.merge(dir, name_merged, testing_io, table, table1, allocator);
+    var merged = try SSTable.merge(dir, name_merged, testing_io, &[2]SSTable{ table, table1 }, 1, allocator);
     defer merged.deinit();
 
     {
@@ -957,13 +969,13 @@ test "Merged SSTable persists min and max keys" {
     defer allocator.free(name1);
     defer allocator.free(merged_name);
 
-    var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+    var table = try SSTable.create(dir, name, &tb, 0, testing_io, allocator);
     defer table.deinit();
-    var table1 = try SSTable.create(dir, name1, &tb1, testing_io, allocator);
+    var table1 = try SSTable.create(dir, name1, &tb1, 0, testing_io, allocator);
     defer table1.deinit();
 
     {
-        var merged = try SSTable.merge(dir, merged_name, testing_io, table, table1, allocator);
+        var merged = try SSTable.merge(dir, merged_name, testing_io, &[_]SSTable{ table, table1 }, 1, allocator);
         defer merged.deinit();
 
         try std.testing.expectEqualSlices(u8, "a", merged.min());
@@ -1052,12 +1064,12 @@ test "Merge with remove and overlapping regions" {
     try tb1.remove("a", KVSeq.init(6));
     try tb1.put("c", "cc", KVSeq.init(7));
 
-    var table = try SSTable.create(dir, name, &tb, testing_io, allocator);
+    var table = try SSTable.create(dir, name, &tb, 0, testing_io, allocator);
     defer table.deinit();
-    var table1 = try SSTable.create(dir, name1, &tb1, testing_io, allocator);
+    var table1 = try SSTable.create(dir, name1, &tb1, 0, testing_io, allocator);
     defer table1.deinit();
 
-    const merged = try SSTable.merge(dir, merged_name, testing_io, table, table1, allocator);
+    const merged = try SSTable.merge(dir, merged_name, testing_io, &[_]SSTable{ table, table1 }, 1, allocator);
 
     try expect_founded_value(try merged.find_value("b", allocator), "b", allocator);
     try expect_deleted(try merged.find_value("a", allocator));

@@ -66,11 +66,12 @@ pub const Version = struct {
             self.active_tables[file.lvl] += 1;
         }
 
-        // it's n^2, but len(deleted_files) should be small (2)
-        for (edit.deleted_files.items) |seq| {
+        // it's n^2, but len(deleted_files) should be small
+        for (edit.deleted_files.items) |file| {
             for (self.tables.items, 0..) |f, i| {
-                if (f.file_seq.get() == seq.get()) {
+                if (f.file_seq.get() == file.file.get()) {
                     _ = self.tables.swapRemove(i);
+                    self.active_tables[file.lvl] -= 1;
                     break;
                 }
             }
@@ -153,34 +154,61 @@ pub const Version = struct {
         std.debug.assert(self.tables.items.len >= MaxLevel);
         std.debug.assert(MaxLevel >= 2);
 
-        var tables: [2]struct { meta: FileMeta, idx: usize } = undefined;
+        var lvl0_tables: [2]struct { meta: FileMeta, idx: usize } = undefined;
+        var lvl1_tables = try std.ArrayList(struct { meta: FileMeta, idx: usize }).initCapacity(alloc, 0);
+        var opened_tables = try std.ArrayList(SSTable).initCapacity(alloc, 0);
         var found: usize = 0;
+
+        defer lvl1_tables.deinit(alloc);
 
         {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
 
+            // Step 1: find 2 lvl0 tables to compact. Basically take first 2 in a list
             for (self.tables.items, 0..) |file, idx| {
                 if (file.lvl == 0) {
-                    tables[found] = .{ .meta = file, .idx = idx };
+                    lvl0_tables[found] = .{ .meta = file, .idx = idx };
                     found += 1;
-                    if (found == 2) break;
+
+                    if (found == 2)
+                        break;
+                }
+            }
+
+            std.debug.assert(found == 2);
+
+            // Step 2: once we've found them. Find all lvl1 tables that have overlapping key ranges
+            for (self.tables.items, 0..) |file, idx| {
+                if (file.lvl == 1) {
+                    const first_overlap = file.key_range_overlap(lvl0_tables[0].meta.min.data, lvl0_tables[0].meta.max.data);
+                    const second_overlap = file.key_range_overlap(lvl0_tables[1].meta.min.data, lvl0_tables[1].meta.max.data);
+
+                    if (first_overlap or second_overlap)
+                        try lvl1_tables.append(alloc, .{ .meta = file, .idx = idx });
                 }
             }
         }
-
-        std.debug.assert(found == 2);
 
         const merged_seq = self.new_file_seq();
         // name will be freed later, since it will be added to tables array
         const name = try Self.file_name(merged_seq, alloc);
 
-        const first = try SSTable.open(dir, io, tables[0].meta.name);
-        defer first.deinit();
-        const second = try SSTable.open(dir, io, tables[1].meta.name);
-        defer second.deinit();
+        defer {
+            for (opened_tables.items) |sstable|
+                sstable.deinit();
 
-        const new = try SSTable.merge(dir, name, io, first, second, alloc);
+            opened_tables.deinit(alloc);
+        }
+
+        try opened_tables.append(alloc, try SSTable.open(dir, io, lvl0_tables[0].meta.name));
+        try opened_tables.append(alloc, try SSTable.open(dir, io, lvl0_tables[1].meta.name));
+
+        for (lvl1_tables.items) |lvl1| {
+            try opened_tables.append(alloc, try SSTable.open(dir, io, lvl1.meta.name));
+        }
+
+        const new = try SSTable.merge(dir, name, io, opened_tables.items, 1, alloc);
         defer new.deinit();
 
         var edit = try VersionEdit.empty(alloc);
@@ -192,17 +220,17 @@ pub const Version = struct {
             .max = try KeyOwned.from_raw(new.max(), alloc),
             .min = try KeyOwned.from_raw(new.min(), alloc),
             .file_seq = merged_seq,
-            .value_seq = new.maximum_seq().?,
+            .value_seq = new.maximum_seq(),
         });
 
-        try edit.deleted_files.append(alloc, tables[0].meta.file_seq);
-        try edit.deleted_files.append(alloc, tables[1].meta.file_seq);
+        try edit.deleted_files.append(alloc, .{ .file = lvl0_tables[0].meta.file_seq, .lvl = 0 });
+        try edit.deleted_files.append(alloc, .{ .file = lvl0_tables[1].meta.file_seq, .lvl = 0 });
+
+        for (lvl1_tables.items) |lvl1| {
+            try edit.deleted_files.append(alloc, .{ .file = lvl1.meta.file_seq, .lvl = 1 });
+        }
 
         try self.apply(edit, io, alloc);
-
-        // NOTE: this should be safe to access without lock, since it's updated only from flusher thread.
-        // tho it's better be moved to apply, but we don't store lvl there...
-        self.active_tables[0] -= 2;
     }
 
     // Flushes a memtable synchronously into an SSTable and records it in the manifest.
@@ -227,7 +255,7 @@ pub const Version = struct {
         });
 
         // TODO: maybe make SSTable::create generic over table type? Accessing table.table is ugly af.
-        var sstable = try SSTable.create(dir, name, &table.table, io, alloc);
+        var sstable = try SSTable.create(dir, name, &table.table, 0, io, alloc);
         defer sstable.deinit();
 
         try self.apply(edit, io, alloc);
@@ -329,6 +357,7 @@ pub const Version = struct {
                     for (self.tables.items, 0..) |file, idx| {
                         if (file.file_seq.get() == f.get()) {
                             _ = self.tables.swapRemove(idx);
+                            self.active_tables[file.lvl] -= 1;
                             found = true;
                             break;
                         }
@@ -371,9 +400,14 @@ pub const Version = struct {
 pub const VersionEdit = struct {
     next_file: ?FileSeq,
     new_files: std.ArrayList(FileMeta),
-    deleted_files: std.ArrayList(FileSeq),
+    deleted_files: std.ArrayList(DeletedFile),
     next_seq: ?KVSeq,
     add_wal: ?FileSeq,
+
+    pub const DeletedFile = struct {
+        file: FileSeq,
+        lvl: usize,
+    };
 
     pub fn as_manifest_records(
         self: *const VersionEdit,
@@ -394,7 +428,7 @@ pub const VersionEdit = struct {
         }
 
         for (self.deleted_files.items) |file| {
-            try res.append(alloc, .{ .DeleteFile = file });
+            try res.append(alloc, .{ .DeleteFile = file.file });
         }
 
         if (self.add_wal) |wal| {
@@ -413,7 +447,7 @@ pub const VersionEdit = struct {
         return .{
             .next_file = null,
             .new_files = try std.ArrayList(FileMeta).initCapacity(alloc, 0),
-            .deleted_files = try std.ArrayList(FileSeq).initCapacity(alloc, 0),
+            .deleted_files = try std.ArrayList(DeletedFile).initCapacity(alloc, 0),
             .next_seq = null,
             .add_wal = null,
         };
@@ -421,6 +455,12 @@ pub const VersionEdit = struct {
 };
 
 const testing_memtable_opts = MemTableOpts{ .memtable_size = 1 << 20 };
+
+const TestSSTableKV = struct {
+    key: []const u8,
+    value: ?[]const u8,
+    seq: usize,
+};
 
 test "Version serialization" {
     var arena = std.heap.DebugAllocator(.{}){};
@@ -476,6 +516,39 @@ fn test_file_meta(
         .min = try KeyOwned.from_kv(memtable.min().?, alloc),
         .max = try KeyOwned.from_kv(memtable.max().?, alloc),
         .value_seq = KVSeq.init(seq + 1),
+    };
+}
+
+fn create_test_sstable(
+    dir: std.Io.Dir,
+    io: std.Io,
+    alloc: Allocator,
+    name: []const u8,
+    lvl: u8,
+    file_seq: usize,
+    keys: []const TestSSTableKV,
+) !FileMeta {
+    var memtable = try MemTable.new(alloc, null);
+    defer memtable.deinit(alloc);
+
+    for (keys) |kv| {
+        if (kv.value) |value| {
+            try memtable.put(kv.key, value, KVSeq.init(kv.seq));
+        } else {
+            try memtable.remove(kv.key, KVSeq.init(kv.seq));
+        }
+    }
+
+    var sstable = try SSTable.create(dir, name, &memtable, lvl, io, alloc);
+    defer sstable.deinit();
+
+    return .{
+        .name = try alloc.dupe(u8, name),
+        .lvl = lvl,
+        .file_seq = FileSeq.init(file_seq),
+        .min = try KeyOwned.from_raw(sstable.min(), alloc),
+        .max = try KeyOwned.from_raw(sstable.max(), alloc),
+        .value_seq = sstable.maximum_seq(),
     };
 }
 
@@ -566,4 +639,171 @@ test "Version apply persists edits that reopen can replay" {
         try std.testing.expectEqual(@as(usize, 1), reopened.tables.items.len);
         try std.testing.expectEqualSlices(u8, "memtable11.sst", reopened.tables.items[0].name);
     }
+}
+
+test "lvl0 compaction merges overlapping lvl1 table" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const testing_io = std.testing.io;
+
+    const dirname = "test_db_l0_compaction_overlapping_l1";
+    std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
+    try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
+
+    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    defer {
+        dir.close(testing_io);
+        std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, testing_io, allocator);
+    defer version.deinit(testing_io, allocator);
+
+    var edit = try VersionEdit.empty(allocator);
+    defer edit.deinit(allocator);
+    edit.next_file = FileSeq.init(4);
+
+    try edit.new_files.append(
+        allocator,
+        try create_test_sstable(
+            dir,
+            testing_io,
+            allocator,
+            "memtable1.sst",
+            1,
+            1,
+            &[_]TestSSTableKV{
+                .{ .key = "b", .value = "old", .seq = 1 },
+            },
+        ),
+    );
+    try edit.new_files.append(
+        allocator,
+        try create_test_sstable(
+            dir,
+            testing_io,
+            allocator,
+            "memtable2.sst",
+            0,
+            2,
+            &[_]TestSSTableKV{
+                .{ .key = "b", .value = null, .seq = 2 },
+            },
+        ),
+    );
+    try edit.new_files.append(
+        allocator,
+        try create_test_sstable(
+            dir,
+            testing_io,
+            allocator,
+            "memtable3.sst",
+            0,
+            3,
+            &[_]TestSSTableKV{
+                .{ .key = "a", .value = "fresh", .seq = 3 },
+            },
+        ),
+    );
+
+    try version.apply(edit, testing_io, allocator);
+    try version.compact_lvl0(dir, testing_io, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), version.tables.items.len);
+    try std.testing.expectEqual(@as(u8, 0), version.active_tables[0]);
+    try std.testing.expectEqual(@as(u8, 1), version.active_tables[1]);
+    try std.testing.expectEqual(@as(u8, 1), version.tables.items[0].lvl);
+
+    try std.testing.expectEqual(null, try version.get("b", dir, testing_io, allocator));
+
+    const value = (try version.get("a", dir, testing_io, allocator)).?;
+    try std.testing.expectEqualSlices(u8, "fresh", value);
+}
+
+test "lvl0 compaction keeps non-overlapping lvl1 table" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const testing_io = std.testing.io;
+
+    const dirname = "test_db_l0_compaction_non_overlapping_l1";
+    std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
+    try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
+
+    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    defer {
+        dir.close(testing_io);
+        std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, testing_io, allocator);
+    defer version.deinit(testing_io, allocator);
+
+    var edit = try VersionEdit.empty(allocator);
+    defer edit.deinit(allocator);
+    edit.next_file = FileSeq.init(4);
+
+    try edit.new_files.append(
+        allocator,
+        try create_test_sstable(
+            dir,
+            testing_io,
+            allocator,
+            "memtable1.sst",
+            1,
+            1,
+            &[_]TestSSTableKV{
+                .{ .key = "z", .value = "old", .seq = 1 },
+            },
+        ),
+    );
+    try edit.new_files.append(
+        allocator,
+        try create_test_sstable(
+            dir,
+            testing_io,
+            allocator,
+            "memtable2.sst",
+            0,
+            2,
+            &[_]TestSSTableKV{
+                .{ .key = "a", .value = "fresh-a", .seq = 2 },
+            },
+        ),
+    );
+    try edit.new_files.append(
+        allocator,
+        try create_test_sstable(
+            dir,
+            testing_io,
+            allocator,
+            "memtable3.sst",
+            0,
+            3,
+            &[_]TestSSTableKV{
+                .{ .key = "b", .value = "fresh-b", .seq = 3 },
+            },
+        ),
+    );
+
+    try version.apply(edit, testing_io, allocator);
+    try version.compact_lvl0(dir, testing_io, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), version.tables.items.len);
+    try std.testing.expectEqual(@as(u8, 0), version.active_tables[0]);
+    try std.testing.expectEqual(@as(u8, 2), version.active_tables[1]);
+
+    const old = (try version.get("z", dir, testing_io, allocator)).?;
+    try std.testing.expectEqualSlices(u8, "old", old);
+
+    const fresh_a = (try version.get("a", dir, testing_io, allocator)).?;
+    try std.testing.expectEqualSlices(u8, "fresh-a", fresh_a);
+
+    const fresh_b = (try version.get("b", dir, testing_io, allocator)).?;
+    try std.testing.expectEqualSlices(u8, "fresh-b", fresh_b);
 }
