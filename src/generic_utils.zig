@@ -64,7 +64,10 @@ pub fn compare_keys(Key: type, Other: type, lhs: Key, rhs: Other) std.math.Order
                 if (@hasDecl(Key, "cmp_with_" ++ &transform_struct_name(suffix))) {
                     return @field(Key, "cmp_with_" ++ &transform_struct_name(suffix))(&lhs, &rhs);
                 } else {
-                    @compileError("Custom structs must implement 'cmp_with_" ++ &transform_struct_name(suffix) ++ "' method. Type name is " ++ @typeName(Key));
+                    @compileError("Custom structs must implement 'cmp_with_" ++
+                        &transform_struct_name(suffix) ++
+                        "' method. Type name is " ++
+                        @typeName(Key));
                 }
             },
             else => @compileError("Unsupported type for comparison: " ++ @typeName(Key)),

@@ -553,7 +553,7 @@ fn test_file_meta(
     max_key: []const u8,
     max_value: []const u8,
 ) !FileMeta {
-    var memtable = try MemTable.new(alloc, null);
+    var memtable = try MemTable.new(alloc, std.testing.io, null);
     defer memtable.deinit(alloc);
 
     try memtable.put(min_key, min_value, KVSeq.init(seq));
@@ -578,7 +578,7 @@ fn create_test_sstable(
     file_seq: usize,
     keys: []const TestSSTableKV,
 ) !FileMeta {
-    var memtable = try MemTable.new(alloc, null);
+    var memtable = try MemTable.new(alloc, io, null);
     defer memtable.deinit(alloc);
 
     for (keys) |kv| {

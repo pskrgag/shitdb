@@ -30,7 +30,7 @@ pub const WalTable = struct {
     ) !*WalTable {
         const self = try alloc.create(WalTable);
 
-        self.table = try MemTable.new(alloc, user_opts);
+        self.table = try MemTable.new(alloc, io, user_opts);
         self.wal = try Wal.new(dir, seq, version, io, alloc);
         self.seq = seq;
         self.io = io;
@@ -48,7 +48,7 @@ pub const WalTable = struct {
     ) !*WalTable {
         const self = try alloc.create(WalTable);
 
-        self.table = try MemTable.new(alloc, user_opts);
+        self.table = try MemTable.new(alloc, io, user_opts);
         self.wal = try Wal.open(dir, seq, io, alloc);
 
         self.seq = seq;

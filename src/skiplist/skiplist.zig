@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const compare_keys = @import("generic_utils").compare_keys;
 pub const Arena = @import("arena.zig").ThreadSafeArena;
+pub const ArenaBouned = @import("arena.zig").ThreadSafeArenaBounded;
 
 const MaxHeigth = 12;
 
@@ -112,7 +113,15 @@ pub fn SkipList(T: type) type {
             return h;
         }
 
-        fn find_insert_spot(self: *Self, K: type, val: K, h: usize, prev: []*Node(T), succ: []?*Node(T), to_lvl: usize) ?*Node(T) {
+        fn find_insert_spot(
+            self: *Self,
+            K: type,
+            val: K,
+            h: usize,
+            prev: []*Node(T),
+            succ: []?*Node(T),
+            to_lvl: usize,
+        ) ?*Node(T) {
             var lvl: usize = h - 1;
             var node = &self.head;
 
@@ -159,8 +168,8 @@ pub fn SkipList(T: type) type {
         }
 
         /// Constructs new SkipList with `bound` memory usage.
-        pub fn new(alloc: Allocator, bound: usize) !Self {
-            var arena = try Arena.new(alloc, bound);
+        pub fn new(alloc: Allocator, io: std.Io) !Self {
+            var arena = try Arena.new(alloc, io);
             const node = try Node(T).new(MaxHeigth, undefined, arena.allocator());
 
             return .{
@@ -191,7 +200,8 @@ pub fn SkipList(T: type) type {
                 std.debug.assert(max_h < MaxHeigth);
 
                 const found = self.find_insert_spot(T, val, max_h, prev[0..], succ[0..], linked_lvl);
-                std.debug.assert(found == null);
+                if (found != null)
+                    return error.AlreadyExists;
 
                 for (linked_lvl..lvl) |h| {
                     // If this fails, just retry the search. Even if h != 0, it's fine, since node can
@@ -273,8 +283,8 @@ pub fn SkipList(T: type) type {
             }
         }
 
-        pub fn deinit(self: *Self, alloc: Allocator) void {
-            self.arena.deinit(alloc);
+        pub fn deinit(self: *Self) void {
+            self.arena.deinit();
         }
     };
 }
@@ -284,7 +294,7 @@ test "Basic" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var list = try SkipList(usize).new(allocator, 1000);
+    var list = try SkipList(usize).new(allocator, std.testing.io);
     try list.insert(40);
     try list.insert(20);
     try list.insert(10);
@@ -304,7 +314,7 @@ test "Min Max" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var list = try SkipList(usize).new(allocator, 1000);
+    var list = try SkipList(usize).new(allocator, std.testing.io);
     try list.insert(40);
     try list.insert(20);
     try list.insert(10);
@@ -341,7 +351,7 @@ test "Test MT" {
     var shuffle_prng = std.Random.DefaultPrng.init(0xdead_beef);
     const rand = shuffle_prng.random();
 
-    var list = try SkipList(usize).new(allocator, NumPush * NumPush);
+    var list = try SkipList(usize).new(allocator, std.testing.io);
     var list1 = try std.ArrayList(usize).initCapacity(allocator, NumPush);
     var list2 = try std.ArrayList(usize).initCapacity(allocator, NumPush);
 

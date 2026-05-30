@@ -1,9 +1,10 @@
 const std = @import("std");
 const skiplist = @import("skiplist");
-const Arena = skiplist.Arena;
+const Arena = skiplist.ArenaBouned;
 const Allocator = std.mem.Allocator;
 const Node = std.DoublyLinkedList.Node;
 const test_utils = @import("test_utils");
+const Value = std.atomic.Value;
 
 pub const sstable = @import("sstable.zig");
 pub const manifest = @import("manifest.zig");
@@ -221,20 +222,21 @@ pub const MemTable = struct {
     table: skiplist.SkipList(KeyValue),
     arena: Arena,
     max_seq: KVSeq,
+    size: Value(usize),
 
     const Self = @This();
 
-    pub fn new(alloc: Allocator, user_opts: ?MemTableOpts) !Self {
+    pub fn new(alloc: Allocator, io: std.Io, user_opts: ?MemTableOpts) !Self {
         const opts = user_opts orelse MemTableOpts.default();
         const arena = try Arena.new(alloc, opts.memtable_size);
 
-        // TODO: oh, this is weird place. Actually it would be cool to reuse self.arena. However, it's not
-        // really fair, since skiplist is utility memory and should not really count. Node itself can take a lot
-        // of memory.
-        //
-        // So here I just try to guess enough memory for skiplist itself.
-        const table = try skiplist.SkipList(KeyValue).new(alloc, opts.memtable_size * 10);
-        return .{ .arena = arena, .table = table, .max_seq = KVSeq.init(0) };
+        const table = try skiplist.SkipList(KeyValue).new(alloc, io);
+        return .{
+            .arena = arena,
+            .table = table,
+            .max_seq = KVSeq.init(0),
+            .size = Value(usize).init(opts.memtable_size),
+        };
     }
 
     /// Inserts new value into MemTable
@@ -301,7 +303,7 @@ pub const MemTable = struct {
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
-        self.table.deinit(alloc);
+        self.table.deinit();
         self.arena.deinit(alloc);
     }
 };
@@ -313,7 +315,7 @@ test "Basic test" {
     }
     const allocator = arena.allocator();
 
-    var tb = try MemTable.new(allocator, null);
+    var tb = try MemTable.new(allocator, std.testing.io, null);
     defer tb.deinit(allocator);
 
     {
@@ -360,7 +362,7 @@ test "Try overwriting the key" {
     }
     const allocator = arena.allocator();
 
-    var tb = try MemTable.new(allocator, null);
+    var tb = try MemTable.new(allocator, std.testing.io, null);
     defer tb.deinit(allocator);
 
     try tb.put("hello", "world", KVSeq.init(0));
@@ -401,6 +403,6 @@ test "HashTable equivalence" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const tb = try MemTable.new(allocator, null);
+    const tb = try MemTable.new(allocator, std.testing.io, null);
     try test_utils.test_hash_table_equavalance(tb, false, 1000);
 }

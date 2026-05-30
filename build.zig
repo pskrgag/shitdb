@@ -12,6 +12,12 @@ pub fn build(b: *std.Build) void {
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const zbench_module = b.dependency("zbench", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("zbench");
 
     const fi = b.addModule("fault_injection", .{
         .root_source_file = b.path("src/fault_injection/fi.zig"),
@@ -62,6 +68,29 @@ pub fn build(b: *std.Build) void {
             .{ .name = "fault_injection", .module = fi },
         },
     });
+
+    const bench_exe = b.addExecutable(.{
+        .name = "kv-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benches/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .omit_frame_pointer = false,
+            .imports = &.{
+                .{ .name = "zbench", .module = zbench_module },
+                .{ .name = "skiplist", .module = skiplist },
+            },
+        }),
+    });
+    b.installArtifact(bench_exe);
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| {
+        run_bench.addArgs(args);
+    }
+
+    const bench_step = b.step("bench", "Run benchmarks");
+    bench_step.dependOn(&run_bench.step);
 
     const skiplist_tests = b.addTest(.{
         .root_module = skiplist,
