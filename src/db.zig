@@ -146,12 +146,12 @@ test "Shutdown and then boot" {
 }
 
 test "WAL startup recovery" {
-    const fi = @import("fault_injection");
+    const fi = @import("test_injection");
     const Repeats = 10;
 
     // Should crash after 100 additions
-    try fi.enable("after_wal", Repeats);
-    defer fi.clear();
+    try fi.fault_injection.enable("after_wal", Repeats);
+    defer fi.fault_injection.clear();
 
     const io = std.testing.io;
     var arena = std.heap.DebugAllocator(.{}){};

@@ -9,7 +9,6 @@ const PanicMap = std.StringHashMap(PanicPoint);
 
 var gpa = std.heap.DebugAllocator(.{}){};
 var PanicPoints: PanicMap = undefined;
-var init_mutex: std.Thread.Mutex = .{};
 var initialized: bool = false;
 
 // Assume single-threaded setup

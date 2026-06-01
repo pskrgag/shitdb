@@ -154,7 +154,7 @@ pub fn add_benches(bench: *zbench.Benchmark) !void {
         },
         .iterations = 5,
     });
-    
+
     try bench.add("Push random ST", push_random, .{
         .hooks = .{
             .before_each = allocate_list,

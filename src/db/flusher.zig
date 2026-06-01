@@ -42,6 +42,8 @@ pub const Flusher = struct {
         try self.version.flush_memtable(first, self.io, self.dir, self.alloc);
         first.deinit(self.alloc);
 
+        self.version.stat.inc(.memtable_flush);
+
         @memmove(self.list[0 .. MaxNumTables - 1], self.list[1..MaxNumTables]);
         self.list[MaxNumTables - 1] = null;
         self.count -= 1;

@@ -19,8 +19,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("zbench");
 
-    const fi = b.addModule("fault_injection", .{
-        .root_source_file = b.path("src/fault_injection/fi.zig"),
+    const fi = b.addModule("test_injection", .{
+        .root_source_file = b.path("src/test_injection/root.zig"),
         .target = target,
     });
 
@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "storage", .module = storage },
             .{ .name = "test_utils", .module = test_utils },
-            .{ .name = "fault_injection", .module = fi },
+            .{ .name = "test_injection", .module = fi },
         },
     });
 

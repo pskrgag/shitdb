@@ -8,7 +8,7 @@ const GetResult = @import("storage").GetResult;
 const KeyValue = @import("storage").KeyValue;
 const KVSeq = @import("storage").KVSeq;
 const FileSeq = @import("storage").manifest.FileSeq;
-const fi = @import("fault_injection");
+const fi = @import("test_injection");
 const Version = @import("version.zig").Version;
 const VersionEdit = @import("version.zig").VersionEdit;
 
@@ -72,7 +72,7 @@ pub const WalTable = struct {
 
         try self.wal.record(entry, self.io);
         try self.table.put(key, value, seq);
-        fi.crash("after_wal");
+        fi.fault_injection.crash("after_wal");
     }
 
     /// Removes value from the memtable and records it into WAL
@@ -81,7 +81,7 @@ pub const WalTable = struct {
 
         try self.wal.record(entry, self.io);
         try self.table.remove(key, seq);
-        fi.crash("after_wal");
+        fi.fault_injection.crash("after_wal");
     }
 
     /// Retrieves value from the memtable
