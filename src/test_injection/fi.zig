@@ -1,11 +1,15 @@
 const std = @import("std");
 const Value = std.atomic.Value;
 
+pub const PanicKind = enum {
+    after_wal,
+};
+
 const PanicPoint = struct {
     count: Value(usize),
 };
 
-const PanicMap = std.StringHashMap(PanicPoint);
+const PanicMap = std.AutoHashMap(PanicKind, PanicPoint);
 
 var gpa = std.heap.DebugAllocator(.{}){};
 var PanicPoints: PanicMap = undefined;
@@ -21,10 +25,13 @@ fn init() void {
 }
 
 // Conditionally crashes the execution
-pub fn crash(comptime name: []const u8) void {
+pub fn crash(comptime kind: PanicKind) void {
+    if (!initialized)
+        return;
+
     init();
 
-    const val = PanicPoints.getPtr(name);
+    const val = PanicPoints.getPtr(kind);
     if (val) |v| {
         if (v.count.fetchSub(1, .monotonic) == 1)
             std.process.abort();
@@ -32,10 +39,10 @@ pub fn crash(comptime name: []const u8) void {
 }
 
 // Enable panic point
-pub fn enable(comptime name: []const u8, count: usize) !void {
+pub fn enable(comptime kind: PanicKind, count: usize) !void {
     init();
 
-    try PanicPoints.put(name, .{ .count = Value(usize).init(count) });
+    try PanicPoints.put(kind, .{ .count = Value(usize).init(count) });
 }
 
 pub fn clear() void {

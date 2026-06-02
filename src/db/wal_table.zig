@@ -122,7 +122,7 @@ pub const WalTable = struct {
 
         try fi.sleep_injection.sleep(.Insert);
         try self.table.put(key, value, seq);
-        fi.fault_injection.crash("after_wal");
+        fi.fault_injection.crash(.after_wal);
     }
 
     /// Removes value from the memtable and records it into WAL
@@ -136,7 +136,7 @@ pub const WalTable = struct {
 
         try self.wal.record(entry, self.io);
         try self.table.remove(key, seq);
-        fi.fault_injection.crash("after_wal");
+        fi.fault_injection.crash(.after_wal);
     }
 
     /// Retrieves value from the memtable

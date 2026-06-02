@@ -150,7 +150,7 @@ test "WAL startup recovery" {
     const Repeats = 10;
 
     // Should crash after 100 additions
-    try fi.fault_injection.enable("after_wal", Repeats);
+    try fi.fault_injection.enable(.after_wal, Repeats);
     defer fi.fault_injection.clear();
 
     const io = std.testing.io;
