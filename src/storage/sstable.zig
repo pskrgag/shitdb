@@ -473,7 +473,14 @@ pub const SSTable = struct {
     }
 
     /// Creates new SSTable with given name
-    pub fn create(dir: std.Io.Dir, name: []const u8, tbl: *const MemTable, lvl: u8, io: std.Io, alloc: Allocator) !Self {
+    pub fn create(
+        dir: std.Io.Dir,
+        name: []const u8,
+        tbl: *const MemTable,
+        lvl: u8,
+        io: std.Io,
+        alloc: Allocator,
+    ) !Self {
         const file = try dir.createFile(io, name, .{
             .truncate = true,
             .read = true,
@@ -528,7 +535,14 @@ pub const SSTable = struct {
     }
 
     /// Merges SSTables into one
-    pub fn merge(dir: std.Io.Dir, name: []const u8, io: std.Io, tables: []const SSTable, merged_lvl: u8, alloc: Allocator) !Self {
+    pub fn merge(
+        dir: std.Io.Dir,
+        name: []const u8,
+        io: std.Io,
+        tables: []const SSTable,
+        merged_lvl: u8,
+        alloc: Allocator,
+    ) !Self {
         var iters = try std.ArrayList(merging_iterator.IteratorWrapper(KeyValue)).initCapacity(alloc, 0);
         var iter_wrappers = try std.ArrayList(Iterator).initCapacity(alloc, 0);
         var total_size: usize = 0;

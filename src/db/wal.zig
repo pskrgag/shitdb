@@ -263,7 +263,7 @@ fn expectReplayInvalidFormat(dir: Dir, seq: usize, data: []const u8, alloc: Allo
     var target = try WalTable.new(dir, null, FileSeq.init(seq + 1000), null, testing_io, alloc);
     defer target.deinit(alloc);
 
-    try std.testing.expectError(error.InvalidFormat, wal.replay_to(target, testing_io));
+    try std.testing.expectError(error.InvalidFormat, wal.replay_to(&target, testing_io));
 }
 
 test "WAL serializes add record" {
@@ -433,7 +433,7 @@ test "WAL replay restores add record into target table" {
 
     var target = try WalTable.new(dir, null, FileSeq.init(5), null, testing_io, allocator);
     defer target.deinit(allocator);
-    try wal.replay_to(target, testing_io);
+    try wal.replay_to(&target, testing_io);
 
     const value = try target.get("alpha", KVSeq.init(7), allocator);
     switch (value) {
@@ -467,7 +467,7 @@ test "WAL replay restores remove record into target table" {
 
     var target = try WalTable.new(dir, null, FileSeq.init(7), null, testing_io, allocator);
     defer target.deinit(allocator);
-    try wal.replay_to(target, testing_io);
+    try wal.replay_to(&target, testing_io);
 
     const value = try target.get("alpha", KVSeq.init(8), allocator);
     try std.testing.expectEqual(@as(@TypeOf(value), .Removed), value);
@@ -496,7 +496,7 @@ test "WAL replay applies later remove over earlier add" {
 
     var target = try WalTable.new(dir, null, FileSeq.init(9), null, testing_io, allocator);
     defer target.deinit(allocator);
-    try wal.replay_to(target, testing_io);
+    try wal.replay_to(&target, testing_io);
 
     const removed = try target.get("alpha", KVSeq.init(8), allocator);
     try std.testing.expectEqual(@as(@TypeOf(removed), .Removed), removed);

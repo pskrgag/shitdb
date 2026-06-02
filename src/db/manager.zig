@@ -9,8 +9,9 @@ const Version = @import("version.zig").Version;
 const WalTable = @import("wal_table.zig").WalTable;
 const fi = @import("test_injection");
 const Statistics = @import("stat.zig").Statistics;
+const Slab = @import("slab").Slab;
 
-const LoadSleep = "load UAF";
+pub const MemTableSlab = Slab(WalTable, 20);
 
 pub const Manager = struct {
     // Active MemTable
@@ -25,12 +26,12 @@ pub const Manager = struct {
     opts: MemTableOpts,
     // Current version of db
     version: *Version,
-    // Allocator used for owned DB structures
-    alloc: Allocator,
     // IO instance,
     io: std.Io,
     // Statistics
     stat: *Statistics,
+    // MemTable allocator
+    slab: *MemTableSlab,
 
     const Self = @This();
 
@@ -39,21 +40,27 @@ pub const Manager = struct {
         const stat = try Statistics.new(alloc);
         errdefer stat.deinit(alloc);
 
-        const version = try Version.from_file(dir, "MANIFEST", real_opts, stat, io, alloc);
+        const slab = try alloc.create(MemTableSlab);
+        errdefer alloc.destroy(slab);
+        slab.* = try MemTableSlab.init(alloc, io);
+        errdefer slab.deinit(alloc);
+
+        const version = try Version.from_file_with_slab(dir, "MANIFEST", real_opts, stat, slab, io, alloc);
         const new_file_seq = version.new_file_seq();
+        const new_table = slab.alloc();
+
+        new_table.* = try WalTable.new(dir, opts, new_file_seq, version, io, alloc);
 
         return .{
             .version = version,
-            .active = std.atomic.Value(*WalTable).init(
-                try WalTable.new(dir, opts, new_file_seq, version, io, alloc),
-            ),
+            .active = std.atomic.Value(*WalTable).init(new_table),
             .path = path,
             .root = dir,
             .new_table_lock = Mutex.init,
             .opts = real_opts,
-            .alloc = alloc,
             .io = io,
             .stat = stat,
+            .slab = slab,
         };
     }
 
@@ -62,8 +69,11 @@ pub const Manager = struct {
         defer self.new_table_lock.unlock(self.io);
 
         if (self.active.load(.unordered) == old) {
+            old.make_immune();
+
             const new_file_seq = self.version.new_file_seq();
-            const new_table = try WalTable.new(
+            const new_table = self.slab.alloc();
+            new_table.* = try WalTable.new(
                 self.root,
                 self.opts,
                 new_file_seq,
@@ -84,11 +94,11 @@ pub const Manager = struct {
         // consume would suffice, but whatever
         const table = self.active.load(.acquire);
 
-        try fi.sleep_injection.sleep(LoadSleep);
+        try fi.sleep_injection.sleep(.Load);
 
         // Current table is full. Allocate new one
         table.put(key, value, self.version.next_seq()) catch |e| {
-            if (e == error.OutOfMemory) {
+            if (e == error.OutOfMemory or e == error.Immutable) {
                 try self.allocate_new_table(table, alloc);
                 // It was updated. Retry the operation
                 return self.put(key, value, alloc);
@@ -105,7 +115,7 @@ pub const Manager = struct {
 
         // Current table is full. Allocate new one
         table.remove(key, self.version.next_seq()) catch |e| {
-            if (e == error.OutOfMemory) {
+            if (e == error.OutOfMemory or e == error.Immutable) {
                 try self.allocate_new_table(table, alloc);
                 // It was updated. Retry the operation
                 return self.remove(key, alloc);
@@ -132,17 +142,20 @@ pub const Manager = struct {
         }
     }
 
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self, alloc: Allocator) void {
         // here we expect that no other user accesses data-base
         const active = self.active.load(.acquire);
 
-        self.version.flush_memtable(active, self.io, self.root, self.alloc) catch {
+        self.version.flush_memtable(active, self.io, self.root, alloc) catch {
             @panic("failed to flush active memtable");
         };
 
-        active.deinit(self.alloc);
-        self.version.deinit(self.io, self.alloc);
-        self.stat.deinit(self.alloc);
+        active.deinit(alloc);
+        self.version.deinit(self.io, alloc);
+        self.slab.free(active);
+        self.slab.deinit(alloc);
+        alloc.destroy(self.slab);
+        self.stat.deinit(alloc);
         self.root.close(self.io);
     }
 };
@@ -166,7 +179,7 @@ fn uaf_thread(manager: *Manager, alloc: Allocator) !void {
 
 test "UAF during flush" {
     defer fi.sleep_injection.clear();
-    try fi.sleep_injection.enable(LoadSleep);
+    try fi.sleep_injection.enable(.Load);
 
     const io = std.testing.io;
     var arena = std.heap.DebugAllocator(.{}){};
@@ -185,16 +198,56 @@ test "UAF during flush" {
     }
 
     var manager = try Manager.new(dir, "test_db3", allocator, io, .{ .memtable_size = 5000 });
-    defer manager.deinit();
+    defer manager.deinit(allocator);
 
     const thread = try std.Thread.spawn(.{}, uaf_thread, .{ &manager, allocator });
-    try fi.sleep_injection.wait_sleep(LoadSleep);
+    try fi.sleep_injection.wait_sleep(.Load);
 
     // Now insert a lot of shit and wait while active memtable is flushed
     while (manager.stat.read(.memtable_flush) == 0) {
         try manager.put("hey" ** 10, "baby" ** 10, allocator);
     }
 
-    try fi.sleep_injection.wake(LoadSleep);
+    try fi.sleep_injection.wake(.Load);
+    thread.join();
+}
+
+test "In progress insert" {
+    const KeyValue = @import("storage").KeyValue;
+
+    defer fi.sleep_injection.clear();
+    try fi.sleep_injection.enable(.Insert);
+
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {};
+
+    const dir = try openOrCreateDir(io, "test_db3");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {
+            @panic("gg");
+        };
+    }
+
+    var manager = try Manager.new(dir, "test_db3", allocator, io, .{ .memtable_size = 100 });
+    defer manager.deinit(allocator);
+
+    const thread = try std.Thread.spawn(.{}, uaf_thread, .{ &manager, allocator });
+    try fi.sleep_injection.wait_sleep(.Insert);
+
+    try std.testing.expect(KeyValue.calculate_size("a" ** 35, "a" ** 35) < 100);
+
+    try std.testing.expectEqual(manager.stat.read(.memtable_flush), 0);
+    try manager.put("a" ** 35, "a" ** 35, allocator);
+    try std.testing.expectEqual(manager.stat.read(.memtable_flush), 0);
+    // This should trigger flush
+    try manager.put("a" ** 35, "a" ** 35, allocator);
+
+    try fi.sleep_injection.wake(.Insert);
     thread.join();
 }

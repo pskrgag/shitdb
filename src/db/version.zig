@@ -16,6 +16,8 @@ const Wal = @import("wal.zig").Wal;
 const MemTableOpts = @import("storage").MemTableOpts;
 const KVSeq = @import("storage").KVSeq;
 const Statistics = @import("stat.zig").Statistics;
+const Slab = @import("slab").Slab;
+const MemTableSlab = Slab(WalTable, 20);
 
 const MaxLevel: usize = 2;
 const MaxTablesLVL: usize = 1;
@@ -100,6 +102,8 @@ pub const Version = struct {
     active_tables: [MaxLevel]u8,
     // Stats
     stat: *Statistics,
+    // Slab for freeing memtables
+    slab: ?*MemTableSlab,
 
     const Self = @This();
 
@@ -178,6 +182,18 @@ pub const Version = struct {
         io: std.Io,
         alloc: Allocator,
     ) !*Self {
+        return from_file_with_slab(dir, path, opts, stat, null, io, alloc);
+    }
+
+    pub fn from_file_with_slab(
+        dir: std.Io.Dir,
+        path: []const u8,
+        opts: MemTableOpts,
+        stat: *Statistics,
+        slab: ?*MemTableSlab,
+        io: std.Io,
+        alloc: Allocator,
+    ) !*Self {
         const file = dir.openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => try dir.createFile(io, path, .{ .read = true }),
             else => return err,
@@ -189,6 +205,7 @@ pub const Version = struct {
         const res = try alloc.create(Self);
 
         res.* = .{
+            .slab = slab,
             .flusher = try Flusher.new(alloc, res, dir, io),
             .file = file,
             .tables = try std.ArrayList(FileMeta).initCapacity(alloc, 0),
@@ -441,7 +458,11 @@ pub const Version = struct {
 
         // Replay from active WALs
         for (self.wals.items) |wal| {
-            const alive_wal = try WalTable.open(dir, opts, wal, io, alloc);
+            const alive_wal = if (self.slab) |slab|
+                slab.alloc()
+            else
+                try alloc.create(WalTable);
+            alive_wal.* = try WalTable.open(dir, opts, wal, io, alloc);
 
             if (alive_wal.max_seq().get() > self.next_sequence.load(.monotonic).get()) {
                 self.next_sequence.store(KVSeq.init(alive_wal.max_seq().get() + 1), .monotonic);

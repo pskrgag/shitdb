@@ -54,8 +54,8 @@ pub const KeyValue = struct {
     }
 
     /// De-initializes db session
-    pub fn deinit(self: *Self) void {
-        self.manager.deinit();
+    pub fn deinit(self: *Self, alloc: Allocator) void {
+        self.manager.deinit(alloc);
     }
 };
 
@@ -70,7 +70,7 @@ test "Simple API Test" {
     std.Io.Dir.cwd().deleteTree(io, "test_db2") catch {};
     var new = try KeyValue.new("test_db2", allocator, io, null);
     defer {
-        new.deinit();
+        new.deinit(allocator);
         std.Io.Dir.cwd().deleteTree(io, "test_db2") catch {
             @panic("gg");
         };
@@ -132,10 +132,10 @@ test "Shutdown and then boot" {
         try old.put("a" ** i, "a" ** i, allocator);
     }
 
-    old.deinit();
+    old.deinit(allocator);
 
     var new = try KeyValue.new("test_db3", allocator, io, null);
-    defer new.deinit();
+    defer new.deinit(allocator);
 
     inline for (1..200) |i| {
         const val = (try new.get("a" ** i, allocator)).?;
@@ -203,7 +203,7 @@ test "WAL startup recovery" {
 
     // Now try to check WAL
     var new = try KeyValue.new("test_db4", allocator, io, null);
-    defer new.deinit();
+    defer new.deinit(allocator);
 
     try std.testing.expectEqual(new.manager.version.current_seq().get(), Repeats);
     try std.testing.expect(new.manager.version.current_file_seq().get() != 0);

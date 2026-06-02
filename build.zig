@@ -19,6 +19,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("zbench");
 
+    const slab = b.addModule("slab", .{
+        .root_source_file = b.path("src/slab/root.zig"),
+        .target = target,
+    });
+
     const fi = b.addModule("test_injection", .{
         .root_source_file = b.path("src/test_injection/root.zig"),
         .target = target,
@@ -66,6 +71,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "storage", .module = storage },
             .{ .name = "test_utils", .module = test_utils },
             .{ .name = "test_injection", .module = fi },
+            .{ .name = "slab", .module = slab },
         },
     });
 

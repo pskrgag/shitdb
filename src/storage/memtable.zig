@@ -67,6 +67,12 @@ pub const KeyValue = struct {
         return (self.data + IntSize)[0..self.key_len()];
     }
 
+    pub fn calculate_size(key: []const u8, value: ?[]const u8) usize {
+        const val_len = if (value) |val| val.len else 0;
+
+        return IntSize + key.len + IntSize + val_len + IntSize;
+    }
+
     pub fn parse(data: []const u8) ?KeyValue {
         var iter = data;
 

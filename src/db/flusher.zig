@@ -37,16 +37,28 @@ pub const Flusher = struct {
     // Version manager
     version: *Version,
 
+    // NOTE: we hold the lock there to keep consistency:
+    //
+    // - Inserted values should be either in memtable or on the disk. If we drop the lock there,
+    //   the first table would be unreachable from the user.
     fn flush_one(self: *Flusher) !void {
         const first = self.list[0].?;
-        try self.version.flush_memtable(first, self.io, self.dir, self.alloc);
-        first.deinit(self.alloc);
-
-        self.version.stat.inc(.memtable_flush);
 
         @memmove(self.list[0 .. MaxNumTables - 1], self.list[1..MaxNumTables]);
         self.list[MaxNumTables - 1] = null;
         self.count -= 1;
+
+        first.wait_no_users();
+        try self.version.flush_memtable(first, self.io, self.dir, self.alloc);
+
+        first.deinit(self.alloc);
+
+        if (self.version.slab) |slab|
+            slab.free(first)
+        else
+            self.alloc.destroy(first);
+
+        self.version.stat.inc(.memtable_flush);
     }
 
     fn flusher_thread_impl(self: *Flusher) !void {
