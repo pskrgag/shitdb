@@ -111,10 +111,10 @@ pub const WalTable = struct {
 
     /// Puts value from the memtable and records it into WAL
     pub fn put(self: *WalTable, key: []const u8, value: []const u8, seq: KVSeq) !void {
-        try self.guard_active();
-
         self.in_progress.inc();
         defer self.in_progress.dec();
+
+        try self.guard_active();
 
         const entry: WalEntry = .{ .Add = .{ .key = key, .value = value, .seq = seq } };
 
@@ -127,10 +127,10 @@ pub const WalTable = struct {
 
     /// Removes value from the memtable and records it into WAL
     pub fn remove(self: *WalTable, key: []const u8, seq: KVSeq) !void {
-        try self.guard_active();
-
         self.in_progress.inc();
         defer self.in_progress.dec();
+
+        try self.guard_active();
 
         const entry: WalEntry = .{ .Remove = .{ .key = key, .seq = seq } };
 

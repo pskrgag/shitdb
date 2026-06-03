@@ -82,11 +82,12 @@ pub const Manager = struct {
                 alloc,
             );
 
-            // Put current table into the flusher
-            self.version.insert(old);
-
+            // NOTE: swap BEFORE publishing a new table.
             const old_table = self.active.swap(new_table, .monotonic);
             std.debug.assert(old_table == old);
+
+            // Put current table into the flusher
+            self.version.insert(old);
         }
     }
 
