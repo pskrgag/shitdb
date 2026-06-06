@@ -7,8 +7,8 @@ const Allocator = std.mem.Allocator;
 const StackSize = 5 << 20;
 
 pub const SleepPoint = enum {
-    Load,
-    Insert,
+    LoadCurrentMemtable,
+    WalWrite,
 
     Test,
     Test1,

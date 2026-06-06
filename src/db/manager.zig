@@ -96,7 +96,7 @@ pub const Manager = struct {
         // consume would suffice, but whatever
         const table = self.active.load(.acquire);
 
-        test_utils.Scheduler.yield(.Load);
+        test_utils.Scheduler.yield(.LoadCurrentMemtable);
 
         // Current table is full. Allocate new one
         table.put(key, value, self.version.next_seq()) catch |e| {
@@ -227,8 +227,8 @@ test "UAF during flush" {
     var plan = try test_utils.Scheduler.SchedulerPlan.new(allocator);
     defer plan.deinit(allocator);
 
-    try plan.add(.{ .fiber = uaf, .run = .{ .Sleep = .Load } }, allocator);
-    try plan.add(.{ .fiber = insert, .run = .{ .Sleep = .Insert } }, allocator);
+    try plan.add(.{ .fiber = uaf, .run = .{ .Sleep = .LoadCurrentMemtable } }, allocator);
+    try plan.add(.{ .fiber = insert, .run = .{ .Sleep = .WalWrite } }, allocator);
     try plan.add(.{ .fiber = uaf, .run = .End }, allocator);
 
     try sched.run_with_plan(plan, allocator);
@@ -265,7 +265,7 @@ test "In progress insert" {
     defer plan.deinit(allocator);
 
     try plan.add(.{ .fiber = first_insert, .run = .End }, allocator);
-    try plan.add(.{ .fiber = in_progress, .run = .{ .Sleep = .Insert } }, allocator);
+    try plan.add(.{ .fiber = in_progress, .run = .{ .Sleep = .WalWrite } }, allocator);
     try plan.add(.{ .fiber = flush_trigger, .run = .End }, allocator);
     try plan.add(.{ .fiber = in_progress, .run = .End }, allocator);
 

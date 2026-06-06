@@ -121,7 +121,7 @@ pub const WalTable = struct {
 
         try self.wal.record(entry, self.io);
 
-        test_utils.Scheduler.yield(.Insert);
+        test_utils.Scheduler.yield(.WalWrite);
         try self.table.put(key, value, seq);
         fi.fault_injection.crash(.after_wal);
     }
