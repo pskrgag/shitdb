@@ -227,7 +227,7 @@ pub const GetResult = union(enum) {
 pub const MemTable = struct {
     table: skiplist.SkipList(KeyValue),
     arena: Arena,
-    max_seq: KVSeq,
+    max_seq: Value(KVSeq),
     size: Value(usize),
 
     const Self = @This();
@@ -240,9 +240,24 @@ pub const MemTable = struct {
         return .{
             .arena = arena,
             .table = table,
-            .max_seq = KVSeq.init(0),
+            .max_seq = Value(KVSeq).init(KVSeq.init(0)),
             .size = Value(usize).init(opts.memtable_size),
         };
+    }
+
+    fn update_max_seq(self: *Self, seq: KVSeq) void {
+        while (true) {
+            const current = self.max_seq.load(.monotonic);
+
+            // This may happen in case of OOO write.
+            if (current.get() > seq.get())
+                return;
+
+            const res = self.max_seq.cmpxchgWeak(current, seq, .monotonic, .monotonic);
+
+            if (res == null)
+                break;
+        }
     }
 
     /// Inserts new value into MemTable
@@ -253,10 +268,27 @@ pub const MemTable = struct {
             return error.InvalidValue;
 
         std.debug.assert(!kv.is_tombstone());
-        // This extra = for tests
-        std.debug.assert(seq.get() >= self.max_seq.get());
 
-        self.max_seq = seq;
+        // This would be nice, but actually it's too optimistic:
+        //
+        // Imagine following execution path:
+        //
+        // Thread A:           Thread B:
+        //   manager.put
+        //   Get seq N
+        //   Writes to WAL
+        //   yields
+        //                        manager.put
+        //                        Get seq N + 1
+        //                        Writes to WAL
+        //                        writes to memtable
+        //
+        //  writes to memtable
+        //
+        // I am not sure if OOO write is fine or not, but let's leave it for now.
+        // std.debug.assert(seq.get() >= self.max_seq.get());
+
+        self.update_max_seq(seq);
         _ = try self.table.insert(kv);
     }
 
@@ -265,10 +297,10 @@ pub const MemTable = struct {
         const kv = try KeyValue.new(key, "", seq, Type.Delete, self.arena.allocator());
 
         std.debug.assert(kv.is_tombstone());
-        // This extra = for tests
-        std.debug.assert(seq.get() >= self.max_seq.get());
+        // See comment above.
+        // std.debug.assert(seq.get() >= self.max_seq.get());
 
-        self.max_seq = seq;
+        self.update_max_seq(seq);
         _ = try self.table.insert(kv);
     }
 

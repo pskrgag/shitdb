@@ -157,7 +157,7 @@ pub const WalTable = struct {
 
     /// Returns minimal key
     pub fn max_seq(self: *WalTable) KVSeq {
-        return self.table.max_seq;
+        return self.table.max_seq.load(.monotonic);
     }
 
     /// Deinits table
