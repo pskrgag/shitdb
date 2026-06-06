@@ -179,10 +179,17 @@ pub const Version = struct {
         path: []const u8,
         opts: MemTableOpts,
         stat: *Statistics,
+        sanitize: bool,
         io: std.Io,
         alloc: Allocator,
     ) !*Self {
-        return from_file_with_slab(dir, path, opts, stat, null, io, alloc);
+        const self = try from_file_with_slab(dir, path, opts, stat, null, io, alloc);
+        errdefer self.deinit(io, alloc);
+
+        if (sanitize)
+            try self.sanitize_disk_state(dir, alloc, io);
+
+        return self;
     }
 
     pub fn from_file_with_slab(
@@ -472,6 +479,29 @@ pub const Version = struct {
         }
     }
 
+    pub fn sanitize_disk_state(self: *Self, dir: std.Io.Dir, alloc: Allocator, io: std.Io) !void {
+        var sorted = try std.ArrayList(FileMeta).initCapacity(alloc, self.tables.items.len);
+
+        defer sorted.deinit(alloc);
+
+        try sorted.appendSlice(alloc, self.tables.items);
+        std.mem.sort(FileMeta, sorted.items, {}, FileMeta.less_than);
+
+        var max: ?usize = null;
+
+        for (sorted.items) |table| {
+            const sstable = SSTable.open(dir, io, table.name) catch |e| {
+                std.debug.print("Failed to open {s}\n", .{table.name});
+                return e;
+            };
+
+            if (max) |m| {
+                std.debug.assert(sstable.maximum_seq().get() < m);
+                max = sstable.maximum_seq().get();
+            }
+        }
+    }
+
     // De-initializes version
     pub fn deinit(self: *Version, io: std.Io, alloc: Allocator) void {
         // It's required to destroy flusher first, since it may want to apply some changes to version.
@@ -563,6 +593,7 @@ test "Version serialization" {
     var stat = std.mem.zeroes(Statistics);
 
     const dirname = "test_db10";
+    std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
     var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
@@ -574,7 +605,7 @@ test "Version serialization" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     {
@@ -754,7 +785,7 @@ test "Version apply persists edits that reopen can replay" {
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, testing_io, allocator);
+        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
         defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
@@ -776,7 +807,7 @@ test "Version apply persists edits that reopen can replay" {
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, testing_io, allocator);
+        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 13), reopened.current_seq().get());
@@ -805,7 +836,7 @@ test "lvl0 compaction merges overlapping lvl1 table" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -889,7 +920,7 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -976,7 +1007,7 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1063,7 +1094,7 @@ test "lvl0 compaction physically deletes obsolete input files" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1145,7 +1176,7 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1227,7 +1258,7 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, testing_io, allocator);
+        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
         defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
@@ -1282,7 +1313,7 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, testing_io, allocator);
+        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 1), reopened.tables.items.len);
@@ -1318,7 +1349,7 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, testing_io, allocator);
+        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
         defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
@@ -1373,7 +1404,7 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, testing_io, allocator);
+        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 2), reopened.tables.items.len);

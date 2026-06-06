@@ -95,11 +95,12 @@ pub const Manager = struct {
     pub fn put(self: *Self, key: []const u8, value: []const u8, alloc: Allocator) !void {
         // consume would suffice, but whatever
         const table = self.active.load(.acquire);
+        const new_seq = self.version.next_seq();
 
         test_utils.Scheduler.yield(.LoadCurrentMemtable);
 
         // Current table is full. Allocate new one
-        table.put(key, value, self.version.next_seq()) catch |e| {
+        table.put(key, value, new_seq) catch |e| {
             if (e == error.OutOfMemory or e == error.Immutable) {
                 try self.allocate_new_table(table, alloc);
                 // It was updated. Retry the operation
@@ -182,6 +183,13 @@ fn uaf_thread(manager: *Manager, alloc: Allocator) !void {
 fn insert_thread(manager: *Manager, alloc: Allocator) !void {
     // Now insert a lot of shit and wait while active memtable is flushed
     while (manager.stat.read(.memtable_flush) == 0) {
+        try manager.put("hey" ** 10, "baby" ** 10, alloc);
+    }
+}
+
+fn insert_second(manager: *Manager, alloc: Allocator) !void {
+    // Now insert a lot of shit and wait while active memtable is flushed
+    while (manager.stat.read(.memtable_flush) != 2) {
         try manager.put("hey" ** 10, "baby" ** 10, alloc);
     }
 }
@@ -270,4 +278,117 @@ test "In progress insert" {
     try plan.add(.{ .fiber = in_progress, .run = .End }, allocator);
 
     try sched.run_with_plan(plan, allocator);
+}
+
+test "OOB write" {
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    std.Io.Dir.cwd().deleteTree(io, "test_db4") catch {};
+
+    const dir = try openOrCreateDir(io, "test_db4");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, "test_db4") catch {
+            @panic("gg");
+        };
+    }
+
+    var manager = try Manager.new(dir, "test_db4", allocator, io, .{ .memtable_size = 100 });
+    defer manager.deinit(allocator);
+
+    var sched = try test_utils.Scheduler.Scheduler.new(allocator);
+    defer sched.deinit(allocator);
+
+    const first_insert = try sched.spawn(checked_big_insert, .{ &manager, allocator }, allocator);
+    const flush_trigger = try sched.spawn(insert_thread, .{ &manager, allocator }, allocator);
+    const flush1_trigger = try sched.spawn(insert_second, .{ &manager, allocator }, allocator);
+
+    var plan = try test_utils.Scheduler.SchedulerPlan.new(allocator);
+    defer plan.deinit(allocator);
+
+    // 1. Allocate new seq
+    try plan.add(.{ .fiber = first_insert, .run = .{ .Sleep = .LoadCurrentMemtable } }, allocator);
+    // 2. Fill current memtable with seq > 1st one
+    try plan.add(.{ .fiber = flush_trigger, .run = .End }, allocator);
+    // 3. Continue first insert. It must allocate new memtable
+    try plan.add(.{ .fiber = first_insert, .run = .End }, allocator);
+    // 4. Flush second memtable
+    try plan.add(.{ .fiber = flush1_trigger, .run = .End }, allocator);
+
+    try sched.run_with_plan(plan, allocator);
+    try std.testing.expectEqual(manager.stat.read(.memtable_flush), 2);
+    try manager.version.sanitize_disk_state(dir, allocator, io);
+}
+
+fn add_test_sstable(
+    manager: *Manager,
+    file_seq: usize,
+    value_seq: usize,
+    key: []const u8,
+    value: []const u8,
+    alloc: Allocator,
+) !void {
+    const storage = @import("storage");
+    const SSTable = storage.sstable.SSTable;
+    const FileMeta = storage.manifest.FileMeta;
+    const FileSeq = storage.manifest.FileSeq;
+    const KeyOwned = storage.manifest.KeyOwned;
+    const VersionEdit = @import("version.zig").VersionEdit;
+
+    var memtable = try MemTable.new(alloc, manager.io, null);
+    defer memtable.deinit(alloc);
+    try memtable.put(key, value, storage.KVSeq.init(value_seq));
+
+    const file = FileSeq.init(file_seq);
+    const name = try std.fmt.allocPrint(alloc, "memtable{}.sst", .{file.get()});
+
+    var sstable = try SSTable.create(manager.root, name, &memtable, 0, manager.io, alloc);
+    defer sstable.deinit();
+
+    var edit = try VersionEdit.empty(alloc);
+    defer edit.deinit(alloc);
+
+    try edit.new_files.append(alloc, FileMeta{
+        .lvl = 0,
+        .name = name,
+        .max = try KeyOwned.from_raw(sstable.max(), alloc),
+        .min = try KeyOwned.from_raw(sstable.min(), alloc),
+        .file_seq = file,
+        .value_seq = sstable.maximum_seq(),
+    });
+
+    try manager.version.apply(edit, manager.root, manager.io, alloc);
+}
+
+test "Disk search checks newest SSTable first" {
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "test_db_disk_newest_first";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    const dir = try openOrCreateDir(io, dirname);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    var manager = try Manager.new(dir, dirname, allocator, io, null);
+    defer manager.deinit(allocator);
+
+    try add_test_sstable(&manager, 100, 10, "shared", "old", allocator);
+    try add_test_sstable(&manager, 101, 11, "shared", "new", allocator);
+
+    const value = (try manager.get("shared", allocator)).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualSlices(u8, "new", value);
 }
