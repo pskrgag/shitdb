@@ -56,7 +56,12 @@ pub const Scheduler = struct {
 
             fn entry(ptr: *anyopaque) void {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
-                @call(.auto, f, ctx.args);
+                const result = @call(.auto, f, ctx.args);
+                switch (@typeInfo(@TypeOf(result))) {
+                    .error_union => result catch @panic("fiber returned error"),
+                    .void => {},
+                    else => @compileError("fiber entry must return void or !void"),
+                }
             }
 
             fn cleanup(ptr: *anyopaque, allocator: Allocator) void {

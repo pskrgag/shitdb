@@ -179,74 +179,95 @@ fn uaf_thread(manager: *Manager, alloc: Allocator) !void {
     try manager.put("hey", "bro", alloc);
 }
 
-// test "UAF during flush" {
-//     const io = std.testing.io;
-//     var arena = std.heap.DebugAllocator(.{}){};
-//     defer {
-//         _ = arena.deinit();
-//     }
-//     const allocator = arena.allocator();
-//
-//     std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {};
-//
-//     const dir = try openOrCreateDir(io, "test_db3");
-//     defer {
-//         std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {
-//             @panic("gg");
-//         };
-//     }
-//
-//     var manager = try Manager.new(dir, "test_db3", allocator, io, .{ .memtable_size = 5000 });
-//     defer manager.deinit(allocator);
-//
-//     const thread = try std.Thread.spawn(.{}, uaf_thread, .{ &manager, allocator });
-//     try fi.sleep_injection.wait_sleep(.Load);
-//
-//     // Now insert a lot of shit and wait while active memtable is flushed
-//     while (manager.stat.read(.memtable_flush) == 0) {
-//         try manager.put("hey" ** 10, "baby" ** 10, allocator);
-//     }
-//
-//     try fi.sleep_injection.wake(.Load);
-//     thread.join();
-// }
-//
-// test "In progress insert" {
-//     const KeyValue = @import("storage").KeyValue;
-//
-//     defer fi.sleep_injection.clear();
-//     try fi.sleep_injection.enable(.Insert);
-//
-//     const io = std.testing.io;
-//     var arena = std.heap.DebugAllocator(.{}){};
-//     defer {
-//         _ = arena.deinit();
-//     }
-//     const allocator = arena.allocator();
-//
-//     std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {};
-//
-//     const dir = try openOrCreateDir(io, "test_db3");
-//     defer {
-//         std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {
-//             @panic("gg");
-//         };
-//     }
-//
-//     var manager = try Manager.new(dir, "test_db3", allocator, io, .{ .memtable_size = 100 });
-//     defer manager.deinit(allocator);
-//
-//     const thread = try std.Thread.spawn(.{}, uaf_thread, .{ &manager, allocator });
-//     try fi.sleep_injection.wait_sleep(.Insert);
-//
-//     try std.testing.expect(KeyValue.calculate_size("a" ** 35, "a" ** 35) < 100);
-//
-//     try std.testing.expectEqual(manager.stat.read(.memtable_flush), 0);
-//     try manager.put("a" ** 35, "a" ** 35, allocator);
-//     try std.testing.expectEqual(manager.stat.read(.memtable_flush), 0);
-//     // This should trigger flush
-//     try manager.put("a" ** 35, "a" ** 35, allocator);
-//
-//     try fi.sleep_injection.wake(.Insert);
-//     thread.join();
-// }
+fn insert_thread(manager: *Manager, alloc: Allocator) !void {
+    // Now insert a lot of shit and wait while active memtable is flushed
+    while (manager.stat.read(.memtable_flush) == 0) {
+        try manager.put("hey" ** 10, "baby" ** 10, alloc);
+    }
+}
+
+fn big_insert(manager: *Manager, alloc: Allocator) !void {
+    try manager.put("a" ** 35, "a" ** 35, alloc);
+}
+
+fn checked_big_insert(manager: *Manager, alloc: Allocator) !void {
+    const KeyValue = @import("storage").KeyValue;
+
+    try std.testing.expect(KeyValue.calculate_size("a" ** 35, "a" ** 35) < 100);
+    try std.testing.expectEqual(manager.stat.read(.memtable_flush), 0);
+    try big_insert(manager, alloc);
+}
+
+test "UAF during flush" {
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {};
+
+    const dir = try openOrCreateDir(io, "test_db3");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {
+            @panic("gg");
+        };
+    }
+
+    var manager = try Manager.new(dir, "test_db3", allocator, io, .{ .memtable_size = 5000 });
+    defer manager.deinit(allocator);
+
+    var sched = try test_utils.Scheduler.Scheduler.new(allocator);
+    defer sched.deinit(allocator);
+
+    const uaf = try sched.spawn(uaf_thread, .{ &manager, allocator }, allocator);
+    const insert = try sched.spawn(insert_thread, .{ &manager, allocator }, allocator);
+
+    var plan = try test_utils.Scheduler.SchedulerPlan.new(allocator);
+    defer plan.deinit(allocator);
+
+    try plan.add(.{ .fiber = uaf, .run = .{ .Sleep = .Load } }, allocator);
+    try plan.add(.{ .fiber = insert, .run = .{ .Sleep = .Insert } }, allocator);
+    try plan.add(.{ .fiber = uaf, .run = .End }, allocator);
+
+    try sched.run_with_plan(plan, allocator);
+}
+
+test "In progress insert" {
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {};
+
+    const dir = try openOrCreateDir(io, "test_db3");
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {
+            @panic("gg");
+        };
+    }
+
+    var manager = try Manager.new(dir, "test_db3", allocator, io, .{ .memtable_size = 100 });
+    defer manager.deinit(allocator);
+
+    var sched = try test_utils.Scheduler.Scheduler.new(allocator);
+    defer sched.deinit(allocator);
+
+    const first_insert = try sched.spawn(checked_big_insert, .{ &manager, allocator }, allocator);
+    const in_progress = try sched.spawn(uaf_thread, .{ &manager, allocator }, allocator);
+    const flush_trigger = try sched.spawn(big_insert, .{ &manager, allocator }, allocator);
+
+    var plan = try test_utils.Scheduler.SchedulerPlan.new(allocator);
+    defer plan.deinit(allocator);
+
+    try plan.add(.{ .fiber = first_insert, .run = .End }, allocator);
+    try plan.add(.{ .fiber = in_progress, .run = .{ .Sleep = .Insert } }, allocator);
+    try plan.add(.{ .fiber = flush_trigger, .run = .End }, allocator);
+    try plan.add(.{ .fiber = in_progress, .run = .End }, allocator);
+
+    try sched.run_with_plan(plan, allocator);
+}
