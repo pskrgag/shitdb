@@ -53,7 +53,12 @@ fn Node(T: type) type {
         }
 
         fn try_change_next_at_lvl(self: *Node(T), lvl: usize, expected: ?*Node(T), n: *Node(T)) bool {
-            return self.next.items[lvl].cmpxchgStrong(NodeRef(T).new(expected), NodeRef(T).new(n), .release, .monotonic) == null;
+            return self.next.items[lvl].cmpxchgStrong(
+                NodeRef(T).new(expected),
+                NodeRef(T).new(n),
+                .release,
+                .monotonic,
+            ) == null;
         }
 
         fn heigth(self: *Node(T)) usize {
@@ -204,13 +209,16 @@ pub fn SkipList(T: type) type {
                     return error.AlreadyExists;
 
                 for (linked_lvl..lvl) |h| {
+                    // NOTE: initialize next before publishing. Otherwise there is a chance that list would be split
+                    // into 2 parts on 0th lvl.
+                    node.change_next_at_lvl_unsafe(h, succ[h]);
+
                     // If this fails, just retry the search. Even if h != 0, it's fine, since node can
                     // be found using 0th level. It only affects O(logN) for the search.
                     if (!prev[h].try_change_next_at_lvl(h, succ[h], node)) {
                         continue :outer;
                     }
 
-                    node.change_next_at_lvl_unsafe(h, succ[h]);
                     linked_lvl += 1;
                 }
 
