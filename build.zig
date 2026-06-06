@@ -24,10 +24,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    const fi = b.addModule("test_injection", .{
-        .root_source_file = b.path("src/test_injection/root.zig"),
-        .target = target,
-    });
 
     const generic_utils = b.addModule("generic_utils", .{
         .root_source_file = b.path("src/generic_utils.zig"),
@@ -50,7 +46,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_utils = b.addModule("test_utils", .{
-        .root_source_file = b.path("src/test_utils.zig"),
+        .root_source_file = b.path("src/test_utils/root.zig"),
         .target = target,
     });
 
@@ -70,7 +66,6 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "storage", .module = storage },
             .{ .name = "test_utils", .module = test_utils },
-            .{ .name = "test_injection", .module = fi },
             .{ .name = "slab", .module = slab },
         },
     });

@@ -3,7 +3,7 @@ const Allocator = std.mem.Allocator;
 const MemTable = @import("storage").MemTable;
 const MemTableOpts = @import("storage").MemTableOpts;
 const Manager = @import("db/manager.zig").Manager;
-const test_utils = @import("test_utils");
+const HashTableTest = @import("test_utils").HashTableTest;
 const Dir = std.Io.Dir;
 
 fn openOrCreateDir(io: std.Io, path: []const u8) !Dir {
@@ -109,7 +109,7 @@ test "Test more than one memtable" {
     }
 
     // deinit will be called inside test_hash_table_equavalance. I HATE ZIG, it's even worse than C.
-    try test_utils.test_hash_table_equavalance(tb, false, 500);
+    try HashTableTest.test_hash_table_equavalance(tb, false, 500);
 }
 
 test "Shutdown and then boot" {
@@ -146,7 +146,7 @@ test "Shutdown and then boot" {
 }
 
 test "WAL startup recovery" {
-    const fi = @import("test_injection");
+    const fi = @import("test_utils").Injections;
     const Repeats = 10;
 
     // Should crash after 100 additions

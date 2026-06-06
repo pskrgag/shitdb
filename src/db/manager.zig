@@ -7,7 +7,7 @@ const Allocator = std.mem.Allocator;
 const Mutex = std.Io.Mutex;
 const Version = @import("version.zig").Version;
 const WalTable = @import("wal_table.zig").WalTable;
-const fi = @import("test_injection");
+const fi = @import("test_utils").Injections;
 const Statistics = @import("stat.zig").Statistics;
 const Slab = @import("slab").Slab;
 

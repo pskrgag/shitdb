@@ -3,7 +3,7 @@ const skiplist = @import("skiplist");
 const Arena = skiplist.ArenaBouned;
 const Allocator = std.mem.Allocator;
 const Node = std.DoublyLinkedList.Node;
-const test_utils = @import("test_utils");
+const HashTableTest = @import("test_utils").HashTableTest;
 const Value = std.atomic.Value;
 
 pub const sstable = @import("sstable.zig");
@@ -410,5 +410,5 @@ test "HashTable equivalence" {
     const allocator = arena.allocator();
 
     const tb = try MemTable.new(allocator, std.testing.io, null);
-    try test_utils.test_hash_table_equavalance(tb, false, 1000);
+    try HashTableTest.test_hash_table_equavalance(tb, false, 1000);
 }
