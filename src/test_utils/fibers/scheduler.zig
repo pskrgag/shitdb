@@ -4,7 +4,7 @@ const SleepPoint = @import("fiber.zig").SleepPoint;
 const List = std.DoublyLinkedList;
 const Allocator = std.mem.Allocator;
 
-var SchedulerContext: *Fiber = undefined;
+var SchedulerContext: ?*Fiber = null;
 var CurrentFiber: *Fiber = undefined;
 
 /// Opaque fiber handle
@@ -49,7 +49,7 @@ pub const Scheduler = struct {
     }
 
     pub fn spawn(self: *Scheduler, f: *const fn () void, alloc: Allocator) !FiberHandle {
-        const fib = try Fiber.new(f, SchedulerContext, alloc);
+        const fib = try Fiber.new(f, SchedulerContext.?, alloc);
 
         self.active.append(&fib.node);
         return .{ .ptr = @intFromPtr(fib) };
@@ -60,7 +60,7 @@ pub const Scheduler = struct {
         CurrentFiber = fiber;
         defer CurrentFiber = undefined;
 
-        fiber.switch_from(SchedulerContext);
+        fiber.switch_from(SchedulerContext.?);
     }
 
     pub fn run_with_plan(self: *Scheduler, plan: SchedulerPlan, alloc: Allocator) !void {
@@ -121,15 +121,19 @@ pub const Scheduler = struct {
         }
 
         SchedulerContext.deinit(alloc);
-        SchedulerContext = undefined;
+        SchedulerContext = null;
     }
 };
 
 pub fn yield(point: SleepPoint) void {
-    CurrentFiber.sleep = point;
-    defer CurrentFiber.sleep = null;
+    const builtin = @import("builtin");
 
-    SchedulerContext.switch_from(CurrentFiber);
+    if (builtin.is_test and SchedulerContext != null) {
+        CurrentFiber.sleep = point;
+        defer CurrentFiber.sleep = null;
+
+        SchedulerContext.?.switch_from(CurrentFiber);
+    }
 }
 
 var Global: i32 = 0;

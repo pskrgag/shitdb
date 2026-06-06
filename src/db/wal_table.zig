@@ -8,7 +8,8 @@ const GetResult = @import("storage").GetResult;
 const KeyValue = @import("storage").KeyValue;
 const KVSeq = @import("storage").KVSeq;
 const FileSeq = @import("storage").manifest.FileSeq;
-const fi = @import("test_utils").Injections;
+const test_utils = @import("test_utils");
+const fi = test_utils.Injections;
 const Version = @import("version.zig").Version;
 const VersionEdit = @import("version.zig").VersionEdit;
 const Value = std.atomic.Value;
@@ -120,7 +121,7 @@ pub const WalTable = struct {
 
         try self.wal.record(entry, self.io);
 
-        try fi.sleep_injection.sleep(.Insert);
+        test_utils.Scheduler.yield(.Load);
         try self.table.put(key, value, seq);
         fi.fault_injection.crash(.after_wal);
     }
