@@ -48,8 +48,28 @@ pub const Scheduler = struct {
         return .{ .active = List{} };
     }
 
-    pub fn spawn(self: *Scheduler, f: *const fn () void, alloc: Allocator) !FiberHandle {
-        const fib = try Fiber.new(f, SchedulerContext.?, alloc);
+    pub fn spawn(self: *Scheduler, comptime f: anytype, args: anytype, alloc: Allocator) !FiberHandle {
+        const Args = @TypeOf(args);
+
+        const CallContext = struct {
+            args: Args,
+
+            fn entry(ptr: *anyopaque) void {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                @call(.auto, f, ctx.args);
+            }
+
+            fn cleanup(ptr: *anyopaque, allocator: Allocator) void {
+                const ctx: *@This() = @ptrCast(@alignCast(ptr));
+                allocator.destroy(ctx);
+            }
+        };
+
+        const ctx = try alloc.create(CallContext);
+        errdefer alloc.destroy(ctx);
+        ctx.* = .{ .args = args };
+
+        const fib = try Fiber.new(CallContext.entry, ctx, CallContext.cleanup, SchedulerContext.?, alloc);
 
         self.active.append(&fib.node);
         return .{ .ptr = @intFromPtr(fib) };
@@ -120,7 +140,7 @@ pub const Scheduler = struct {
             fiber.deinit(alloc);
         }
 
-        SchedulerContext.deinit(alloc);
+        SchedulerContext.?.deinit(alloc);
         SchedulerContext = null;
     }
 };
@@ -152,7 +172,7 @@ test "Noop fiber" {
     var sched = try Scheduler.new(allocator);
     defer sched.deinit(allocator);
 
-    _ = try sched.spawn(noop, allocator);
+    _ = try sched.spawn(noop, .{}, allocator);
     try sched.run(allocator);
     try std.testing.expectEqual(Global, 1);
 }
@@ -189,8 +209,8 @@ test "Ping pong" {
     var sched = try Scheduler.new(allocator);
     defer sched.deinit(allocator);
 
-    _ = try sched.spawn(ping, allocator);
-    _ = try sched.spawn(pong, allocator);
+    _ = try sched.spawn(ping, .{}, allocator);
+    _ = try sched.spawn(pong, .{}, allocator);
     try sched.run(allocator);
     try std.testing.expectEqual(GlobalPong, 4);
 }
@@ -210,7 +230,7 @@ test "Sleep points" {
     var sched = try Scheduler.new(allocator);
     defer sched.deinit(allocator);
 
-    _ = try sched.spawn(test_sleep, allocator);
+    _ = try sched.spawn(test_sleep, .{}, allocator);
     try sched.run(allocator);
 }
 
@@ -248,9 +268,9 @@ test "Simple plan" {
     var sched = try Scheduler.new(allocator);
     defer sched.deinit(allocator);
 
-    const f1_handle = try sched.spawn(f1, allocator);
-    const f2_handle = try sched.spawn(f2, allocator);
-    const f3_handle = try sched.spawn(f3, allocator);
+    const f1_handle = try sched.spawn(f1, .{}, allocator);
+    const f2_handle = try sched.spawn(f2, .{}, allocator);
+    const f3_handle = try sched.spawn(f3, .{}, allocator);
 
     var plan = try SchedulerPlan.new(allocator);
     defer plan.deinit(allocator);
@@ -261,4 +281,28 @@ test "Simple plan" {
 
     try sched.run_with_plan(plan, allocator);
     try std.testing.expectEqual(PlanGlobal, 4);
+}
+
+var ArgsGlobal: i32 = 0;
+
+fn add_to_global(delta: i32, multiplier: i32) void {
+    ArgsGlobal += delta * multiplier;
+}
+
+test "Spawn passes args" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+
+    ArgsGlobal = 0;
+
+    const allocator = arena.allocator();
+    var sched = try Scheduler.new(allocator);
+    defer sched.deinit(allocator);
+
+    _ = try sched.spawn(add_to_global, .{ 2, 3 }, allocator);
+    _ = try sched.spawn(add_to_global, .{ 4, 5 }, allocator);
+    try sched.run(allocator);
+    try std.testing.expectEqual(@as(i32, 26), ArgsGlobal);
 }

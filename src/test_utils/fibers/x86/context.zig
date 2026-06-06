@@ -25,10 +25,10 @@ export fn switch_ctx() callconv(.naked) void {
         ::: .{ .memory = true });
 }
 
-fn zig_entry_point(f: usize, self: *ArchContext) callconv(.{ .x86_64_sysv = .{} }) noreturn {
-    const ff: *const fn () void = @ptrFromInt(f);
+fn zig_entry_point(f: usize, arg: *anyopaque, self: *ArchContext) callconv(.{ .x86_64_sysv = .{} }) noreturn {
+    const ff: *const fn (*anyopaque) void = @ptrFromInt(f);
 
-    ff();
+    ff(arg);
     self.done.* = true;
     self.scheduler.switch_from(self);
 
@@ -37,10 +37,11 @@ fn zig_entry_point(f: usize, self: *ArchContext) callconv(.{ .x86_64_sysv = .{} 
 }
 
 export fn entry_point() callconv(.naked) void {
-    asm volatile (
-        \\ movq %%r12, %%rdi
-        \\ movq %%r13, %%rsi
-        \\ callq *%[zig_entry_point]
+        asm volatile (
+            \\ movq %%r12, %%rdi
+            \\ movq %%r14, %%rsi
+            \\ movq %%r13, %%rdx
+            \\ callq *%[zig_entry_point]
         \\ halt:
         \\ jmp halt
         :
@@ -85,7 +86,7 @@ pub const ArchContext = extern struct {
             });
     }
 
-    pub fn new(ep: usize, stack: usize, done: *bool, scheduler: *ArchContext, alloc: Allocator) !*ArchContext {
+    pub fn new(ep: usize, arg: usize, stack: usize, done: *bool, scheduler: *ArchContext, alloc: Allocator) !*ArchContext {
         const self = try alloc.create(ArchContext);
         const stack_slot: [*]usize = @ptrFromInt(stack - 8);
 
@@ -99,7 +100,7 @@ pub const ArchContext = extern struct {
             .rsp = @intFromPtr(stack_slot),
             .r12 = ep,
             .r13 = @intFromPtr(self),
-            .r14 = 0,
+            .r14 = arg,
             .r15 = 0,
             .flags = 0,
         };

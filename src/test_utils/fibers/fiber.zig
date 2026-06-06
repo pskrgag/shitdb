@@ -15,8 +15,13 @@ pub const SleepPoint = enum {
 };
 
 pub const Fiber = struct {
+    const EntryFn = *const fn (*anyopaque) void;
+    const CleanupFn = *const fn (*anyopaque, Allocator) void;
+
     ctx: *ArchContext,
     stack: ?[]u8,
+    arg: ?*anyopaque,
+    cleanup: ?CleanupFn,
     node: ListNode,
     done: bool,
     sleep: ?SleepPoint,
@@ -27,6 +32,8 @@ pub const Fiber = struct {
         self.* = .{
             .ctx = try alloc.create(ArchContext),
             .stack = null,
+            .arg = null,
+            .cleanup = null,
             .node = ListNode{},
             .done = false,
             .sleep = null,
@@ -34,7 +41,7 @@ pub const Fiber = struct {
         return self;
     }
 
-    pub fn new(f: *const fn () void, parent: *Fiber, alloc: Allocator) !*Fiber {
+    pub fn new(f: EntryFn, arg: ?*anyopaque, cleanup: ?CleanupFn, parent: *Fiber, alloc: Allocator) !*Fiber {
         const self = try alloc.create(Fiber);
         const stack = try posix.mmap(
             null,
@@ -49,12 +56,15 @@ pub const Fiber = struct {
             .node = ListNode{},
             .ctx = try ArchContext.new(
                 @intFromPtr(f),
+                @intFromPtr(arg.?),
                 @intFromPtr(stack.ptr + StackSize),
                 &self.done,
                 parent.ctx,
                 alloc,
             ),
             .stack = stack,
+            .arg = arg,
+            .cleanup = cleanup,
             .done = false,
             .sleep = null,
         };
@@ -64,6 +74,11 @@ pub const Fiber = struct {
     pub fn deinit(self: *Fiber, alloc: Allocator) void {
         if (self.stack) |stack|
             posix.munmap(@alignCast(stack));
+
+        if (self.arg) |arg| {
+            if (self.cleanup) |cleanup|
+                cleanup(arg, alloc);
+        }
 
         alloc.destroy(self.ctx);
         alloc.destroy(self);
