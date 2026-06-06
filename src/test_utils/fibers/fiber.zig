@@ -11,6 +11,7 @@ pub const SleepPoint = enum {
     Insert,
 
     Test,
+    Test1,
 };
 
 pub const Fiber = struct {
