@@ -6,11 +6,19 @@ const Allocator = std.mem.Allocator;
 
 const StackSize = 5 << 20;
 
+pub const SleepPoint = enum {
+    Load,
+    Insert,
+
+    Test,
+};
+
 pub const Fiber = struct {
     ctx: *ArchContext,
     stack: ?[]u8,
     node: ListNode,
     done: bool,
+    sleep: ?SleepPoint,
 
     pub fn from_current(alloc: Allocator) !*Fiber {
         const self = try alloc.create(Fiber);
@@ -20,6 +28,7 @@ pub const Fiber = struct {
             .stack = null,
             .node = ListNode{},
             .done = false,
+            .sleep = null,
         };
         return self;
     }
@@ -46,11 +55,15 @@ pub const Fiber = struct {
             ),
             .stack = stack,
             .done = false,
+            .sleep = null,
         };
         return self;
     }
 
     pub fn deinit(self: *Fiber, alloc: Allocator) void {
+        if (self.stack) |stack|
+            posix.munmap(@alignCast(stack));
+
         alloc.destroy(self.ctx);
         alloc.destroy(self);
     }

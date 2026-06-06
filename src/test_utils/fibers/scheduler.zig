@@ -1,5 +1,6 @@
 const std = @import("std");
 const Fiber = @import("fiber.zig").Fiber;
+const SleepPoint = @import("fiber.zig").SleepPoint;
 const List = std.DoublyLinkedList;
 const Allocator = std.mem.Allocator;
 
@@ -28,8 +29,10 @@ pub const Scheduler = struct {
             CurrentFiber = undefined;
 
             if (fiber.is_done()) {
+                std.debug.assert(fiber.sleep == null);
                 fiber.deinit(alloc);
             } else {
+                std.debug.assert(fiber.sleep != null);
                 self.active.append(&fiber.node);
             }
         }
@@ -42,7 +45,10 @@ pub const Scheduler = struct {
     }
 };
 
-pub fn yield() void {
+pub fn yield(point: SleepPoint) void {
+    CurrentFiber.sleep = point;
+    defer CurrentFiber.sleep = null;
+
     SchedulerContext.switch_from(CurrentFiber);
 }
 
@@ -72,22 +78,21 @@ var GlobalPong: i32 = 0;
 fn ping() void {
     std.debug.assert(GlobalPong == 0);
     GlobalPong = 1;
-    yield();
-
+    yield(.Test);
 
     std.debug.assert(GlobalPong == 2);
     GlobalPong = 3;
-    yield();
+    yield(.Test);
 }
 
 fn pong() void {
     std.debug.assert(GlobalPong == 1);
     GlobalPong = 2;
-    yield();
+    yield(.Test);
 
     std.debug.assert(GlobalPong == 3);
     GlobalPong = 4;
-    yield();
+    yield(.Test);
 }
 
 test "Ping pong" {
@@ -104,5 +109,24 @@ test "Ping pong" {
     try sched.spawn(pong, allocator);
     try sched.run(allocator);
     try std.testing.expectEqual(GlobalPong, 4);
+}
+
+fn test_sleep() void {
+    std.debug.assert(CurrentFiber.sleep == null);
+    yield(.Test);
+}
+
+test "Sleep points" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+
+    const allocator = arena.allocator();
+    var sched = try Scheduler.new(allocator);
+    defer sched.deinit(allocator);
+
+    try sched.spawn(test_sleep, allocator);
+    try sched.run(allocator);
 }
 

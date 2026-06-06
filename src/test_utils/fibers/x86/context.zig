@@ -71,7 +71,18 @@ pub const ArchContext = extern struct {
             : [from] "r" (from),
               [to] "r" (to),
               [switch_ctx] "r" (&switch_ctx),
-        );
+            : .{
+              .rax = true,
+              .rcx = true,
+              .rdx = true,
+              .rsi = true,
+              .rdi = true,
+              .r8 = true,
+              .r9 = true,
+              .r10 = true,
+              .r11 = true,
+              .memory = true,
+            });
     }
 
     pub fn new(ep: usize, stack: usize, done: *bool, scheduler: *ArchContext, alloc: Allocator) !*ArchContext {
