@@ -399,7 +399,45 @@ fn insert_values_until_immutable(manager: *Manager, offset: u8, count: usize, al
     const current = manager.version.flusher.count;
     var symbol: u8 = 'a';
 
+    // There is a race, tho... I am not sure I want to make this counter atomic only for tests
+    // (maybe I am)
     while (manager.version.flusher.count == current) {
+        const key = try alloc.alloc(u8, count);
+        defer alloc.free(key);
+
+        const value = try alloc.alloc(u8, count);
+        defer alloc.free(value);
+
+        @memset(key, symbol);
+        @memset(value, symbol + offset);
+
+        try manager.put(key, value, alloc);
+        symbol += 1;
+    }
+}
+
+fn remove_values_until_immutable(manager: *Manager, count: usize, alloc: Allocator) !void {
+    const current = manager.version.flusher.count;
+    var symbol: u8 = 'a';
+
+    // There is a race, tho... I am not sure I want to make this counter atomic only for tests
+    // (maybe I am)
+    while (manager.version.flusher.count == current) {
+        const key = try alloc.alloc(u8, count);
+        defer alloc.free(key);
+
+        @memset(key, symbol);
+
+        try manager.remove(key, alloc);
+        symbol += 1;
+    }
+}
+
+fn insert_values_until_flushed(manager: *Manager, offset: u8, count: usize, alloc: Allocator) !void {
+    const current = manager.version.stat.read(.memtable_flush);
+    var symbol: u8 = 'a';
+
+    while (manager.version.stat.read(.memtable_flush) == current) {
         const key = try alloc.alloc(u8, count);
         defer alloc.free(key);
 
@@ -422,7 +460,7 @@ test "Flusher searches new memtables first" {
     }
     const allocator = arena.allocator();
 
-    const dirname = "test_db_disk_newest_first";
+    const dirname = "flusher_searches_memtable_first";
     std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
 
     const dir = try openOrCreateDir(io, dirname);
@@ -448,4 +486,35 @@ test "Flusher searches new memtables first" {
     const value = (try manager.get("a" ** 10, allocator)).?;
     defer allocator.free(value);
     try std.testing.expectEqualSlices(u8, "b" ** 10, value);
+}
+
+test "Removed in flusher does not result in disk search" {
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "flusher_removed_no_disk";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    const dir = try openOrCreateDir(io, dirname);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    var manager = try Manager.new(dir, dirname, allocator, io, .{ .memtable_size = 200 });
+    defer manager.deinit(allocator);
+
+    // Flush some tables to disk with real values.
+    try insert_values_until_flushed(&manager, 0, 10, allocator);
+
+    // Put removed values into immutable memtable.
+    try remove_values_until_immutable(&manager, 10, allocator);
+
+    const value = manager.get("a" ** 10, allocator);
+    try std.testing.expectEqual(null, value);
 }
