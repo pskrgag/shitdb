@@ -112,9 +112,9 @@ pub const Flusher = struct {
         if (self.count < MaxNumTables) {
             self.list[self.count] = table;
             self.count += 1;
-
-            self.empty_cv.signal(self.io);
         } else {
+            self.empty_cv.signal(self.io);
+
             while (self.count == MaxNumTables)
                 self.full_cv.waitUncancelable(self.io, &self.mutex);
 
@@ -128,7 +128,7 @@ pub const Flusher = struct {
         defer self.mutex.unlock(self.io);
 
         for (0..self.count) |i| {
-            const table: *WalTable = self.list[i].?;
+            const table: *WalTable = self.list[self.count - 1 - i].?;
             const val = try table.get(key, seq, alloc);
 
             switch (val) {

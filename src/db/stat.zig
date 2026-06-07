@@ -31,6 +31,10 @@ pub const Statistics = struct {
         _ = @atomicRmw(u64, &self.counters[@intFromEnum(stat)], .Add, 1, .monotonic);
     }
 
+    pub fn dec(self: *Self, comptime stat: StatKind) void {
+        _ = @atomicRmw(u64, &self.counters[@intFromEnum(stat)], .Sub, 1, .monotonic);
+    }
+
     pub fn add(self: *Self, comptime stat: StatKind, n: u64) void {
         _ = @atomicRmw(u64, &self.counters[@intFromEnum(stat)], .Add, n, .monotonic);
     }

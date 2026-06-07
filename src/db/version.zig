@@ -352,6 +352,7 @@ pub const Version = struct {
     pub fn get(self: *Self, key: []const u8, dir: std.Io.Dir, io: std.Io, alloc: Allocator) !?[]u8 {
         // Resolved from immutable table
         if (try self.flusher.get(key, self.current_seq(), alloc)) |val| {
+            defer alloc.free(val);
             var res = try std.ArrayList(u8).initCapacity(alloc, val.len);
 
             try res.appendSlice(alloc, val);

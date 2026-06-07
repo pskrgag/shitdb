@@ -37,11 +37,11 @@ fn zig_entry_point(f: usize, arg: *anyopaque, self: *ArchContext) callconv(.{ .x
 }
 
 export fn entry_point() callconv(.naked) void {
-        asm volatile (
-            \\ movq %%r12, %%rdi
-            \\ movq %%r14, %%rsi
-            \\ movq %%r13, %%rdx
-            \\ callq *%[zig_entry_point]
+    asm volatile (
+        \\ movq %%r12, %%rdi
+        \\ movq %%r14, %%rsi
+        \\ movq %%r13, %%rdx
+        \\ callq *%[zig_entry_point]
         \\ halt:
         \\ jmp halt
         :

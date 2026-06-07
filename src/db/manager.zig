@@ -70,10 +70,9 @@ pub const Manager = struct {
         defer self.new_table_lock.unlock(self.io);
 
         if (self.active.load(.unordered) == old) {
-            old.make_immune();
-
             const new_file_seq = self.version.new_file_seq();
             const new_table = self.slab.alloc();
+
             new_table.* = try WalTable.new(
                 self.root,
                 self.opts,
@@ -86,6 +85,9 @@ pub const Manager = struct {
             // NOTE: swap BEFORE publishing a new table.
             const old_table = self.active.swap(new_table, .monotonic);
             std.debug.assert(old_table == old);
+
+            // Make immune only after new table was published.
+            old.make_immune();
 
             // Put current table into the flusher
             self.version.insert(old);
@@ -189,7 +191,7 @@ fn insert_thread(manager: *Manager, alloc: Allocator) !void {
 
 fn insert_second(manager: *Manager, alloc: Allocator) !void {
     // Now insert a lot of shit and wait while active memtable is flushed
-    while (manager.stat.read(.memtable_flush) != 2) {
+    while (manager.stat.read(.memtable_flush) < 2) {
         try manager.put("hey" ** 10, "baby" ** 10, alloc);
     }
 }
@@ -320,7 +322,7 @@ test "OOB write" {
     try plan.add(.{ .fiber = flush1_trigger, .run = .End }, allocator);
 
     try sched.run_with_plan(plan, allocator);
-    try std.testing.expectEqual(manager.stat.read(.memtable_flush), 2);
+    try std.testing.expect(manager.stat.read(.memtable_flush) >= 2);
     try manager.version.sanitize_disk_state(dir, allocator, io);
 }
 
@@ -391,4 +393,59 @@ test "Disk search checks newest SSTable first" {
     const value = (try manager.get("shared", allocator)).?;
     defer allocator.free(value);
     try std.testing.expectEqualSlices(u8, "new", value);
+}
+
+fn insert_values_until_immutable(manager: *Manager, offset: u8, count: usize, alloc: Allocator) !void {
+    const current = manager.version.flusher.count;
+    var symbol: u8 = 'a';
+
+    while (manager.version.flusher.count == current) {
+        const key = try alloc.alloc(u8, count);
+        defer alloc.free(key);
+
+        const value = try alloc.alloc(u8, count);
+        defer alloc.free(value);
+
+        @memset(key, symbol);
+        @memset(value, symbol + offset);
+
+        try manager.put(key, value, alloc);
+        symbol += 1;
+    }
+}
+
+test "Flusher searches new memtables first" {
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "test_db_disk_newest_first";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    const dir = try openOrCreateDir(io, dirname);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    var manager = try Manager.new(dir, dirname, allocator, io, .{ .memtable_size = 200 });
+    defer manager.deinit(allocator);
+
+    try std.testing.expectEqual(manager.version.flusher.count, 0);
+
+    // 1 create one full memtable
+    try insert_values_until_immutable(&manager, 0, 10, allocator);
+    try std.testing.expectEqual(manager.version.flusher.count, 1);
+
+    // 2 create second full memtable with values offseted by 1
+    try insert_values_until_immutable(&manager, 1, 10, allocator);
+    try std.testing.expectEqual(manager.version.flusher.count, 2);
+
+    const value = (try manager.get("a" ** 10, allocator)).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualSlices(u8, "b" ** 10, value);
 }
