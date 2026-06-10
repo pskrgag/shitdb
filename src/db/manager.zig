@@ -582,7 +582,7 @@ test "Wal does not include not-inserted entries" {
         // This is should be unreachable
         std.posix.system.exit(0);
     } else {
-        var status: u32 = 0;
+        var status: c_int = 0;
         const res = std.posix.system.waitpid(@intCast(pid), &status, 0);
 
         if (res == -1) {

@@ -7,12 +7,15 @@ const std = @import("std");
 // build runner to parallelize the build automatically (and the cache system to
 // know when a step doesn't need to be re-run).
 pub fn build(b: *std.Build) void {
+    const tsan = b.option(bool, "tsan", "Enable ThreadSanitizer") orelse false;
     // Standard target options allow the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const test_filter = b.option([]const u8, "test-filter", "Run only tests matching this filter");
+    const test_filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{};
 
     const zbench_module = b.dependency("zbench", .{
         .target = target,
@@ -23,7 +26,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/slab/root.zig"),
         .target = target,
     });
-
 
     const generic_utils = b.addModule("generic_utils", .{
         .root_source_file = b.path("src/generic_utils.zig"),
@@ -40,6 +42,7 @@ pub fn build(b: *std.Build) void {
     const skiplist = b.addModule("skiplist", .{
         .root_source_file = b.path("src/skiplist/skiplist.zig"),
         .target = target,
+        .sanitize_thread = tsan,
         .imports = &.{
             .{ .name = "generic_utils", .module = generic_utils },
         },
@@ -95,20 +98,28 @@ pub fn build(b: *std.Build) void {
 
     const skiplist_tests = b.addTest(.{
         .root_module = skiplist,
+        .filters = test_filters,
+        .use_llvm = tsan,
     });
     const run_skiplist_tests = b.addRunArtifact(skiplist_tests);
 
     const memtable_tests = b.addTest(.{
         .root_module = storage,
+        .filters = test_filters,
+        .use_llvm = tsan,
     });
     const run_memtable_tests = b.addRunArtifact(memtable_tests);
 
     const db_tests = b.addTest(.{
         .root_module = db,
+        .filters = test_filters,
+        .use_llvm = tsan,
     });
     const run_db_tests = b.addRunArtifact(db_tests);
     const iter_tests = b.addTest(.{
         .root_module = merging_iterator,
+        .filters = test_filters,
+        .use_llvm = tsan,
     });
     const run_iter_tests = b.addRunArtifact(iter_tests);
 
