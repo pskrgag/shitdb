@@ -161,17 +161,18 @@ test "WAL startup recovery" {
     const allocator = arena.allocator();
 
     std.Io.Dir.cwd().deleteTree(io, "test_db4") catch {};
-    const pid = std.posix.system.fork();
-
-    if (pid == -1) {
-        std.debug.print("Failed to fork\n", .{});
-        return error.ForkFailed;
-    }
 
     defer {
         std.Io.Dir.cwd().deleteTree(io, "test_db4") catch {
             @panic("gg");
         };
+    }
+
+    const pid = std.posix.system.fork();
+
+    if (pid == -1) {
+        std.debug.print("Failed to fork\n", .{});
+        return error.ForkFailed;
     }
 
     if (pid == 0) {

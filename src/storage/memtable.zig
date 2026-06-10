@@ -260,15 +260,20 @@ pub const MemTable = struct {
         }
     }
 
-    /// Inserts new value into MemTable
-    pub fn put(self: *Self, key: []const u8, value: []const u8, seq: KVSeq) !void {
-        const kv = try KeyValue.new(key, value, seq, Type.Add, self.arena.allocator());
-
+    /// Creates a new KV using internal bounded arena
+    pub fn create_add_kv(self: *Self, key: []const u8, value: []const u8, seq: KVSeq) !KeyValue {
         if (value.len == 0)
             return error.InvalidValue;
 
-        std.debug.assert(!kv.is_tombstone());
+        return try KeyValue.new(key, value, seq, Type.Add, self.arena.allocator());
+    }
 
+    pub fn create_remove_kv(self: *Self, key: []const u8, seq: KVSeq) !KeyValue {
+        return try KeyValue.new(key, null, seq, Type.Delete, self.arena.allocator());
+    }
+
+    /// Puts kv previously constructed by MemTable::create_kv
+    pub fn put_kv(self: *Self, kv: KeyValue) !void {
         // This would be nice, but actually it's too optimistic:
         //
         // Imagine following execution path:
@@ -288,8 +293,17 @@ pub const MemTable = struct {
         // I am not sure if OOO write is fine or not, but let's leave it for now.
         // std.debug.assert(seq.get() >= self.max_seq.get());
 
-        self.update_max_seq(seq);
-        _ = try self.table.insert(kv);
+        try self.table.insert(kv);
+        self.update_max_seq(kv.as_seq());
+    }
+
+    /// Inserts new value into MemTable
+    pub fn put(self: *Self, key: []const u8, value: []const u8, seq: KVSeq) !void {
+        if (value.len == 0)
+            return error.InvalidValue;
+
+        const kv = try KeyValue.new(key, value, seq, Type.Add, self.arena.allocator());
+        return self.put_kv(kv);
     }
 
     // Removes value from MemTable

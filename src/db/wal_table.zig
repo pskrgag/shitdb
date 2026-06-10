@@ -110,34 +110,68 @@ pub const WalTable = struct {
         self.in_progress.wait_zero();
     }
 
-    /// Puts value from the memtable and records it into WAL
-    pub fn put(self: *WalTable, key: []const u8, value: []const u8, seq: KVSeq, alloc: Allocator) !void {
+    const Action = union(enum) {
+        Put: struct {
+            key: []const u8,
+            value: []const u8,
+            seq: KVSeq,
+        },
+        Remove: struct {
+            key: []const u8,
+            seq: KVSeq,
+        },
+    };
+
+    fn insert(self: *WalTable, action: Action, alloc: Allocator) !void {
         self.in_progress.inc();
         defer self.in_progress.dec();
 
         try self.guard_active();
 
-        const entry: WalEntry = .{ .Add = .{ .key = key, .value = value, .seq = seq } };
+        var kv: KeyValue = undefined;
+        var entry: WalEntry = undefined;
+
+        switch (action) {
+            .Put => |p| {
+                kv = self.table.create_add_kv(p.key, p.value, p.seq) catch |e| {
+                    if (e == error.OutOfMemory) {
+                        fi.fault_injection.crash(.after_insert_oom);
+                    }
+
+                    return e;
+                };
+                entry = .{ .Add = .{ .key = p.key, .value = p.value, .seq = p.seq } };
+            },
+            .Remove => |r| {
+                kv = self.table.create_remove_kv(r.key, r.seq) catch |e| {
+                    if (e == error.OutOfMemory) {
+                        fi.fault_injection.crash(.after_insert_oom);
+                    }
+
+                    return e;
+                };
+                entry = .{ .Remove = .{ .key = r.key, .seq = r.seq } };
+            },
+        }
+
+        // In case of WAL record failure, KV is leaked. Since allocator is bounded arena, there is
+        // no way we can return it back.
 
         try self.wal.record(entry, alloc, self.io);
-
         test_utils.Scheduler.yield(.WalWritten);
-        try self.table.put(key, value, seq);
+
+        try self.table.put_kv(kv);
         fi.fault_injection.crash(.after_wal);
+    }
+
+    /// Puts value from the memtable and records it into WAL
+    pub fn put(self: *WalTable, key: []const u8, value: []const u8, seq: KVSeq, alloc: Allocator) !void {
+        return self.insert(.{ .Put = .{ .key = key, .value = value, .seq = seq } }, alloc);
     }
 
     /// Removes value from the memtable and records it into WAL
     pub fn remove(self: *WalTable, key: []const u8, seq: KVSeq, alloc: Allocator) !void {
-        self.in_progress.inc();
-        defer self.in_progress.dec();
-
-        try self.guard_active();
-
-        const entry: WalEntry = .{ .Remove = .{ .key = key, .seq = seq } };
-
-        try self.wal.record(entry, alloc, self.io);
-        try self.table.remove(key, seq);
-        fi.fault_injection.crash(.after_wal);
+        return self.insert(.{ .Remove = .{ .key = key, .seq = seq } }, alloc);
     }
 
     /// Retrieves value from the memtable

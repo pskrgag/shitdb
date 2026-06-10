@@ -5,6 +5,7 @@ const Flusher = @import("flusher.zig").Flusher;
 const Dir = std.Io.Dir;
 const Allocator = std.mem.Allocator;
 const Mutex = std.Io.Mutex;
+const KeyValue = @import("storage").KeyValue;
 const Version = @import("version.zig").Version;
 const WalTable = @import("wal_table.zig").WalTable;
 const test_utils = @import("test_utils");
@@ -202,8 +203,6 @@ fn big_insert(manager: *Manager, alloc: Allocator) !void {
 }
 
 fn checked_big_insert(manager: *Manager, alloc: Allocator) !void {
-    const KeyValue = @import("storage").KeyValue;
-
     try std.testing.expect(KeyValue.calculate_size("a" ** 35, "a" ** 35) < 100);
     try std.testing.expectEqual(manager.stat.read(.memtable_flush), 0);
     try big_insert(manager, alloc);
@@ -518,4 +517,99 @@ test "Removed in flusher does not result in disk search" {
 
     const value = manager.get("a" ** 10, allocator);
     try std.testing.expectEqual(null, value);
+}
+
+test "Wal does not include not-inserted entries" {
+    try fi.fault_injection.enable(.after_insert_oom, 1);
+    defer fi.fault_injection.clear();
+
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "flusher_removed_no_disk";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    const dir = try openOrCreateDir(io, dirname);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    const expected_kv_size = 44;
+    const iterations = 11;
+    const memtable_size = expected_kv_size * (iterations - 1);
+
+    const pid = std.posix.system.fork();
+
+    if (pid == -1) {
+        std.debug.print("Failed to fork\n", .{});
+        return error.ForkFailed;
+    }
+
+    if (pid == 0) {
+        var manager = Manager.new(dir, dirname, allocator, io, .{
+            .memtable_size = memtable_size,
+        }) catch |e| {
+            std.debug.print("Unexpected error returned during create {}\n", .{e});
+            std.posix.system.exit(0);
+        };
+
+        var key_buf: [10]u8 = undefined;
+        var value_buf: [10]u8 = undefined;
+        const key = key_buf[0..];
+        const value = value_buf[0..];
+
+        std.testing.expectEqual(expected_kv_size, KeyValue.calculate_size(key, value)) catch |e| {
+            std.debug.print("Unexpected size of KV {}\n", .{e});
+            std.posix.system.exit(0);
+        };
+
+        for (1..iterations) |i| {
+            @memset(key, 'a' + @as(u8, @intCast(i)));
+            @memset(value, 'a' + @as(u8, @intCast(i)));
+
+            manager.put(key, value, allocator) catch {
+                std.debug.print("Unexpected error returned during put\n", .{});
+                std.posix.system.exit(0);
+            };
+        }
+
+        // This is should be unreachable
+        std.posix.system.exit(0);
+    } else {
+        var status: u32 = 0;
+        const res = std.posix.system.waitpid(@intCast(pid), &status, 0);
+
+        if (res == -1) {
+            std.debug.print("Failed to wait\n", .{});
+            return error.WaitPidFailed;
+        }
+
+        try std.testing.expect(status != 0);
+    }
+    var key_buf: [10]u8 = undefined;
+    const key = key_buf[0..];
+
+    @memset(key, 'a' + @as(u8, @intCast(iterations - 1)));
+
+    // Now reopen it
+    var manager = try Manager.new(dir, dirname, allocator, io, null);
+    defer manager.deinit(allocator);
+
+    // Failed one should not be there
+    try std.testing.expectEqual(manager.get(key, allocator), null);
+
+    for (1..iterations - 1) |i| {
+        @memset(key, 'a' + @as(u8, @intCast(i)));
+
+        const val = (try manager.get(key, allocator)).?;
+        defer allocator.free(val);
+
+        try std.testing.expectEqualSlices(u8, val, key);
+    }
 }

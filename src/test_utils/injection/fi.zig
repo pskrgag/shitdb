@@ -3,6 +3,7 @@ const Value = std.atomic.Value;
 
 pub const PanicKind = enum {
     after_wal,
+    after_insert_oom,
 };
 
 const PanicPoint = struct {
