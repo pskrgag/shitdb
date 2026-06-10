@@ -102,7 +102,7 @@ pub const Manager = struct {
         test_utils.Scheduler.yield(.LoadCurrentMemtable);
 
         // Current table is full. Allocate new one
-        table.put(key, value, new_seq) catch |e| {
+        table.put(key, value, new_seq, alloc) catch |e| {
             if (e == error.OutOfMemory or e == error.Immutable) {
                 try self.allocate_new_table(table, alloc);
                 // It was updated. Retry the operation
@@ -117,9 +117,10 @@ pub const Manager = struct {
     pub fn remove(self: *Self, key: []const u8, alloc: Allocator) !void {
         // consume would suffice, but whatever
         const table = self.active.load(.acquire);
+        const new_seq = self.version.next_seq();
 
         // Current table is full. Allocate new one
-        table.remove(key, self.version.next_seq()) catch |e| {
+        table.remove(key, new_seq, alloc) catch |e| {
             if (e == error.OutOfMemory or e == error.Immutable) {
                 try self.allocate_new_table(table, alloc);
                 // It was updated. Retry the operation
@@ -238,7 +239,7 @@ test "UAF during flush" {
     defer plan.deinit(allocator);
 
     try plan.add(.{ .fiber = uaf, .run = .{ .Sleep = .LoadCurrentMemtable } }, allocator);
-    try plan.add(.{ .fiber = insert, .run = .{ .Sleep = .WalWrite } }, allocator);
+    try plan.add(.{ .fiber = insert, .run = .{ .Sleep = .WalWritten } }, allocator);
     try plan.add(.{ .fiber = uaf, .run = .End }, allocator);
 
     try sched.run_with_plan(plan, allocator);
@@ -275,7 +276,7 @@ test "In progress insert" {
     defer plan.deinit(allocator);
 
     try plan.add(.{ .fiber = first_insert, .run = .End }, allocator);
-    try plan.add(.{ .fiber = in_progress, .run = .{ .Sleep = .WalWrite } }, allocator);
+    try plan.add(.{ .fiber = in_progress, .run = .{ .Sleep = .WalWritten } }, allocator);
     try plan.add(.{ .fiber = flush_trigger, .run = .End }, allocator);
     try plan.add(.{ .fiber = in_progress, .run = .End }, allocator);
 

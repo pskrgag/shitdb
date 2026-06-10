@@ -27,6 +27,32 @@ pub const WalEntry = union(enum) {
         seq: KVSeq,
     },
 
+    fn string_size(slice: []const u8) usize {
+        return 8 + slice.len;
+    }
+
+    fn full_size(self: *const WalEntry) usize {
+        var size: usize = 0;
+
+        switch (self.*) {
+            .Add => |add| {
+                size += @sizeOf(@TypeOf(AddMagic));
+                size += WalEntry.string_size(add.key);
+                size += WalEntry.string_size(add.value);
+                size += @sizeOf(@TypeOf(add.seq));
+                size += 4; // checksum.
+            },
+            .Remove => |rem| {
+                size += @sizeOf(@TypeOf(RemoveMagic));
+                size += WalEntry.string_size(rem.key);
+                size += @sizeOf(@TypeOf(rem.seq));
+                size += 4; // checksum.
+            },
+        }
+
+        return size;
+    }
+
     fn checksum(self: *const WalEntry) u32 {
         var hash = Crc32.init();
 
@@ -80,11 +106,20 @@ pub const Wal = struct {
         return .{ .file = file };
     }
 
-    pub fn record(self: *Wal, entry: WalEntry, io: Io) !void {
-        // TODO: I really don't know how to pass an allocator here. Let's keep small on-stack buffer for now
-        // and maybe measure some perf.
-        var buf: [64 * 1024]u8 = undefined;
-        var fw = self.file.writerStreaming(io, &buf);
+    pub fn record(self: *Wal, entry: WalEntry, alloc: Allocator, io: Io) !void {
+        // Here we rely on Linux behavior regarding concurrent file writes from the threads of the _same process_.
+        //
+        // man 2 write:
+        //        Among  the  APIs  subsequently  listed  are  write()  and  writev(2).   And among the effects that 
+        //        should be atomic across threads (and processes) are updates of the file offset.
+        //
+        // So we allocate enough heap buffer, write to it and atomically dump it to the disk. Test at the end sanity-checks
+        // this behavior.
+
+        const buf = try alloc.alloc(u8, entry.full_size());
+        defer alloc.free(buf);
+
+        var fw = self.file.writerStreaming(io, buf);
         const w = &fw.interface;
 
         switch (entry) {
@@ -107,6 +142,8 @@ pub const Wal = struct {
         }
 
         try w.flush();
+
+        // tho in case of that error things would be quite fun...
         try self.file.sync(io);
     }
 
@@ -284,7 +321,7 @@ test "WAL serializes add record" {
 
     var wal = try Wal.new(dir, FileSeq.init(1), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, allocator, testing_io);
 
     const data = try readWalFile(dir, 1, allocator);
     defer allocator.free(data);
@@ -328,7 +365,7 @@ test "WAL serializes remove record" {
 
     var wal = try Wal.new(dir, FileSeq.init(2), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Remove = .{ .key = "beta", .seq = KVSeq.init(42) } }, testing_io);
+    try wal.record(.{ .Remove = .{ .key = "beta", .seq = KVSeq.init(42) } }, allocator, testing_io);
 
     const data = try readWalFile(dir, 2, allocator);
     defer allocator.free(data);
@@ -368,8 +405,8 @@ test "WAL serializes records in append order" {
 
     var wal = try Wal.new(dir, FileSeq.init(3), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, allocator, testing_io);
+    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, allocator, testing_io);
 
     const data = try readWalFile(dir, 3, allocator);
     defer allocator.free(data);
@@ -429,7 +466,7 @@ test "WAL replay restores add record into target table" {
 
     var wal = try Wal.new(dir, FileSeq.init(4), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, allocator, testing_io);
 
     var target = try WalTable.new(dir, null, FileSeq.init(5), null, testing_io, allocator);
     defer target.deinit(allocator);
@@ -463,7 +500,7 @@ test "WAL replay restores remove record into target table" {
 
     var wal = try Wal.new(dir, FileSeq.init(6), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, testing_io);
+    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, allocator, testing_io);
 
     var target = try WalTable.new(dir, null, FileSeq.init(7), null, testing_io, allocator);
     defer target.deinit(allocator);
@@ -491,8 +528,8 @@ test "WAL replay applies later remove over earlier add" {
 
     var wal = try Wal.new(dir, FileSeq.init(8), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, allocator, testing_io);
+    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, allocator, testing_io);
 
     var target = try WalTable.new(dir, null, FileSeq.init(9), null, testing_io, allocator);
     defer target.deinit(allocator);
@@ -600,4 +637,68 @@ test "WAL replay rejects remove record without sequence number" {
     @memcpy(data[1 + @sizeOf(usize) ..], "alpha");
 
     try expectReplayInvalidFormat(dir, 13, &data, allocator);
+}
+
+var Stop = std.atomic.Value(bool).init(false);
+
+fn thread_big_insert(wal: *Wal, c: u8, alloc: Allocator) !void {
+    const key = try alloc.alloc(u8, 200 * 1024);
+    defer alloc.free(key);
+
+    const value = try alloc.alloc(u8, 200 * 1024);
+    defer alloc.free(value);
+
+    @memset(key, c);
+    @memset(value, c);
+
+    while (Stop.load(.monotonic) == false) {
+        const entry: WalEntry = .{ .Add = .{ .key = key, .value = value, .seq = KVSeq.init(0) } };
+
+        try wal.record(entry, alloc, testing_io);
+    }
+}
+
+test "WAL concurency" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+    const dirname = "test_wal_replay_truncated_remove_seq";
+    const thread_count = 16;
+
+    var dir = try openTestDir(dirname);
+    defer {
+        dir.close(testing_io);
+        Dir.cwd().deleteTree(testing_io, dirname) catch {
+            @panic("failed to delete test wal dir");
+        };
+    }
+
+    var threads = try std.ArrayList(std.Thread).initCapacity(allocator, thread_count);
+    defer threads.deinit(allocator);
+
+    var wal = try Wal.new(dir, FileSeq.init(0), null, testing_io, allocator);
+    const ch: u8 = 'a';
+
+    for (0..thread_count) |i| {
+        try threads.append(allocator, try std.Thread.spawn(.{}, thread_big_insert, .{
+            &wal,
+            ch + @as(u8, @intCast(i)),
+            allocator,
+        }));
+    }
+
+    try std.Io.sleep(testing_io, .fromSeconds(5), .awake);
+    Stop.store(true, .monotonic);
+
+    for (threads.items) |thread| {
+        thread.join();
+    }
+
+    // Check WAL sanity
+    var target = try WalTable.new(dir, null, FileSeq.init(0), null, testing_io, allocator);
+    defer target.deinit(allocator);
+
+    try wal.replay_to(&target, testing_io);
 }

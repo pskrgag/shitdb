@@ -111,7 +111,7 @@ pub const WalTable = struct {
     }
 
     /// Puts value from the memtable and records it into WAL
-    pub fn put(self: *WalTable, key: []const u8, value: []const u8, seq: KVSeq) !void {
+    pub fn put(self: *WalTable, key: []const u8, value: []const u8, seq: KVSeq, alloc: Allocator) !void {
         self.in_progress.inc();
         defer self.in_progress.dec();
 
@@ -119,15 +119,15 @@ pub const WalTable = struct {
 
         const entry: WalEntry = .{ .Add = .{ .key = key, .value = value, .seq = seq } };
 
-        try self.wal.record(entry, self.io);
+        try self.wal.record(entry, alloc, self.io);
 
-        test_utils.Scheduler.yield(.WalWrite);
+        test_utils.Scheduler.yield(.WalWritten);
         try self.table.put(key, value, seq);
         fi.fault_injection.crash(.after_wal);
     }
 
     /// Removes value from the memtable and records it into WAL
-    pub fn remove(self: *WalTable, key: []const u8, seq: KVSeq) !void {
+    pub fn remove(self: *WalTable, key: []const u8, seq: KVSeq, alloc: Allocator) !void {
         self.in_progress.inc();
         defer self.in_progress.dec();
 
@@ -135,7 +135,7 @@ pub const WalTable = struct {
 
         const entry: WalEntry = .{ .Remove = .{ .key = key, .seq = seq } };
 
-        try self.wal.record(entry, self.io);
+        try self.wal.record(entry, alloc, self.io);
         try self.table.remove(key, seq);
         fi.fault_injection.crash(.after_wal);
     }
