@@ -110,6 +110,7 @@ pub const Iterator = struct {
 
 pub const SSTable = struct {
     file: []u8,
+    real_size: usize,
     lvl: usize,
     min_key: []const u8,
     max_key: []const u8,
@@ -461,7 +462,14 @@ pub const SSTable = struct {
 
         const stat = try file.stat(io);
 
-        const mmap = try std.posix.mmap(null, stat.size, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
+        const mmap = try std.posix.mmap(
+            null,
+            stat.size,
+            .{ .READ = true },
+            .{ .TYPE = .SHARED },
+            file.handle,
+            0,
+        );
         const mt = Self.meta_from_file(mmap);
         return .{
             .file = mmap,
@@ -469,6 +477,7 @@ pub const SSTable = struct {
             .min_key = Self.min_key_from_file(mmap),
             .max_key = Self.max_key_from_file(mmap),
             .max_seq = null,
+            .real_size = stat.size,
         };
     }
 
@@ -514,6 +523,7 @@ pub const SSTable = struct {
             .min_key = iter.min.?.as_key(),
             .max_key = iter.max.?.as_key(),
             .max_seq = iter.max_seq,
+            .real_size = total_size,
         };
     }
 
@@ -528,7 +538,11 @@ pub const SSTable = struct {
 
         // We found a block that may contain a value. Try to find a value there
         if (Self.find_block_candidate(index, key, self.file)) |blk| {
-            return try Self.find_value_in_block(self.file[blk.offset .. blk.offset + blk.size], key, alloc);
+            return try Self.find_value_in_block(
+                self.file[blk.offset .. blk.offset + blk.size],
+                key,
+                alloc,
+            );
         }
 
         return .NotFound;
@@ -543,16 +557,21 @@ pub const SSTable = struct {
         merged_lvl: u8,
         alloc: Allocator,
     ) !Self {
-        var iters = try std.ArrayList(merging_iterator.IteratorWrapper(KeyValue)).initCapacity(alloc, 0);
-        var iter_wrappers = try std.ArrayList(Iterator).initCapacity(alloc, 0);
-        var total_size: usize = 0;
-
+        var iters = try std.ArrayList(merging_iterator.IteratorWrapper(KeyValue)).initCapacity(
+            alloc,
+            tables.len,
+        );
         defer iters.deinit(alloc);
+
+        var iter_wrappers = try std.ArrayList(Iterator).initCapacity(alloc, tables.len);
+        var total_size: usize = 0;
         defer iter_wrappers.deinit(alloc);
 
         for (tables) |i| {
             // We need extra array, since IteratorWrapper accepts pointer
             try iter_wrappers.append(alloc, i.iterator());
+
+            // This is safe, since iter_wrappers has pre-allocated capacity.
             try iters.append(
                 alloc,
                 merging_iterator.IteratorWrapper(KeyValue).init(&iter_wrappers.items[iter_wrappers.items.len - 1]),
@@ -566,7 +585,7 @@ pub const SSTable = struct {
             .truncate = true,
             .read = true,
         });
-        errdefer file.close(io);
+        defer file.close(io);
 
         try file.setLength(io, total_size);
 
@@ -578,6 +597,8 @@ pub const SSTable = struct {
             file.handle,
             0,
         ));
+        errdefer std.posix.munmap(@alignCast(mmap));
+
         var write_iter = try WriteKVIter.init(mmap.ptr, alloc);
         var prev: ?KeyValue = null;
 
@@ -608,7 +629,10 @@ pub const SSTable = struct {
         std.debug.assert(write_iter.min != null);
 
         const real_size = try Self.finalize_table(write_iter, file, mmap, merged_lvl, io, alloc);
+        std.debug.assert(real_size <= total_size);
+
         return .{
+            .real_size = total_size,
             .file = mmap[0..real_size],
             .lvl = merged_lvl,
             .min_key = Self.min_key_from_file(mmap[0..real_size]),
@@ -631,7 +655,9 @@ pub const SSTable = struct {
 
     /// Closes SSTable
     pub fn deinit(self: *const Self) void {
-        std.posix.munmap(@ptrCast(@alignCast(self.file)));
+        const ptr: [*]u8 = @ptrCast(self.file.ptr);
+
+        std.posix.munmap(@ptrCast(@alignCast(ptr[0..self.real_size])));
     }
 };
 
