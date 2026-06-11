@@ -520,6 +520,14 @@ test "Removed in flusher does not result in disk search" {
 }
 
 test "Wal does not include not-inserted entries" {
+    const builtin = @import("builtin");
+
+    // Zig spawns threads, so fork in multi-threaded env is not really supported
+    // (tho whole test is unsafe)
+    if (builtin.sanitize_thread) {
+        return;
+    }
+
     try fi.fault_injection.enable(.after_insert_oom, 1);
     defer fi.fault_injection.clear();
 
@@ -582,7 +590,7 @@ test "Wal does not include not-inserted entries" {
         // This is should be unreachable
         std.posix.system.exit(0);
     } else {
-        var status: c_int = 0;
+        var status: u32 = 0;
         const res = std.posix.system.waitpid(@intCast(pid), &status, 0);
 
         if (res == -1) {

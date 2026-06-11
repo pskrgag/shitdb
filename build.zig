@@ -25,15 +25,18 @@ pub fn build(b: *std.Build) void {
     const slab = b.addModule("slab", .{
         .root_source_file = b.path("src/slab/root.zig"),
         .target = target,
+        .sanitize_thread = tsan,
     });
 
     const generic_utils = b.addModule("generic_utils", .{
         .root_source_file = b.path("src/generic_utils.zig"),
         .target = target,
+        .sanitize_thread = tsan,
     });
     const merging_iterator = b.addModule("merging_iterator ", .{
         .root_source_file = b.path("src/merging_iterator/iterator.zig"),
         .target = target,
+        .sanitize_thread = tsan,
         .imports = &.{
             .{ .name = "generic_utils", .module = generic_utils },
         },
@@ -51,11 +54,13 @@ pub fn build(b: *std.Build) void {
     const test_utils = b.addModule("test_utils", .{
         .root_source_file = b.path("src/test_utils/root.zig"),
         .target = target,
+        .sanitize_thread = tsan,
     });
 
     const storage = b.addModule("storage", .{
         .root_source_file = b.path("src/storage/memtable.zig"),
         .target = target,
+        .sanitize_thread = tsan,
         .imports = &.{
             .{ .name = "skiplist", .module = skiplist },
             .{ .name = "test_utils", .module = test_utils },
@@ -66,6 +71,7 @@ pub fn build(b: *std.Build) void {
     const db = b.addModule("db", .{
         .root_source_file = b.path("src/db.zig"),
         .target = target,
+        .sanitize_thread = tsan,
         .imports = &.{
             .{ .name = "storage", .module = storage },
             .{ .name = "test_utils", .module = test_utils },
@@ -80,6 +86,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .omit_frame_pointer = false,
+            .sanitize_thread = tsan,
             .imports = &.{
                 .{ .name = "zbench", .module = zbench_module },
                 .{ .name = "skiplist", .module = skiplist },

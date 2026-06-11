@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const compare_keys = @import("generic_utils").compare_keys;
 pub const Arena = @import("arena.zig").ThreadSafeArena;
 pub const ArenaBouned = @import("arena.zig").ThreadSafeArenaBounded;
+const thread_prng = @import("prng.zig").prng;
 
 const MaxHeigth = 12;
 
@@ -45,7 +46,7 @@ fn Node(T: type) type {
         }
 
         fn next_at_lvl(self: *const Node(T), lvl: usize) NodeRef(T) {
-            return self.next.items[lvl].load(.monotonic);
+            return self.next.items[lvl].load(.acquire);
         }
 
         fn change_next_at_lvl_unsafe(self: *Node(T), lvl: usize, n: ?*Node(T)) void {
@@ -98,7 +99,6 @@ pub fn SkipList(T: type) type {
         head: Node(T),
         arena: Arena,
         heigth: std.atomic.Value(usize),
-        prng: std.Random.DefaultPrng,
 
         const Self = @This();
 
@@ -106,12 +106,12 @@ pub fn SkipList(T: type) type {
             return self.heigth.load(.monotonic);
         }
 
-        fn random_lvl(self: *Self) usize {
+        fn random_lvl() usize {
             const FACTOR: usize = 25;
 
             var h: usize = 1;
 
-            while (self.prng.random().int(u8) % 100 < FACTOR and h < MaxHeigth - 1) {
+            while (thread_prng().random().int(u8) % 100 < FACTOR and h < MaxHeigth - 1) {
                 h += 1;
             }
 
@@ -181,13 +181,12 @@ pub fn SkipList(T: type) type {
                 .head = node,
                 .arena = arena,
                 .heigth = std.atomic.Value(usize).init(1),
-                .prng = std.Random.DefaultPrng.init(0x1234_5678_9abc_def0),
             };
         }
 
         /// Inserts new value into the SkipList
         pub fn insert(self: *Self, val: T) !void {
-            const lvl = self.random_lvl();
+            const lvl = Self.random_lvl();
             const node = try self.arena.allocator().create(Node(T));
             node.* = try Node(T).new(lvl, val, self.arena.allocator());
 

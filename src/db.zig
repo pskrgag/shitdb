@@ -146,6 +146,14 @@ test "Shutdown and then boot" {
 }
 
 test "WAL startup recovery" {
+    const builtin = @import("builtin");
+
+    // Zig spawns threads, so fork in multi-threaded env is not really supported
+    // (tho whole test is unsafe)
+    if (builtin.sanitize_thread) {
+        return;
+    }
+
     const fi = @import("test_utils").Injections;
     const Repeats = 10;
 
@@ -191,7 +199,7 @@ test "WAL startup recovery" {
         // This is should be unreachable
         std.posix.system.exit(0);
     } else {
-        var status: c_int = 0;
+        var status: u32 = 0;
         const res = std.posix.system.waitpid(@intCast(pid), &status, 0);
 
         if (res == -1) {
