@@ -323,6 +323,9 @@ pub const Version = struct {
         if (table.min() == null)
             return;
 
+        table.assert_immutable();
+        table.assert_no_users();
+
         const min = try KeyOwned.from_kv(table.min().?, alloc);
         const max = try KeyOwned.from_kv(table.max().?, alloc);
 
@@ -434,7 +437,12 @@ pub const Version = struct {
 
                     for (self.wals.items, 0..) |wal, idx| {
                         if (wal.get() == f.file_seq.get()) {
-                            _ = self.wals.swapRemove(idx);
+                            const old_wal = self.wals.swapRemove(idx);
+
+                            // I don't really want to abort initialization in of WAL GC failure.
+                            Wal.unlink(dir, old_wal, io, alloc) catch |e| {
+                                std.debug.print("Failed to delete old WAL {}", .{e});
+                            };
                             break;
                         }
                     }
@@ -476,12 +484,14 @@ pub const Version = struct {
                 slab.alloc()
             else
                 try alloc.create(WalTable);
+
             alive_wal.* = try WalTable.open(dir, opts, wal, io, alloc);
 
             if (alive_wal.max_seq().get() > self.next_sequence.load(.monotonic).get()) {
                 self.next_sequence.store(KVSeq.init(alive_wal.max_seq().get() + 1), .monotonic);
             }
 
+            alive_wal.make_immune();
             self.insert(alive_wal);
         }
     }

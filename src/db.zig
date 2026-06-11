@@ -50,7 +50,7 @@ pub const KeyValue = struct {
         const dir = try openOrCreateDir(io, path);
         const mem_opts = if (opts) |o| o.memtable else null;
 
-        return .{ .manager = try Manager.new(dir, path, alloc, io, mem_opts) };
+        return .{ .manager = try Manager.new(dir, alloc, io, mem_opts) };
     }
 
     /// De-initializes db session

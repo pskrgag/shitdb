@@ -77,6 +77,14 @@ pub const WalTable = struct {
         return s;
     }
 
+    pub fn assert_immutable(self: *WalTable) void {
+        std.debug.assert(self.get_state() == .immutable);
+    }
+
+    pub fn assert_no_users(self: *WalTable) void {
+        std.debug.assert(self.in_progress.counter.load(.monotonic) == 0);
+    }
+
     fn assert_active(self: *WalTable) void {
         std.debug.assert(self.get_state() == .active);
     }

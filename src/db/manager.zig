@@ -20,8 +20,6 @@ pub const Manager = struct {
     active: std.atomic.Value(*WalTable),
     // Root folder
     root: Dir,
-    // Root path
-    path: []const u8,
     // Mutex that protects new table creation
     new_table_lock: Mutex,
     // MemTable options
@@ -37,7 +35,7 @@ pub const Manager = struct {
 
     const Self = @This();
 
-    pub fn new(dir: Dir, path: []const u8, alloc: Allocator, io: std.Io, opts: ?MemTableOpts) !Self {
+    pub fn new(dir: Dir, alloc: Allocator, io: std.Io, opts: ?MemTableOpts) !Self {
         const real_opts = opts orelse MemTableOpts.default();
         const stat = try Statistics.new(alloc);
         errdefer stat.deinit(alloc);
@@ -47,7 +45,15 @@ pub const Manager = struct {
         slab.* = try MemTableSlab.init(alloc, io);
         errdefer slab.deinit(alloc);
 
-        const version = try Version.from_file_with_slab(dir, "MANIFEST", real_opts, stat, slab, io, alloc);
+        const version = try Version.from_file_with_slab(
+            dir,
+            "MANIFEST",
+            real_opts,
+            stat,
+            slab,
+            io,
+            alloc,
+        );
         const new_file_seq = version.new_file_seq();
         const new_table = slab.alloc();
 
@@ -56,7 +62,6 @@ pub const Manager = struct {
         return .{
             .version = version,
             .active = std.atomic.Value(*WalTable).init(new_table),
-            .path = path,
             .root = dir,
             .new_table_lock = Mutex.init,
             .opts = real_opts,
@@ -153,6 +158,9 @@ pub const Manager = struct {
         // here we expect that no other user accesses data-base
         const active = self.active.load(.acquire);
 
+        active.make_immune();
+        active.assert_no_users();
+
         self.version.flush_memtable(active, self.io, self.root, alloc) catch {
             @panic("failed to flush active memtable");
         };
@@ -163,7 +171,6 @@ pub const Manager = struct {
         self.slab.deinit(alloc);
         alloc.destroy(self.slab);
         self.stat.deinit(alloc);
-        self.root.close(self.io);
     }
 };
 
@@ -225,7 +232,7 @@ test "UAF during flush" {
         };
     }
 
-    var manager = try Manager.new(dir, "test_db3", allocator, io, .{ .memtable_size = 5000 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 5000 });
     defer manager.deinit(allocator);
 
     var sched = try test_utils.Scheduler.Scheduler.new(allocator);
@@ -261,7 +268,7 @@ test "In progress insert" {
         };
     }
 
-    var manager = try Manager.new(dir, "test_db3", allocator, io, .{ .memtable_size = 100 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 100 });
     defer manager.deinit(allocator);
 
     var sched = try test_utils.Scheduler.Scheduler.new(allocator);
@@ -299,7 +306,7 @@ test "OOB write" {
         };
     }
 
-    var manager = try Manager.new(dir, "test_db4", allocator, io, .{ .memtable_size = 100 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 100 });
     defer manager.deinit(allocator);
 
     var sched = try test_utils.Scheduler.Scheduler.new(allocator);
@@ -384,7 +391,7 @@ test "Disk search checks newest SSTable first" {
         };
     }
 
-    var manager = try Manager.new(dir, dirname, allocator, io, null);
+    var manager = try Manager.new(dir, allocator, io, null);
     defer manager.deinit(allocator);
 
     try add_test_sstable(&manager, 100, 10, "shared", "old", allocator);
@@ -470,7 +477,7 @@ test "Flusher searches new memtables first" {
         };
     }
 
-    var manager = try Manager.new(dir, dirname, allocator, io, .{ .memtable_size = 200 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
     defer manager.deinit(allocator);
 
     try std.testing.expectEqual(manager.version.flusher.count, 0);
@@ -506,7 +513,7 @@ test "Removed in flusher does not result in disk search" {
         };
     }
 
-    var manager = try Manager.new(dir, dirname, allocator, io, .{ .memtable_size = 200 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
     defer manager.deinit(allocator);
 
     // Flush some tables to disk with real values.
@@ -560,11 +567,11 @@ test "Wal does not include not-inserted entries" {
     }
 
     if (pid == 0) {
-        var manager = Manager.new(dir, dirname, allocator, io, .{
+        var manager = Manager.new(dir, allocator, io, .{
             .memtable_size = memtable_size,
         }) catch |e| {
             std.debug.print("Unexpected error returned during create {}\n", .{e});
-            std.posix.system.exit(0);
+            std.process.exit(0);
         };
 
         var key_buf: [10]u8 = undefined;
@@ -574,7 +581,7 @@ test "Wal does not include not-inserted entries" {
 
         std.testing.expectEqual(expected_kv_size, KeyValue.calculate_size(key, value)) catch |e| {
             std.debug.print("Unexpected size of KV {}\n", .{e});
-            std.posix.system.exit(0);
+            std.process.exit(0);
         };
 
         for (1..iterations) |i| {
@@ -583,12 +590,12 @@ test "Wal does not include not-inserted entries" {
 
             manager.put(key, value, allocator) catch {
                 std.debug.print("Unexpected error returned during put\n", .{});
-                std.posix.system.exit(0);
+                std.process.exit(0);
             };
         }
 
         // This is should be unreachable
-        std.posix.system.exit(0);
+        std.process.exit(0);
     } else {
         var status: u32 = 0;
         const res = std.posix.system.waitpid(@intCast(pid), &status, 0);
@@ -606,7 +613,7 @@ test "Wal does not include not-inserted entries" {
     @memset(key, 'a' + @as(u8, @intCast(iterations - 1)));
 
     // Now reopen it
-    var manager = try Manager.new(dir, dirname, allocator, io, null);
+    var manager = try Manager.new(dir, allocator, io, null);
     defer manager.deinit(allocator);
 
     // Failed one should not be there
@@ -620,4 +627,139 @@ test "Wal does not include not-inserted entries" {
 
         try std.testing.expectEqualSlices(u8, val, key);
     }
+}
+
+test "WAL GC no crash" {
+    const Wal = @import("wal.zig").Wal;
+
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "wal_gc";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    const dir = try openOrCreateDir(io, dirname);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    {
+        var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+        defer manager.deinit(allocator);
+
+        // Flush some memtables
+        while (manager.version.stat.read(.memtable_flush) < 3) {
+            try manager.put("a" ** 10, "a" ** 10, allocator);
+        }
+    }
+
+    // Reopen it. Should read current manifest and GC old WALs.
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    defer manager.deinit(allocator);
+
+    var diriter = dir.iterate();
+
+    var wals: usize = 0;
+
+    while (try diriter.next(io)) |entry| {
+        const is_wal = Wal.is_wal_name(entry.name);
+
+        if (is_wal) {
+            const stat = try dir.statFile(io, entry.name, .{ .follow_symlinks = false });
+
+            // It must be empty, since it's for the current memtable.
+            try std.testing.expectEqual(stat.size, 0);
+        }
+
+        wals += @intFromBool(is_wal);
+    }
+
+    // There is one empty WAL for the current active table. Others must be deleted.
+    try std.testing.expectEqual(wals, 1);
+}
+
+test "WAL GC crash" {
+    const Wal = @import("wal.zig").Wal;
+    const builtin = @import("builtin");
+
+    // Zig spawns threads, so fork in multi-threaded env is not really supported
+    // (tho whole test is unsafe)
+    if (builtin.sanitize_thread) {
+        return;
+    }
+
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "wal_gc_crash";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    const dir = try openOrCreateDir(io, dirname);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    const pid = std.posix.system.fork();
+    if (pid == -1) {
+        std.debug.print("Failed to fork\n", .{});
+        return error.ForkFailed;
+    }
+
+    if (pid == 0) {
+        var manager = Manager.new(dir, allocator, io, .{
+            .memtable_size = 500,
+        }) catch |e| {
+            std.debug.print("Unexpected error returned during create {}\n", .{e});
+            std.process.exit(0);
+        };
+
+        // Insert something, so WAL is active and should not be GCed
+        manager.put("a" ** 10, "a" ** 10, allocator) catch |e| {
+            std.debug.print("Unexpected error returned during put{}\n", .{e});
+            std.process.exit(0);
+        };
+
+        std.process.exit(255);
+    } else {
+        var status: u32 = 0;
+        const res = std.posix.system.waitpid(@intCast(pid), &status, 0);
+
+        if (res == -1) {
+            std.debug.print("Failed to wait\n", .{});
+            return error.WaitPidFailed;
+        }
+
+        try std.testing.expect(status != 0);
+    }
+
+    // Reopen it. Should read current manifest and GC old WALs.
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    defer manager.deinit(allocator);
+
+    var diriter = dir.iterate();
+    var wals: usize = 0;
+
+    while (try diriter.next(io)) |entry| {
+        const is_wal = Wal.is_wal_name(entry.name);
+        wals += @intFromBool(is_wal);
+    }
+
+    // There should be one WAL. And it should contain pushed value.
+    try std.testing.expectEqual(wals, 1);
+
+    const value = (try manager.get("a" ** 10, allocator)).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualSlices(u8, "a" ** 10, value);
 }

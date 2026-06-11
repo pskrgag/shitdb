@@ -45,13 +45,14 @@ pub const Flusher = struct {
     fn flush_one(self: *Flusher) !void {
         const first = self.list[0].?;
 
+        first.assert_immutable();
+
         @memmove(self.list[0 .. MaxNumTables - 1], self.list[1..MaxNumTables]);
         self.list[MaxNumTables - 1] = null;
         self.count -= 1;
 
         first.wait_no_users();
         try self.version.flush_memtable(first, self.io, self.dir, self.alloc);
-
         first.deinit(self.alloc);
 
         if (self.version.slab) |slab|
@@ -107,6 +108,8 @@ pub const Flusher = struct {
     }
 
     pub fn insert(self: *Flusher, table: *WalTable) void {
+        table.assert_immutable();
+
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
@@ -142,16 +145,20 @@ pub const Flusher = struct {
     }
 
     pub fn deinit(self: *Flusher, alloc: Allocator) void {
-        self.mutex.lockUncancelable(self.io);
-        self.stop.store(true, .monotonic);
-        self.empty_cv.broadcast(self.io);
-        self.full_cv.broadcast(self.io);
-        self.mutex.unlock(self.io);
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+
+            self.stop.store(true, .monotonic);
+            self.empty_cv.broadcast(self.io);
+            self.full_cv.broadcast(self.io);
+        }
 
         self.thread.join();
 
-        while (self.count > 0)
+        while (self.count > 0) {
             self.flush_one() catch @panic("Failed to flush MemTable during deinit");
+        }
 
         alloc.destroy(self);
     }

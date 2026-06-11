@@ -89,6 +89,17 @@ pub const Wal = struct {
         return .{ .file = file };
     }
 
+    pub fn is_wal_name(name: []const u8) bool {
+        return std.mem.startsWith(u8, name, "WAL") and std.mem.endsWith(u8, name, ".sst");
+    }
+
+    pub fn unlink(dir: Dir, seq: FileSeq, io: std.Io, alloc: Allocator) !void {
+        const name = try Wal.file_name(alloc, seq);
+        defer alloc.free(name);
+
+        try dir.deleteFile(io, name);
+    }
+
     pub fn new(dir: Dir, seq: FileSeq, version: ?*Version, io: Io, alloc: Allocator) !Wal {
         const name = try Wal.file_name(alloc, seq);
         defer alloc.free(name);
@@ -110,7 +121,7 @@ pub const Wal = struct {
         // Here we rely on Linux behavior regarding concurrent file writes from the threads of the _same process_.
         //
         // man 2 write:
-        //        Among  the  APIs  subsequently  listed  are  write()  and  writev(2).   And among the effects that 
+        //        Among  the  APIs  subsequently  listed  are  write()  and  writev(2).   And among the effects that
         //        should be atomic across threads (and processes) are updates of the file offset.
         //
         // So we allocate enough heap buffer, write to it and atomically dump it to the disk. Test at the end sanity-checks
