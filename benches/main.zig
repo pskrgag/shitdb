@@ -1,6 +1,7 @@
 const std = @import("std");
 const zbench = @import("zbench");
 const skiplist = @import("skiplist.zig");
+const db = @import("db.zig");
 
 fn noop(allocator: std.mem.Allocator) void {
     _ = allocator;
@@ -21,5 +22,6 @@ pub fn main() !void {
     defer bench.deinit();
 
     try skiplist.add_benches(&bench);
+    try db.add_benches(&bench);
     try bench.run(io, stdout);
 }

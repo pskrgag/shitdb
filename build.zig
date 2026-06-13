@@ -87,9 +87,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .omit_frame_pointer = false,
             .sanitize_thread = tsan,
+            .error_tracing = true,
             .imports = &.{
                 .{ .name = "zbench", .module = zbench_module },
                 .{ .name = "skiplist", .module = skiplist },
+                .{ .name = "db", .module = db },
             },
         }),
     });

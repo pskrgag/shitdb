@@ -7,6 +7,7 @@ const BackgroundThreadCount = 7;
 const PinnedThreadCount = BackgroundThreadCount + 1;
 var List: SkipList(usize) = undefined;
 var Allocator = std.heap.DebugAllocator(.{}){};
+var Arena = std.heap.ArenaAllocator.init(Allocator.allocator());
 var Thread: std.Thread = undefined;
 var BackgroundThreads: [BackgroundThreadCount]std.Thread = undefined;
 var OriginalCpuSet: std.os.linux.cpu_set_t = undefined;
@@ -146,8 +147,18 @@ fn teardown_thread() void {
     free_list();
 }
 
+fn create_name(prefix: []const u8) []const u8 {
+    return std.fmt.allocPrint(Allocator.allocator(), "{s}. Count {d} Value size {}", .{
+        prefix,
+        ListSize,
+        @sizeOf(usize),
+    }) catch {
+        @panic("Failed to allocate name");
+    };
+}
+
 pub fn add_benches(bench: *zbench.Benchmark) !void {
-    try bench.add("Push linear ST", push_linear, .{
+    try bench.add(create_name("Push linear ST"), push_linear, .{
         .hooks = .{
             .before_each = allocate_list,
             .after_each = free_list,
@@ -155,7 +166,7 @@ pub fn add_benches(bench: *zbench.Benchmark) !void {
         .iterations = 5,
     });
 
-    try bench.add("Push random ST", push_random, .{
+    try bench.add(create_name("Push random ST"), push_random, .{
         .hooks = .{
             .before_each = allocate_list,
             .after_each = free_list,
@@ -163,18 +174,10 @@ pub fn add_benches(bench: *zbench.Benchmark) !void {
         .iterations = 5,
     });
 
-    try bench.add("Push random ST with 7 pinned writers", push_random, .{
+    try bench.add(create_name("Push random ST with 7 pinned writers"), push_random, .{
         .hooks = .{
             .before_each = setup_pinned_background_threads,
             .after_each = teardown_pinned_background_threads,
-        },
-        .iterations = 5,
-    });
-
-    try bench.add("Push random 2 threads", push_random, .{
-        .hooks = .{
-            .before_each = setup_thread,
-            .after_each = teardown_thread,
         },
         .iterations = 5,
     });
