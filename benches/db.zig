@@ -1,6 +1,7 @@
 const std = @import("std");
 const zbench = @import("zbench");
 const db_mod = @import("db");
+const SkipListPrng = @import("skiplist").Prng;
 
 const Db = db_mod.KeyValue;
 const DbOptions = db_mod.KeyValueOptions;
@@ -74,6 +75,7 @@ fn open_db(memtable_size: usize) void {
         @panic("failed to open benchmark db");
     };
 
+    SkipListPrng.reset();
     DbActive = true;
 }
 

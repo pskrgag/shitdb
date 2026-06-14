@@ -1,6 +1,7 @@
 const std = @import("std");
 const zbench = @import("zbench");
 const SkipList = @import("skiplist").SkipList;
+const SkipListPrng = @import("skiplist").Prng;
 
 const ListSize = 1_000_000;
 const BackgroundThreadCount = 7;
@@ -117,6 +118,9 @@ fn allocate_list() void {
     ) catch {
         @panic("Failed to allocate list");
     };
+
+    Prng = std.Random.DefaultPrng.init(0x1234_5678_9abc_def0);
+    SkipListPrng.reset();
 }
 
 fn free_list() void {
@@ -163,7 +167,7 @@ pub fn add_benches(bench: *zbench.Benchmark) !void {
             .before_each = allocate_list,
             .after_each = free_list,
         },
-        .iterations = 5,
+        .iterations = 50,
     });
 
     try bench.add(create_name("Push random ST"), push_random, .{
@@ -171,7 +175,7 @@ pub fn add_benches(bench: *zbench.Benchmark) !void {
             .before_each = allocate_list,
             .after_each = free_list,
         },
-        .iterations = 5,
+        .iterations = 50,
     });
 
     try bench.add(create_name("Push random ST with 7 pinned writers"), push_random, .{

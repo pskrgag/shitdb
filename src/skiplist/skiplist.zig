@@ -5,6 +5,7 @@ pub const Arena = @import("arena.zig").ThreadSafeArena;
 pub const ArenaBouned = @import("arena.zig").ThreadSafeArenaBounded;
 const thread_prng = @import("prng.zig").prng;
 
+pub const Prng = @import("prng.zig");
 const MaxHeigth = 12;
 
 fn NodeRef(T: type) type {

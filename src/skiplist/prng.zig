@@ -6,3 +6,7 @@ threadlocal var Prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0x123
 pub fn prng() *std.Random.DefaultPrng {
     return &Prng;
 }
+
+pub fn reset() void {
+    Prng = std.Random.DefaultPrng.init(0x1234_5678_9abc_def0);
+}

@@ -8,6 +8,7 @@ const std = @import("std");
 // know when a step doesn't need to be re-run).
 pub fn build(b: *std.Build) void {
     const tsan = b.option(bool, "tsan", "Enable ThreadSanitizer") orelse false;
+
     // Standard target options allow the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
@@ -85,8 +86,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benches/main.zig"),
             .target = target,
             .optimize = optimize,
-            .omit_frame_pointer = false,
-            .sanitize_thread = tsan,
             .error_tracing = true,
             .imports = &.{
                 .{ .name = "zbench", .module = zbench_module },
