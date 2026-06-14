@@ -53,7 +53,7 @@ pub const Flusher = struct {
 
         first.wait_no_users();
         try self.version.flush_memtable(first, self.io, self.dir, self.alloc);
-        first.deinit(self.alloc);
+        first.deinit(self.alloc) catch @panic("Failed to deinit flushed MemTable");
 
         if (self.version.slab) |slab|
             slab.free(first)

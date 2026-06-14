@@ -9,6 +9,9 @@ const VersionEdit = @import("version.zig").VersionEdit;
 const Crc32 = std.hash.Crc32;
 const KVSeq = @import("storage").KVSeq;
 const FileSeq = @import("storage").manifest.FileSeq;
+const KeyValue = @import("storage").KeyValue;
+const Value = std.atomic.Value;
+const BufferWriter = @import("buffer_writer.zig").BufferWriter;
 
 const AddMagic: u8 = 0x10;
 const RemoveMagic: u8 = 0x12;
@@ -26,6 +29,21 @@ pub const WalEntry = union(enum) {
         key: []const u8,
         seq: KVSeq,
     },
+
+    // Since we know in advance how many bytes of payload we will have, we can can precompute
+    // maximum amount of data user can write.
+    fn precalculate_size(memtable_size: usize) usize {
+        // Given the smallest key we can calculate how many WAL records we will have.
+        const min_kv_size = KeyValue.calculate_size("a", null);
+        const max_records = (memtable_size / min_kv_size) + 1;
+        const wal_max_overhead = (WalEntry{ .Add = .{
+            .key = "a",
+            .value = "a",
+            .seq = KVSeq.init(0),
+        } }).full_size() - 2;
+
+        return memtable_size + max_records * wal_max_overhead;
+    }
 
     fn string_size(slice: []const u8) usize {
         return 8 + slice.len;
@@ -75,6 +93,10 @@ pub const WalEntry = union(enum) {
 pub const Wal = struct {
     // WAL file
     file: File,
+    // Offset within file
+    offset: Value(usize),
+    // Mmaped file
+    data: ?[]u8,
 
     fn file_name(alloc: Allocator, seq: FileSeq) ![]const u8 {
         const res = std.fmt.allocPrint(alloc, "WAL{}.sst", .{seq.get()});
@@ -86,7 +108,7 @@ pub const Wal = struct {
         defer alloc.free(name);
 
         const file = try dir.openFile(io, name, .{ .mode = .read_write });
-        return .{ .file = file };
+        return .{ .file = file, .offset = Value(usize).init(0), .data = null };
     }
 
     pub fn is_wal_name(name: []const u8) bool {
@@ -100,11 +122,31 @@ pub const Wal = struct {
         try dir.deleteFile(io, name);
     }
 
-    pub fn new(dir: Dir, seq: FileSeq, version: ?*Version, io: Io, alloc: Allocator) !Wal {
+    pub fn new(
+        dir: Dir,
+        seq: FileSeq,
+        version: ?*Version,
+        memtable_size: usize,
+        io: Io,
+        alloc: Allocator,
+    ) !Wal {
         const name = try Wal.file_name(alloc, seq);
         defer alloc.free(name);
 
         const file = try dir.createFile(io, name, .{ .read = true });
+        errdefer file.close(io);
+        const file_size = WalEntry.precalculate_size(memtable_size);
+
+        try file.setLength(io, file_size);
+        const mmap = try std.posix.mmap(
+            null,
+            file_size,
+            .{ .READ = true, .WRITE = true },
+            .{ .TYPE = .SHARED },
+            file.handle,
+            0,
+        );
+        errdefer std.posix.munmap(mmap);
 
         if (version) |v| {
             var edit = try VersionEdit.empty(alloc);
@@ -114,48 +156,73 @@ pub const Wal = struct {
             try v.apply(edit, dir, io, alloc);
         }
 
-        return .{ .file = file };
+        return .{
+            .file = file,
+            .offset = Value(usize).init(0),
+            .data = mmap,
+        };
     }
 
-    pub fn record(self: *Wal, entry: WalEntry, alloc: Allocator, io: Io) !void {
-        // Here we rely on Linux behavior regarding concurrent file writes from the threads of the _same process_.
+    pub fn record(self: *Wal, entry: WalEntry) !void {
+        // TODO: This makes parsing a little bit harder than it should be. Imagine following:
         //
-        // man 2 write:
-        //        Among  the  APIs  subsequently  listed  are  write()  and  writev(2).   And among the effects that
-        //        should be atomic across threads (and processes) are updates of the file offset.
+        //      T1:                                     T2:
         //
-        // So we allocate enough heap buffer, write to it and atomically dump it to the disk. Test at the end sanity-checks
-        // this behavior.
+        //   new_offset = fetchAdd()
+        //
+        //                                            new_offset = fetchAdd();
+        //                                            <writes data>
+        //   crashes.
+        //
+        // It would mean that there is a hole in WAL.
+        //
+        // 1) Need a test for that
+        // 2) Need a parsing fix.
+        const my_offset = self.offset.fetchAdd(entry.full_size(), .monotonic);
+        const data = self.data.?;
+        var w = BufferWriter.init(data[my_offset .. my_offset + entry.full_size()]);
 
-        const buf = try alloc.alloc(u8, entry.full_size());
-        defer alloc.free(buf);
-
-        var fw = self.file.writerStreaming(io, buf);
-        const w = &fw.interface;
+        std.debug.assert(my_offset + entry.full_size() <= self.data.?.len);
 
         switch (entry) {
             .Add => |add| {
-                try w.writeAll(&std.mem.toBytes(AddMagic));
-                try w.writeAll(&std.mem.toBytes(add.key.len));
-                try w.writeAll(add.key);
-                try w.writeAll(&std.mem.toBytes(add.value.len));
-                try w.writeAll(add.value);
-                try w.writeAll(&std.mem.toBytes(add.seq.get()));
-                try w.writeAll(&std.mem.toBytes(entry.checksum()));
+                w.writeAll(&std.mem.toBytes(AddMagic));
+                w.writeAll(&std.mem.toBytes(add.key.len));
+                w.writeAll(add.key);
+                w.writeAll(&std.mem.toBytes(add.value.len));
+                w.writeAll(add.value);
+                w.writeAll(&std.mem.toBytes(add.seq.get()));
+                w.writeAll(&std.mem.toBytes(entry.checksum()));
             },
             .Remove => |rem| {
-                try w.writeAll(&std.mem.toBytes(RemoveMagic));
-                try w.writeAll(&std.mem.toBytes(rem.key.len));
-                try w.writeAll(rem.key);
-                try w.writeAll(&std.mem.toBytes(rem.seq.get()));
-                try w.writeAll(&std.mem.toBytes(entry.checksum()));
+                w.writeAll(&std.mem.toBytes(RemoveMagic));
+                w.writeAll(&std.mem.toBytes(rem.key.len));
+                w.writeAll(rem.key);
+                w.writeAll(&std.mem.toBytes(rem.seq.get()));
+                w.writeAll(&std.mem.toBytes(entry.checksum()));
             },
         }
 
-        try w.flush();
+        // TODO: this is insanely bad! I need to come up with better protocol here.
+        {
+            const page_size = std.heap.page_size_min;
 
-        // tho in case of that error things would be quite fun...
-        try self.file.sync(io);
+            const dt = self.data.?;
+            const base = @intFromPtr(dt.ptr);
+            const mapped_end = base + dt.len;
+
+            const start = @intFromPtr(w.buf.ptr);
+            const end = start + w.buf.len;
+
+            const aligned_start = std.mem.alignBackward(usize, start, page_size);
+            const aligned_end = @min(std.mem.alignForward(usize, end, page_size), mapped_end);
+
+            const off = aligned_start - base;
+            const len = aligned_end - aligned_start;
+
+            // tho in case of that error things would be quite fun...
+            try std.posix.msync(@alignCast(dt[off .. off + len]), std.posix.MSF.SYNC);
+        }
     }
 
     pub fn replay_to(self: *const Wal, to: *WalTable, io: std.Io) !void {
@@ -244,12 +311,20 @@ pub const Wal = struct {
                     iter += @sizeOf(u32);
                     try to.remove_but_record(key, seq);
                 },
+                0 => return,
                 else => return error.InvalidFormat,
             }
         }
     }
 
-    pub fn deinit(self: *Wal, io: std.Io) void {
+    pub fn deinit(self: *Wal, io: std.Io) !void {
+        // Adjust file size to actually written amount.
+        try self.file.setLength(io, self.offset.load(.monotonic));
+
+        if (self.data) |data| {
+            std.posix.munmap(@alignCast(data));
+        }
+
         self.file.close(io);
     }
 };
@@ -257,6 +332,7 @@ pub const Wal = struct {
 // AI SLOP! (thanks for attention)
 
 const testing_io = std.testing.io;
+const TestWalMemtableSize = 1 << 20;
 
 fn openTestDir(dirname: []const u8) !Dir {
     const cwd = Dir.cwd();
@@ -309,7 +385,7 @@ fn expectReplayInvalidFormat(dir: Dir, seq: usize, data: []const u8, alloc: Allo
     defer wal.file.close(testing_io);
 
     var target = try WalTable.new(dir, null, FileSeq.init(seq + 1000), null, testing_io, alloc);
-    defer target.deinit(alloc);
+    defer target.deinit(alloc) catch unreachable;
 
     try std.testing.expectError(error.InvalidFormat, wal.replay_to(&target, testing_io));
 }
@@ -330,9 +406,9 @@ test "WAL serializes add record" {
         };
     }
 
-    var wal = try Wal.new(dir, FileSeq.init(1), null, testing_io, allocator);
-    defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, allocator, testing_io);
+    var wal = try Wal.new(dir, FileSeq.init(1), null, TestWalMemtableSize, testing_io, allocator);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
+    try wal.deinit(testing_io);
 
     const data = try readWalFile(dir, 1, allocator);
     defer allocator.free(data);
@@ -374,9 +450,9 @@ test "WAL serializes remove record" {
         };
     }
 
-    var wal = try Wal.new(dir, FileSeq.init(2), null, testing_io, allocator);
-    defer wal.file.close(testing_io);
-    try wal.record(.{ .Remove = .{ .key = "beta", .seq = KVSeq.init(42) } }, allocator, testing_io);
+    var wal = try Wal.new(dir, FileSeq.init(2), null, TestWalMemtableSize, testing_io, allocator);
+    try wal.record(.{ .Remove = .{ .key = "beta", .seq = KVSeq.init(42) } }, testing_io);
+    try wal.deinit(testing_io);
 
     const data = try readWalFile(dir, 2, allocator);
     defer allocator.free(data);
@@ -414,10 +490,10 @@ test "WAL serializes records in append order" {
         };
     }
 
-    var wal = try Wal.new(dir, FileSeq.init(3), null, testing_io, allocator);
-    defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, allocator, testing_io);
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, allocator, testing_io);
+    var wal = try Wal.new(dir, FileSeq.init(3), null, TestWalMemtableSize, testing_io, allocator);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
+    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, testing_io);
+    try wal.deinit(testing_io);
 
     const data = try readWalFile(dir, 3, allocator);
     defer allocator.free(data);
@@ -475,12 +551,12 @@ test "WAL replay restores add record into target table" {
         };
     }
 
-    var wal = try Wal.new(dir, FileSeq.init(4), null, testing_io, allocator);
+    var wal = try Wal.new(dir, FileSeq.init(4), null, TestWalMemtableSize, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, allocator, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
 
     var target = try WalTable.new(dir, null, FileSeq.init(5), null, testing_io, allocator);
-    defer target.deinit(allocator);
+    defer target.deinit(allocator) catch unreachable;
     try wal.replay_to(&target, testing_io);
 
     const value = try target.get("alpha", KVSeq.init(7), allocator);
@@ -509,12 +585,12 @@ test "WAL replay restores remove record into target table" {
         };
     }
 
-    var wal = try Wal.new(dir, FileSeq.init(6), null, testing_io, allocator);
+    var wal = try Wal.new(dir, FileSeq.init(6), null, TestWalMemtableSize, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, allocator, testing_io);
+    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, testing_io);
 
     var target = try WalTable.new(dir, null, FileSeq.init(7), null, testing_io, allocator);
-    defer target.deinit(allocator);
+    defer target.deinit(allocator) catch unreachable;
     try wal.replay_to(&target, testing_io);
 
     const value = try target.get("alpha", KVSeq.init(8), allocator);
@@ -537,13 +613,13 @@ test "WAL replay applies later remove over earlier add" {
         };
     }
 
-    var wal = try Wal.new(dir, FileSeq.init(8), null, testing_io, allocator);
+    var wal = try Wal.new(dir, FileSeq.init(8), null, TestWalMemtableSize, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, allocator, testing_io);
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, allocator, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
+    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, testing_io);
 
     var target = try WalTable.new(dir, null, FileSeq.init(9), null, testing_io, allocator);
-    defer target.deinit(allocator);
+    defer target.deinit(allocator) catch unreachable;
     try wal.replay_to(&target, testing_io);
 
     const removed = try target.get("alpha", KVSeq.init(8), allocator);
@@ -665,7 +741,7 @@ fn thread_big_insert(wal: *Wal, c: u8, alloc: Allocator) !void {
     while (Stop.load(.monotonic) == false) {
         const entry: WalEntry = .{ .Add = .{ .key = key, .value = value, .seq = KVSeq.init(0) } };
 
-        try wal.record(entry, alloc, testing_io);
+        try wal.record(entry, testing_io);
     }
 }
 
@@ -689,7 +765,7 @@ test "WAL concurency" {
     var threads = try std.ArrayList(std.Thread).initCapacity(allocator, thread_count);
     defer threads.deinit(allocator);
 
-    var wal = try Wal.new(dir, FileSeq.init(0), null, testing_io, allocator);
+    var wal = try Wal.new(dir, FileSeq.init(0), null, 10 << 30, testing_io, allocator);
     const ch: u8 = 'a';
 
     for (0..thread_count) |i| {
@@ -709,7 +785,7 @@ test "WAL concurency" {
 
     // Check WAL sanity
     var target = try WalTable.new(dir, null, FileSeq.init(0), null, testing_io, allocator);
-    defer target.deinit(allocator);
+    defer target.deinit(allocator) catch unreachable;
 
     try wal.replay_to(&target, testing_io);
 }

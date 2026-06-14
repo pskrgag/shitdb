@@ -38,9 +38,11 @@ pub const WalTable = struct {
         io: std.Io,
         alloc: Allocator,
     ) !WalTable {
+        const opts = user_opts orelse MemTableOpts.default();
+
         return .{
-            .table = try MemTable.new(alloc, io, user_opts),
-            .wal = try Wal.new(dir, seq, version, io, alloc),
+            .table = try MemTable.new(alloc, io, opts),
+            .wal = try Wal.new(dir, seq, version, opts.memtable_size, io, alloc),
             .seq = seq,
             .io = io,
             .state = Value(State).init(.active),
@@ -130,7 +132,7 @@ pub const WalTable = struct {
         },
     };
 
-    fn insert(self: *WalTable, action: Action, alloc: Allocator) !void {
+    fn insert(self: *WalTable, action: Action) !void {
         self.in_progress.inc();
         defer self.in_progress.dec();
 
@@ -165,7 +167,7 @@ pub const WalTable = struct {
         // In case of WAL record failure, KV is leaked. Since allocator is bounded arena, there is
         // no way we can return it back.
 
-        try self.wal.record(entry, alloc, self.io);
+        try self.wal.record(entry);
         test_utils.Scheduler.yield(.WalWritten);
 
         try self.table.put_kv(kv);
@@ -173,13 +175,13 @@ pub const WalTable = struct {
     }
 
     /// Puts value from the memtable and records it into WAL
-    pub fn put(self: *WalTable, key: []const u8, value: []const u8, seq: KVSeq, alloc: Allocator) !void {
-        return self.insert(.{ .Put = .{ .key = key, .value = value, .seq = seq } }, alloc);
+    pub fn put(self: *WalTable, key: []const u8, value: []const u8, seq: KVSeq) !void {
+        return self.insert(.{ .Put = .{ .key = key, .value = value, .seq = seq } });
     }
 
     /// Removes value from the memtable and records it into WAL
-    pub fn remove(self: *WalTable, key: []const u8, seq: KVSeq, alloc: Allocator) !void {
-        return self.insert(.{ .Remove = .{ .key = key, .seq = seq } }, alloc);
+    pub fn remove(self: *WalTable, key: []const u8, seq: KVSeq) !void {
+        return self.insert(.{ .Remove = .{ .key = key, .seq = seq } });
     }
 
     /// Retrieves value from the memtable
@@ -203,8 +205,8 @@ pub const WalTable = struct {
     }
 
     /// Deinits table
-    pub fn deinit(self: *WalTable, alloc: Allocator) void {
-        self.wal.deinit(self.io);
+    pub fn deinit(self: *WalTable, alloc: Allocator) !void {
+        try self.wal.deinit(self.io);
         self.table.deinit(alloc);
 
         // if (@import("builtin").mode == .Debug)
