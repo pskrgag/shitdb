@@ -9,6 +9,7 @@ const StackSize = 5 << 20;
 pub const SleepPoint = enum {
     LoadCurrentMemtable,
     WalWritten,
+    WalSlotAllocated,
 
     Test,
     Test1,

@@ -47,6 +47,7 @@ fn allowed_cpus() [PinnedThreadCount]usize {
             if (word & (@as(usize, 1) << @intCast(bit_idx)) != 0) {
                 cpus[cpu_count] = word_idx * @bitSizeOf(usize) + bit_idx;
                 cpu_count += 1;
+
                 if (cpu_count == cpus.len) {
                     return cpus;
                 }
@@ -161,6 +162,20 @@ fn create_name(prefix: []const u8) []const u8 {
     };
 }
 
+fn num_cpus_affinity() !usize {
+    const cpu_set = std.posix.sched_getaffinity(0) catch {
+        @panic("Failed to get CPU affinity");
+    };
+
+    var sum: usize = 0;
+
+    for (cpu_set) |entry| {
+        sum += @popCount(entry);
+    }
+
+    return sum;
+}
+
 pub fn add_benches(bench: *zbench.Benchmark) !void {
     try bench.add(create_name("Push linear ST"), push_linear, .{
         .hooks = .{
@@ -178,11 +193,13 @@ pub fn add_benches(bench: *zbench.Benchmark) !void {
         .iterations = 50,
     });
 
-    try bench.add(create_name("Push random ST with 7 pinned writers"), push_random, .{
-        .hooks = .{
-            .before_each = setup_pinned_background_threads,
-            .after_each = teardown_pinned_background_threads,
-        },
-        .iterations = 5,
-    });
+    if (try num_cpus_affinity() >= 7) {
+        try bench.add(create_name("Push random ST with 7 pinned writers"), push_random, .{
+            .hooks = .{
+                .before_each = setup_pinned_background_threads,
+                .after_each = teardown_pinned_background_threads,
+            },
+            .iterations = 5,
+        });
+    }
 }

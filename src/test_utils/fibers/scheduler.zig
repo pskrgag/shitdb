@@ -88,10 +88,41 @@ pub const Scheduler = struct {
         fiber.switch_from(SchedulerContext.?);
     }
 
+    fn fiber_from_handle(handle: FiberHandle) *Fiber {
+        return @ptrFromInt(handle.ptr);
+    }
+
+    pub fn run_until_sleep(self: *Scheduler, handle: FiberHandle, point: SleepPoint) void {
+        const fiber = fiber_from_handle(handle);
+
+        while (true) {
+            if (fiber.sleep == point)
+                return;
+
+            if (fiber.is_done()) {
+                std.debug.print("Cannot run fiber till sleep point '{}'. It has finished earlier\n", .{point});
+                @panic("Incorrect scheduling plan");
+            }
+
+            self.run_one(fiber);
+        }
+    }
+
+    pub fn run_until_done(self: *Scheduler, handle: FiberHandle, alloc: Allocator) void {
+        const fiber = fiber_from_handle(handle);
+
+        while (!fiber.is_done()) {
+            self.run_one(fiber);
+        }
+
+        self.active.remove(&fiber.node);
+        fiber.deinit(alloc);
+    }
+
     pub fn run_with_plan(self: *Scheduler, plan: SchedulerPlan, alloc: Allocator) !void {
         for (plan.plan.items) |entry| {
             // This is insanely unsafe, but let's assume caller is not an asshole
-            const fiber: *Fiber = @ptrFromInt(entry.fiber.ptr);
+            const fiber = fiber_from_handle(entry.fiber);
 
             switch (entry.run) {
                 .End => {

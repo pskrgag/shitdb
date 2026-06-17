@@ -559,54 +559,34 @@ test "Wal does not include not-inserted entries" {
     const iterations = 11;
     const memtable_size = expected_kv_size * (iterations - 1);
 
-    const pid = std.posix.system.fork();
+    const Child = struct {
+        fn run(
+            child_dir: Dir,
+            child_alloc: Allocator,
+            child_io: std.Io,
+            child_memtable_size: usize,
+        ) !void {
+            var manager = try Manager.new(child_dir, child_alloc, child_io, .{
+                .memtable_size = child_memtable_size,
+            });
 
-    if (pid == -1) {
-        std.debug.print("Failed to fork\n", .{});
-        return error.ForkFailed;
-    }
+            var key_buf: [10]u8 = undefined;
+            var value_buf: [10]u8 = undefined;
+            const key = key_buf[0..];
+            const value = value_buf[0..];
 
-    if (pid == 0) {
-        var manager = Manager.new(dir, allocator, io, .{
-            .memtable_size = memtable_size,
-        }) catch |e| {
-            std.debug.print("Unexpected error returned during create {}\n", .{e});
-            std.process.exit(0);
-        };
+            try std.testing.expectEqual(expected_kv_size, KeyValue.calculate_size(key, value));
 
-        var key_buf: [10]u8 = undefined;
-        var value_buf: [10]u8 = undefined;
-        const key = key_buf[0..];
-        const value = value_buf[0..];
+            for (1..iterations) |i| {
+                @memset(key, 'a' + @as(u8, @intCast(i)));
+                @memset(value, 'a' + @as(u8, @intCast(i)));
 
-        std.testing.expectEqual(expected_kv_size, KeyValue.calculate_size(key, value)) catch |e| {
-            std.debug.print("Unexpected size of KV {}\n", .{e});
-            std.process.exit(0);
-        };
-
-        for (1..iterations) |i| {
-            @memset(key, 'a' + @as(u8, @intCast(i)));
-            @memset(value, 'a' + @as(u8, @intCast(i)));
-
-            manager.put(key, value, allocator) catch {
-                std.debug.print("Unexpected error returned during put\n", .{});
-                std.process.exit(0);
-            };
+                try manager.put(key, value, child_alloc);
+            }
         }
+    };
 
-        // This is should be unreachable
-        std.process.exit(0);
-    } else {
-        var status: u32 = 0;
-        const res = std.posix.system.waitpid(@intCast(pid), &status, 0);
-
-        if (res == -1) {
-            std.debug.print("Failed to wait\n", .{});
-            return error.WaitPidFailed;
-        }
-
-        try std.testing.expect(status != 0);
-    }
+    try test_utils.fork.expectCrash(Child.run, .{ dir, allocator, io, memtable_size });
     var key_buf: [10]u8 = undefined;
     const key = key_buf[0..];
 
@@ -712,38 +692,26 @@ test "WAL GC crash" {
         };
     }
 
-    const pid = std.posix.system.fork();
-    if (pid == -1) {
-        std.debug.print("Failed to fork\n", .{});
-        return error.ForkFailed;
-    }
+    const Child = struct {
+        fn run(child_dir: Dir, child_alloc: Allocator, child_io: std.Io) void {
+            var manager = Manager.new(child_dir, child_alloc, child_io, .{
+                .memtable_size = 500,
+            }) catch |e| {
+                std.debug.print("Unexpected error returned during create {}\n", .{e});
+                std.process.exit(0);
+            };
 
-    if (pid == 0) {
-        var manager = Manager.new(dir, allocator, io, .{
-            .memtable_size = 500,
-        }) catch |e| {
-            std.debug.print("Unexpected error returned during create {}\n", .{e});
-            std.process.exit(0);
-        };
+            // Insert something, so WAL is active and should not be GCed
+            manager.put("a" ** 10, "a" ** 10, child_alloc) catch |e| {
+                std.debug.print("Unexpected error returned during put{}\n", .{e});
+                std.process.exit(0);
+            };
 
-        // Insert something, so WAL is active and should not be GCed
-        manager.put("a" ** 10, "a" ** 10, allocator) catch |e| {
-            std.debug.print("Unexpected error returned during put{}\n", .{e});
-            std.process.exit(0);
-        };
-
-        std.process.exit(255);
-    } else {
-        var status: u32 = 0;
-        const res = std.posix.system.waitpid(@intCast(pid), &status, 0);
-
-        if (res == -1) {
-            std.debug.print("Failed to wait\n", .{});
-            return error.WaitPidFailed;
+            std.process.exit(255);
         }
+    };
 
-        try std.testing.expect(status != 0);
-    }
+    try test_utils.fork.expectCrash(Child.run, .{ dir, allocator, io });
 
     // Reopen it. Should read current manifest and GC old WALs.
     var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });

@@ -80,6 +80,17 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const wal = b.addModule("wal", .{
+        .root_source_file = b.path("src/db/wal.zig"),
+        .target = target,
+        .sanitize_thread = tsan,
+        .imports = &.{
+            .{ .name = "storage", .module = storage },
+            .{ .name = "test_utils", .module = test_utils },
+            .{ .name = "slab", .module = slab },
+        },
+    });
+
     const bench_exe = b.addExecutable(.{
         .name = "kv-bench",
         .root_module = b.createModule(.{
@@ -124,6 +135,14 @@ pub fn build(b: *std.Build) void {
         .use_llvm = tsan,
     });
     const run_db_tests = b.addRunArtifact(db_tests);
+
+    const wal_tests = b.addTest(.{
+        .root_module = wal,
+        .filters = test_filters,
+        .use_llvm = tsan,
+    });
+    const run_wal_tests = b.addRunArtifact(wal_tests);
+
     const iter_tests = b.addTest(.{
         .root_module = merging_iterator,
         .filters = test_filters,
@@ -139,6 +158,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_memtable_tests.step);
     test_step.dependOn(&run_db_tests.step);
     test_step.dependOn(&run_iter_tests.step);
+
+    const wal_test_step = b.step("test-wal", "Run only WAL tests");
+    wal_test_step.dependOn(&run_wal_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

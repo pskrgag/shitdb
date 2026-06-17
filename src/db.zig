@@ -5,6 +5,7 @@ const MemTableOpts = @import("storage").MemTableOpts;
 const Manager = @import("db/manager.zig").Manager;
 const HashTableTest = @import("test_utils").HashTableTest;
 const Dir = std.Io.Dir;
+const test_utils = @import("test_utils");
 
 fn openOrCreateDir(io: std.Io, path: []const u8) !Dir {
     const cwd = Dir.cwd();
@@ -176,39 +177,17 @@ test "WAL startup recovery" {
         };
     }
 
-    const pid = std.posix.system.fork();
+    const Child = struct {
+        fn run(child_alloc: Allocator, child_io: std.Io) !void {
+            var new = try KeyValue.new("test_db4", child_alloc, child_io, null);
 
-    if (pid == -1) {
-        std.debug.print("Failed to fork\n", .{});
-        return error.ForkFailed;
-    }
-
-    if (pid == 0) {
-        var new = KeyValue.new("test_db4", allocator, io, null) catch {
-            std.debug.print("Unexpected error returned during create\n", .{});
-            std.posix.system.exit(0);
-        };
-
-        inline for (1..Repeats * 2) |i| {
-            new.put("a" ** i, "a" ** i, allocator) catch {
-                std.debug.print("Unexpected error returned during put\n", .{});
-                std.posix.system.exit(0);
-            };
+            inline for (1..Repeats * 2) |i| {
+                try new.put("a" ** i, "a" ** i, child_alloc);
+            }
         }
+    };
 
-        // This is should be unreachable
-        std.posix.system.exit(0);
-    } else {
-        var status: u32 = 0;
-        const res = std.posix.system.waitpid(@intCast(pid), &status, 0);
-
-        if (res == -1) {
-            std.debug.print("Failed to wait\n", .{});
-            return error.WaitPidFailed;
-        }
-
-        try std.testing.expect(status != 0);
-    }
+    try test_utils.fork.expectCrash(Child.run, .{ allocator, io });
 
     // Now try to check WAL
     var new = try KeyValue.new("test_db4", allocator, io, null);

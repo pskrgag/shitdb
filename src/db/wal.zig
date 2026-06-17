@@ -12,6 +12,8 @@ const FileSeq = @import("storage").manifest.FileSeq;
 const KeyValue = @import("storage").KeyValue;
 const Value = std.atomic.Value;
 const BufferWriter = @import("buffer_writer.zig").BufferWriter;
+const test_utils = @import("test_utils");
+const fi = test_utils.Injections.fault_injection;
 
 const AddMagic: u8 = 0x10;
 const RemoveMagic: u8 = 0x12;
@@ -183,6 +185,9 @@ pub const Wal = struct {
         var w = BufferWriter.init(data[my_offset .. my_offset + entry.full_size()]);
 
         std.debug.assert(my_offset + entry.full_size() <= self.data.?.len);
+
+        fi.crash(.after_wal_slot_allocation);
+        test_utils.Scheduler.yield(.WalSlotAllocated);
 
         switch (entry) {
             .Add => |add| {
@@ -407,7 +412,7 @@ test "WAL serializes add record" {
     }
 
     var wal = try Wal.new(dir, FileSeq.init(1), null, TestWalMemtableSize, testing_io, allocator);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } });
     try wal.deinit(testing_io);
 
     const data = try readWalFile(dir, 1, allocator);
@@ -451,7 +456,7 @@ test "WAL serializes remove record" {
     }
 
     var wal = try Wal.new(dir, FileSeq.init(2), null, TestWalMemtableSize, testing_io, allocator);
-    try wal.record(.{ .Remove = .{ .key = "beta", .seq = KVSeq.init(42) } }, testing_io);
+    try wal.record(.{ .Remove = .{ .key = "beta", .seq = KVSeq.init(42) } });
     try wal.deinit(testing_io);
 
     const data = try readWalFile(dir, 2, allocator);
@@ -491,8 +496,8 @@ test "WAL serializes records in append order" {
     }
 
     var wal = try Wal.new(dir, FileSeq.init(3), null, TestWalMemtableSize, testing_io, allocator);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } });
+    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } });
     try wal.deinit(testing_io);
 
     const data = try readWalFile(dir, 3, allocator);
@@ -553,7 +558,7 @@ test "WAL replay restores add record into target table" {
 
     var wal = try Wal.new(dir, FileSeq.init(4), null, TestWalMemtableSize, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } });
 
     var target = try WalTable.new(dir, null, FileSeq.init(5), null, testing_io, allocator);
     defer target.deinit(allocator) catch unreachable;
@@ -587,7 +592,7 @@ test "WAL replay restores remove record into target table" {
 
     var wal = try Wal.new(dir, FileSeq.init(6), null, TestWalMemtableSize, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, testing_io);
+    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } });
 
     var target = try WalTable.new(dir, null, FileSeq.init(7), null, testing_io, allocator);
     defer target.deinit(allocator) catch unreachable;
@@ -615,8 +620,8 @@ test "WAL replay applies later remove over earlier add" {
 
     var wal = try Wal.new(dir, FileSeq.init(8), null, TestWalMemtableSize, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }, testing_io);
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }, testing_io);
+    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } });
+    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } });
 
     var target = try WalTable.new(dir, null, FileSeq.init(9), null, testing_io, allocator);
     defer target.deinit(allocator) catch unreachable;
@@ -741,7 +746,7 @@ fn thread_big_insert(wal: *Wal, c: u8, alloc: Allocator) !void {
     while (Stop.load(.monotonic) == false) {
         const entry: WalEntry = .{ .Add = .{ .key = key, .value = value, .seq = KVSeq.init(0) } };
 
-        try wal.record(entry, testing_io);
+        try wal.record(entry);
     }
 }
 
@@ -788,4 +793,65 @@ test "WAL concurency" {
     defer target.deinit(allocator) catch unreachable;
 
     try wal.replay_to(&target, testing_io);
+}
+
+fn push_to_wal(wal: *Wal, count: usize) !void {
+    var key: [200]u8 = undefined;
+    var value: [200]u8 = undefined;
+
+    @memset(&key, 'a');
+    @memset(&value, 'b');
+
+    for (0..count) |_| {
+        const entry: WalEntry = .{ .Add = .{
+            .key = &key,
+            .value = &value,
+            .seq = KVSeq.init(0),
+        } };
+
+        try wal.record(entry);
+    }
+}
+
+test "WAL hole" {
+    const prefix_records = 1;
+    const records_after_hole = 10;
+
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+    const dirname = "test_wal_hole_parsing";
+
+    var dir = try openTestDir(dirname);
+    defer {
+        dir.close(testing_io);
+        Dir.cwd().deleteTree(testing_io, dirname) catch {
+            @panic("failed to delete test wal dir");
+        };
+    }
+
+    var wal = try Wal.new(dir, FileSeq.init(0), null, 10 << 30, testing_io, allocator);
+    defer {
+        wal.deinit(testing_io) catch @panic("oh oh");
+    }
+
+    try push_to_wal(&wal, prefix_records);
+
+    var sched = try test_utils.Scheduler.Scheduler.new(allocator);
+    defer sched.deinit(allocator);
+
+    const first_writer = try sched.spawn(push_to_wal, .{ &wal, 1 }, allocator);
+    const second_writer = try sched.spawn(push_to_wal, .{ &wal, records_after_hole }, allocator);
+
+    sched.run_until_sleep(first_writer, .WalSlotAllocated);
+    sched.run_until_done(second_writer, allocator);
+
+    // Check WAL sanity.
+    var target = try WalTable.new(dir, null, FileSeq.init(1), null, testing_io, allocator);
+    defer target.deinit(allocator) catch @panic("oh oh");
+    try wal.replay_to(&target, testing_io);
+
+    try std.testing.expectEqual(@as(usize, prefix_records + records_after_hole), target.len());
 }

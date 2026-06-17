@@ -4,6 +4,7 @@ const Value = std.atomic.Value;
 pub const PanicKind = enum {
     after_wal,
     after_insert_oom,
+    after_wal_slot_allocation,
 };
 
 const PanicPoint = struct {
@@ -34,8 +35,9 @@ pub fn crash(comptime kind: PanicKind) void {
 
     const val = PanicPoints.getPtr(kind);
     if (val) |v| {
-        if (v.count.fetchSub(1, .monotonic) == 1)
+        if (v.count.fetchSub(1, .monotonic) == 1) {
             std.process.abort();
+        }
     }
 }
 

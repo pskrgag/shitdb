@@ -27,6 +27,7 @@ pub const WalTable = struct {
     seq: FileSeq,
     io: std.Io,
     state: Value(State),
+    count: Value(usize),
     in_progress: SleepingCounter,
 
     /// Constructs new WAL+MemTable
@@ -47,6 +48,7 @@ pub const WalTable = struct {
             .io = io,
             .state = Value(State).init(.active),
             .in_progress = SleepingCounter.init(),
+            .count = Value(usize).init(0),
         };
     }
 
@@ -65,6 +67,7 @@ pub const WalTable = struct {
             .io = io,
             .state = Value(State).init(.active),
             .in_progress = SleepingCounter.init(),
+            .count = Value(usize).init(0),
         };
 
         try self.wal.replay_to(&self, io);
@@ -106,12 +109,14 @@ pub const WalTable = struct {
 
     /// Special wrapper for WAL replay
     pub fn put_but_record(self: *WalTable, key: []const u8, value: []const u8, seq: KVSeq) !void {
+        _ = self.count.fetchAdd(1, .monotonic);
         self.assert_active();
         try self.table.put(key, value, seq);
     }
 
     /// Special wrapper for WAL replay
     pub fn remove_but_record(self: *WalTable, key: []const u8, seq: KVSeq) !void {
+        _ = self.count.fetchAdd(1, .monotonic);
         self.assert_active();
         try self.table.remove(key, seq);
     }
@@ -137,6 +142,7 @@ pub const WalTable = struct {
         defer self.in_progress.dec();
 
         try self.guard_active();
+        _ = self.count.fetchAdd(1, .monotonic);
 
         var kv: KeyValue = undefined;
         var entry: WalEntry = undefined;
@@ -202,6 +208,11 @@ pub const WalTable = struct {
     /// Returns minimal key
     pub fn max_seq(self: *WalTable) KVSeq {
         return self.table.max_seq.load(.monotonic);
+    }
+
+    /// Number of entries
+    pub fn len(self: *WalTable) usize {
+        return self.count.load(.monotonic);
     }
 
     /// Deinits table
