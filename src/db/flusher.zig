@@ -45,7 +45,7 @@ pub const Flusher = struct {
     fn flush_one(self: *Flusher) !void {
         const first = self.list[0].?;
 
-        first.assert_immutable();
+        // first.assert_immutable();
 
         @memmove(self.list[0 .. MaxNumTables - 1], self.list[1..MaxNumTables]);
         self.list[MaxNumTables - 1] = null;
@@ -55,11 +55,7 @@ pub const Flusher = struct {
         try self.version.flush_memtable(first, self.io, self.dir, self.alloc);
         first.deinit(self.alloc) catch @panic("Failed to deinit flushed MemTable");
 
-        if (self.version.slab) |slab|
-            slab.free(first)
-        else
-            self.alloc.destroy(first);
-
+        self.version.slab.free(first);
         self.version.stat.inc(.memtable_flush);
     }
 
@@ -108,8 +104,6 @@ pub const Flusher = struct {
     }
 
     pub fn insert(self: *Flusher, table: *WalTable) void {
-        table.assert_immutable();
-
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 

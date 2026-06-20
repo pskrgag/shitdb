@@ -1,19 +1,16 @@
 const std = @import("std");
 const MemTable = @import("storage").MemTable;
 const Wal = @import("wal.zig").Wal;
-const WalEntry = @import("wal.zig").WalEntry;
 const Allocator = std.mem.Allocator;
 const MemTableOpts = @import("storage").MemTableOpts;
 const GetResult = @import("storage").GetResult;
 const KeyValue = @import("storage").KeyValue;
 const KVSeq = @import("storage").KVSeq;
 const FileSeq = @import("storage").manifest.FileSeq;
-const test_utils = @import("test_utils");
-const fi = test_utils.Injections;
 const Version = @import("version.zig").Version;
-const VersionEdit = @import("version.zig").VersionEdit;
 const Value = std.atomic.Value;
 const SleepingCounter = @import("sleeping_count.zig").SleepingCounter;
+const Transaction = @import("manager.zig").Transaction;
 
 pub const State = enum(u8) {
     active,
@@ -43,7 +40,7 @@ pub const WalTable = struct {
 
         return .{
             .table = try MemTable.new(alloc, io, opts),
-            .wal = try Wal.new(dir, seq, version, opts.memtable_size, io, alloc),
+            .wal = try Wal.new(dir, seq, version, io, alloc),
             .seq = seq,
             .io = io,
             .state = Value(State).init(.active),
@@ -82,22 +79,8 @@ pub const WalTable = struct {
         return s;
     }
 
-    pub fn assert_immutable(self: *WalTable) void {
-        std.debug.assert(self.get_state() == .immutable);
-    }
-
-    pub fn assert_no_users(self: *WalTable) void {
-        std.debug.assert(self.in_progress.counter.load(.monotonic) == 0);
-    }
-
     fn assert_active(self: *WalTable) void {
         std.debug.assert(self.get_state() == .active);
-    }
-
-    fn guard_active(self: *WalTable) !void {
-        if (self.get_state() != .active) {
-            return error.Immutable;
-        }
     }
 
     pub fn make_immune(self: *WalTable) void {
@@ -125,69 +108,57 @@ pub const WalTable = struct {
         self.in_progress.wait_zero();
     }
 
-    const Action = union(enum) {
-        Put: struct {
-            key: []const u8,
-            value: []const u8,
-            seq: KVSeq,
-        },
-        Remove: struct {
-            key: []const u8,
-            seq: KVSeq,
-        },
-    };
+    /// Tries to commit transaction. May commit only part of it
+    pub fn commit(self: *WalTable, trans: *Transaction, alloc: Allocator) !bool {
+        var full = true;
+        var iter = trans.iter();
+        var kvs = try std.ArrayList(KeyValue).initCapacity(alloc, 0);
+        var commited = Transaction{};
+        defer kvs.deinit(alloc);
 
-    fn insert(self: *WalTable, action: Action) !void {
-        self.in_progress.inc();
-        defer self.in_progress.dec();
+        // Pre-allocate as much as possible in the memtable allocator. If it's not possible
+        // to allocate, these pending writes will be left for future.
+        while (iter.next()) |*i| {
+            switch (i.*.op) {
+                .Put => |p| {
+                    const kv = self.table.create_add_kv(p.key, p.value, p.seq) catch |e| {
+                        if (e == error.MemTableFull) {
+                            full = false;
+                            break;
+                        }
 
-        try self.guard_active();
-        _ = self.count.fetchAdd(1, .monotonic);
+                        return e;
+                    };
 
-        var kv: KeyValue = undefined;
-        var entry: WalEntry = undefined;
+                    try kvs.append(alloc, kv);
+                },
+                .Remove => |p| {
+                    const kv = self.table.create_remove_kv(p.key, p.seq) catch |e| {
+                        if (e == error.MemTableFull) {
+                            full = false;
+                            break;
+                        }
 
-        switch (action) {
-            .Put => |p| {
-                kv = self.table.create_add_kv(p.key, p.value, p.seq) catch |e| {
-                    if (e == error.OutOfMemory) {
-                        fi.fault_injection.crash(.after_insert_oom);
-                    }
+                        return e;
+                    };
 
-                    return e;
-                };
-                entry = .{ .Add = .{ .key = p.key, .value = p.value, .seq = p.seq } };
-            },
-            .Remove => |r| {
-                kv = self.table.create_remove_kv(r.key, r.seq) catch |e| {
-                    if (e == error.OutOfMemory) {
-                        fi.fault_injection.crash(.after_insert_oom);
-                    }
+                    try kvs.append(alloc, kv);
+                },
+            }
 
-                    return e;
-                };
-                entry = .{ .Remove = .{ .key = r.key, .seq = r.seq } };
-            },
+            trans.ops.remove(&i.*.active_node);
+            commited.push_active(i.*);
         }
 
-        // In case of WAL record failure, KV is leaked. Since allocator is bounded arena, there is
-        // no way we can return it back.
+        // At this point we have entries that fit into memtable. Try to commit them to WAL.
+        try self.wal.commit(commited, self.io, alloc);
 
-        try self.wal.record(entry);
-        test_utils.Scheduler.yield(.WalWritten);
+        // And then commit to active table. It must not fail, since memory was reserved.
+        for (kvs.items) |kv| {
+            self.table.put_kv(kv) catch @panic("must not panic here");
+        }
 
-        try self.table.put_kv(kv);
-        fi.fault_injection.crash(.after_wal);
-    }
-
-    /// Puts value from the memtable and records it into WAL
-    pub fn put(self: *WalTable, key: []const u8, value: []const u8, seq: KVSeq) !void {
-        return self.insert(.{ .Put = .{ .key = key, .value = value, .seq = seq } });
-    }
-
-    /// Removes value from the memtable and records it into WAL
-    pub fn remove(self: *WalTable, key: []const u8, seq: KVSeq) !void {
-        return self.insert(.{ .Remove = .{ .key = key, .seq = seq } });
+        return full;
     }
 
     /// Retrieves value from the memtable

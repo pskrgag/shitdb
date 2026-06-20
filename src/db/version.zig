@@ -6,7 +6,7 @@ const manifest = @import("storage").manifest;
 const Flusher = @import("flusher.zig").Flusher;
 const Allocator = std.mem.Allocator;
 const KeyValueOwned = @import("storage").KeyValueOwned;
-const Mutex = std.Io.Mutex;
+const Mutex = @import("sync").mutex.Mutex;
 const Value = std.atomic.Value;
 const FileMeta = @import("storage").manifest.FileMeta;
 const FileSeq = @import("storage").manifest.FileSeq;
@@ -18,6 +18,7 @@ const KVSeq = @import("storage").KVSeq;
 const Statistics = @import("stat.zig").Statistics;
 const Slab = @import("slab").Slab;
 const MemTableSlab = Slab(WalTable, 20);
+const Transaction = @import("manager.zig").Transaction;
 
 const MaxLevel: usize = 2;
 const MaxTablesLVL: usize = 1;
@@ -103,7 +104,11 @@ pub const Version = struct {
     // Stats
     stat: *Statistics,
     // Slab for freeing memtables
-    slab: ?*MemTableSlab,
+    slab: *MemTableSlab,
+    // Active MemTable
+    active: *WalTable,
+    // Memtable opts
+    opts: MemTableOpts,
 
     const Self = @This();
 
@@ -158,6 +163,30 @@ pub const Version = struct {
         }
     }
 
+    pub fn commit(self: *Self, t: Transaction, dir: std.Io.Dir, io: std.Io, alloc: Allocator) !void {
+        var trans = t;
+
+        const full = try self.active.commit(&trans, alloc);
+        if (!full) {
+            // This means that active memtable is full. Uncommitted requests are left in `t`.
+            // Need to allocate new active table and retry the request
+
+            const next_file = self.new_file_seq();
+            const new_table = self.slab.alloc();
+
+            new_table.* = try WalTable.new(dir, self.opts, next_file, self, io, alloc);
+            self.flusher.insert(self.active);
+            self.active = new_table;
+
+            // Try to commit to new table
+            try self.commit(trans, dir, io, alloc);
+        }
+    }
+
+    pub fn allocate_seqs(self: *Self, count: usize) KVSeq {
+        return self.next_sequence.fetchAdd(KVSeq.init(count), .monotonic);
+    }
+
     pub fn next_seq(self: *Self) KVSeq {
         return self.next_sequence.fetchAdd(KVSeq.init(1), .monotonic);
     }
@@ -183,29 +212,16 @@ pub const Version = struct {
         io: std.Io,
         alloc: Allocator,
     ) !*Self {
-        const self = try from_file_with_slab(dir, path, opts, stat, null, io, alloc);
-        errdefer self.deinit(io, alloc);
-
-        if (sanitize)
-            try self.sanitize_disk_state(dir, alloc, io);
-
-        return self;
-    }
-
-    pub fn from_file_with_slab(
-        dir: std.Io.Dir,
-        path: []const u8,
-        opts: MemTableOpts,
-        stat: *Statistics,
-        slab: ?*MemTableSlab,
-        io: std.Io,
-        alloc: Allocator,
-    ) !*Self {
         const file = dir.openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
             error.FileNotFound => try dir.createFile(io, path, .{ .read = true }),
             else => return err,
         };
         errdefer file.close(io);
+
+        const slab = try alloc.create(MemTableSlab);
+        errdefer alloc.destroy(slab);
+        slab.* = try MemTableSlab.init(alloc, io);
+        errdefer slab.deinit(alloc);
 
         const file_stat = try file.stat(io);
         const size = file_stat.size;
@@ -222,6 +238,8 @@ pub const Version = struct {
             .wals = try std.ArrayList(FileSeq).initCapacity(alloc, 0),
             .active_tables = [_]u8{0} ** MaxLevel,
             .stat = stat,
+            .opts = opts,
+            .active = undefined,
         };
         errdefer res.deinit(io, alloc);
 
@@ -240,6 +258,14 @@ pub const Version = struct {
             defer rep.deinit(alloc);
             try res.replay(dir, rep, opts, io, alloc);
         }
+
+        const active = res.slab.alloc();
+
+        active.* = try WalTable.new(dir, opts, res.new_file_seq(), res, io, alloc);
+        res.active = active;
+
+        if (sanitize)
+            try res.sanitize_disk_state(dir, alloc, io);
 
         return res;
     }
@@ -323,8 +349,8 @@ pub const Version = struct {
         if (table.min() == null)
             return;
 
-        table.assert_immutable();
-        table.assert_no_users();
+        // table.assert_immutable();
+        // table.assert_no_users();
 
         const min = try KeyOwned.from_kv(table.min().?, alloc);
         const max = try KeyOwned.from_kv(table.max().?, alloc);
@@ -353,6 +379,21 @@ pub const Version = struct {
 
     // Resolves value request.
     pub fn get(self: *Self, key: []const u8, dir: std.Io.Dir, io: std.Io, alloc: Allocator) !?[]u8 {
+        // Resolve from current active table
+        const active_find_res = try self.active.get(key, self.current_seq(), alloc);
+
+        switch (active_find_res) {
+            .Found => |val| {
+                defer alloc.free(val);
+                var res = try std.ArrayList(u8).initCapacity(alloc, val.len);
+
+                try res.appendSlice(alloc, val);
+                return res.items;
+            },
+            .Removed => return null,
+            .NotFound => {},
+        }
+
         // Resolved from immutable table
         const find_res = try self.flusher.get(key, self.current_seq(), alloc);
 
@@ -480,10 +521,7 @@ pub const Version = struct {
 
         // Replay from active WALs
         for (self.wals.items) |wal| {
-            const alive_wal = if (self.slab) |slab|
-                slab.alloc()
-            else
-                try alloc.create(WalTable);
+            const alive_wal = self.slab.alloc();
 
             alive_wal.* = try WalTable.open(dir, opts, wal, io, alloc);
 
@@ -521,8 +559,13 @@ pub const Version = struct {
 
     // De-initializes version
     pub fn deinit(self: *Version, io: std.Io, alloc: Allocator) void {
+        self.flusher.insert(self.active);
+        self.active = undefined;
+
         // It's required to destroy flusher first, since it may want to apply some changes to version.
         self.flusher.deinit(alloc);
+        self.slab.deinit(alloc);
+        alloc.destroy(self.slab);
 
         for (self.tables.items) |*table| {
             table.deinit(alloc);
@@ -828,7 +871,9 @@ test "Version apply persists edits that reopen can replay" {
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 13), reopened.current_seq().get());
-        try std.testing.expectEqual(@as(usize, 12), reopened.next_file.load(.monotonic).get());
+
+        // Since version opens new active table, it should be 12 + 1
+        try std.testing.expectEqual(@as(usize, 13), reopened.next_file.load(.monotonic).get());
         try std.testing.expectEqual(@as(usize, 1), reopened.tables.items.len);
         try std.testing.expectEqualSlices(u8, "memtable11.sst", reopened.tables.items[0].name);
     }

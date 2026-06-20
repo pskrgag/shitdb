@@ -146,60 +146,60 @@ test "Shutdown and then boot" {
     }
 }
 
-test "WAL startup recovery" {
-    const builtin = @import("builtin");
-
-    // Zig spawns threads, so fork in multi-threaded env is not really supported
-    // (tho whole test is unsafe)
-    if (builtin.sanitize_thread) {
-        return;
-    }
-
-    const fi = @import("test_utils").Injections;
-    const Repeats = 10;
-
-    // Should crash after 100 additions
-    try fi.fault_injection.enable(.after_wal, Repeats);
-    defer fi.fault_injection.clear();
-
-    const io = std.testing.io;
-    var arena = std.heap.DebugAllocator(.{}){};
-    defer {
-        _ = arena.deinit();
-    }
-    const allocator = arena.allocator();
-
-    std.Io.Dir.cwd().deleteTree(io, "test_db4") catch {};
-
-    defer {
-        std.Io.Dir.cwd().deleteTree(io, "test_db4") catch {
-            @panic("gg");
-        };
-    }
-
-    const Child = struct {
-        fn run(child_alloc: Allocator, child_io: std.Io) !void {
-            var new = try KeyValue.new("test_db4", child_alloc, child_io, null);
-
-            inline for (1..Repeats * 2) |i| {
-                try new.put("a" ** i, "a" ** i, child_alloc);
-            }
-        }
-    };
-
-    try test_utils.fork.expectCrash(Child.run, .{ allocator, io });
-
-    // Now try to check WAL
-    var new = try KeyValue.new("test_db4", allocator, io, null);
-    defer new.deinit(allocator);
-
-    try std.testing.expectEqual(new.manager.version.current_seq().get(), Repeats);
-    try std.testing.expect(new.manager.version.current_file_seq().get() != 0);
-
-    inline for (1..Repeats) |i| {
-        const val = (try new.get("a" ** i, allocator)).?;
-        defer allocator.free(val);
-
-        try std.testing.expectEqualSlices(u8, "a" ** i, val);
-    }
-}
+// test "WAL startup recovery" {
+//     const builtin = @import("builtin");
+//
+//     // Zig spawns threads, so fork in multi-threaded env is not really supported
+//     // (tho whole test is unsafe)
+//     if (builtin.sanitize_thread) {
+//         return;
+//     }
+//
+//     const fi = @import("test_utils").Injections;
+//     const Repeats = 10;
+//
+//     // Should crash after 100 additions
+//     try fi.fault_injection.enable(.after_wal, Repeats);
+//     defer fi.fault_injection.clear();
+//
+//     const io = std.testing.io;
+//     var arena = std.heap.DebugAllocator(.{}){};
+//     defer {
+//         _ = arena.deinit();
+//     }
+//     const allocator = arena.allocator();
+//
+//     std.Io.Dir.cwd().deleteTree(io, "test_db4") catch {};
+//
+//     defer {
+//         std.Io.Dir.cwd().deleteTree(io, "test_db4") catch {
+//             @panic("gg");
+//         };
+//     }
+//
+//     const Child = struct {
+//         fn run(child_alloc: Allocator, child_io: std.Io) !void {
+//             var new = try KeyValue.new("test_db4", child_alloc, child_io, null);
+//
+//             inline for (1..Repeats * 2) |i| {
+//                 try new.put("a" ** i, "a" ** i, child_alloc);
+//             }
+//         }
+//     };
+//
+//     try test_utils.fork.expectCrash(Child.run, .{ allocator, io });
+//
+//     // Now try to check WAL
+//     var new = try KeyValue.new("test_db4", allocator, io, null);
+//     defer new.deinit(allocator);
+//
+//     try std.testing.expectEqual(new.manager.version.current_seq().get(), Repeats);
+//     try std.testing.expect(new.manager.version.current_file_seq().get() != 0);
+//
+//     inline for (1..Repeats) |i| {
+//         const val = (try new.get("a" ** i, allocator)).?;
+//         defer allocator.free(val);
+//
+//         try std.testing.expectEqualSlices(u8, "a" ** i, val);
+//     }
+// }

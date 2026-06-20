@@ -29,6 +29,12 @@ pub fn build(b: *std.Build) void {
         .sanitize_thread = tsan,
     });
 
+    const sync = b.addModule("sync", .{
+        .root_source_file = b.path("src/sync/root.zig"),
+        .target = target,
+        .sanitize_thread = tsan,
+    });
+
     const generic_utils = b.addModule("generic_utils", .{
         .root_source_file = b.path("src/generic_utils.zig"),
         .target = target,
@@ -77,6 +83,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "storage", .module = storage },
             .{ .name = "test_utils", .module = test_utils },
             .{ .name = "slab", .module = slab },
+            .{ .name = "sync", .module = sync },
         },
     });
 
@@ -88,6 +95,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "storage", .module = storage },
             .{ .name = "test_utils", .module = test_utils },
             .{ .name = "slab", .module = slab },
+            .{ .name = "sync", .module = sync },
         },
     });
 

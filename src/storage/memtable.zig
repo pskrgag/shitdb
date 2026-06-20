@@ -265,11 +265,21 @@ pub const MemTable = struct {
         if (value.len == 0)
             return error.InvalidValue;
 
-        return try KeyValue.new(key, value, seq, Type.Add, self.arena.allocator());
+        return KeyValue.new(key, value, seq, Type.Add, self.arena.allocator()) catch |e| {
+            if (e == error.OutOfMemory)
+                return error.MemTableFull;
+
+            return e;
+        };
     }
 
     pub fn create_remove_kv(self: *Self, key: []const u8, seq: KVSeq) !KeyValue {
-        return try KeyValue.new(key, null, seq, Type.Delete, self.arena.allocator());
+        return KeyValue.new(key, null, seq, Type.Delete, self.arena.allocator()) catch |e| {
+            if (e == error.OutOfMemory)
+                return error.MemTableFull;
+
+            return e;
+        };
     }
 
     /// Puts kv previously constructed by MemTable::create_kv

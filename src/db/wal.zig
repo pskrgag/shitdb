@@ -11,94 +11,62 @@ const KVSeq = @import("storage").KVSeq;
 const FileSeq = @import("storage").manifest.FileSeq;
 const KeyValue = @import("storage").KeyValue;
 const Value = std.atomic.Value;
-const BufferWriter = @import("buffer_writer.zig").BufferWriter;
 const test_utils = @import("test_utils");
 const fi = test_utils.Injections.fault_injection;
+const Transaction = @import("manager.zig").Transaction;
+const WriteOp = @import("manager.zig").WriteOp;
+const PendingWrite = @import("manager.zig").PendingWrite;
 
 const AddMagic: u8 = 0x10;
 const RemoveMagic: u8 = 0x12;
 
-pub const WalEntry = union(enum) {
-    // Added key value
-    Add: struct {
-        key: []const u8,
-        value: []const u8,
-        seq: KVSeq,
-    },
+fn string_size(slice: []const u8) usize {
+    return 8 + slice.len;
+}
 
-    // Removed key
-    Remove: struct {
-        key: []const u8,
-        seq: KVSeq,
-    },
+fn full_size(self: *const WriteOp) usize {
+    var size: usize = 0;
 
-    // Since we know in advance how many bytes of payload we will have, we can can precompute
-    // maximum amount of data user can write.
-    fn precalculate_size(memtable_size: usize) usize {
-        // Given the smallest key we can calculate how many WAL records we will have.
-        const min_kv_size = KeyValue.calculate_size("a", null);
-        const max_records = (memtable_size / min_kv_size) + 1;
-        const wal_max_overhead = (WalEntry{ .Add = .{
-            .key = "a",
-            .value = "a",
-            .seq = KVSeq.init(0),
-        } }).full_size() - 2;
-
-        return memtable_size + max_records * wal_max_overhead;
+    switch (self.*) {
+        .Put => |add| {
+            size += @sizeOf(@TypeOf(AddMagic));
+            size += string_size(add.key);
+            size += string_size(add.value);
+            size += @sizeOf(@TypeOf(add.seq));
+            size += 4; // checksum.
+        },
+        .Remove => |rem| {
+            size += @sizeOf(@TypeOf(RemoveMagic));
+            size += string_size(rem.key);
+            size += @sizeOf(@TypeOf(rem.seq));
+            size += 4; // checksum.
+        },
     }
 
-    fn string_size(slice: []const u8) usize {
-        return 8 + slice.len;
+    return size;
+}
+
+fn checksum(self: *const WriteOp) u32 {
+    var hash = Crc32.init();
+
+    switch (self.*) {
+        .Put => |add| {
+            hash.update(add.key);
+            hash.update(add.value);
+            hash.update(&std.mem.toBytes(add.seq.get()));
+        },
+        .Remove => |rem| {
+            hash.update(rem.key);
+            hash.update(&std.mem.toBytes(rem.seq.get()));
+        },
     }
 
-    fn full_size(self: *const WalEntry) usize {
-        var size: usize = 0;
-
-        switch (self.*) {
-            .Add => |add| {
-                size += @sizeOf(@TypeOf(AddMagic));
-                size += WalEntry.string_size(add.key);
-                size += WalEntry.string_size(add.value);
-                size += @sizeOf(@TypeOf(add.seq));
-                size += 4; // checksum.
-            },
-            .Remove => |rem| {
-                size += @sizeOf(@TypeOf(RemoveMagic));
-                size += WalEntry.string_size(rem.key);
-                size += @sizeOf(@TypeOf(rem.seq));
-                size += 4; // checksum.
-            },
-        }
-
-        return size;
-    }
-
-    fn checksum(self: *const WalEntry) u32 {
-        var hash = Crc32.init();
-
-        switch (self.*) {
-            .Add => |add| {
-                hash.update(add.key);
-                hash.update(add.value);
-                hash.update(&std.mem.toBytes(add.seq.get()));
-            },
-            .Remove => |rem| {
-                hash.update(rem.key);
-                hash.update(&std.mem.toBytes(rem.seq.get()));
-            },
-        }
-
-        return hash.final();
-    }
-};
+    return hash.final();
+}
 
 pub const Wal = struct {
     // WAL file
     file: File,
-    // Offset within file
-    offset: Value(usize),
-    // Mmaped file
-    data: ?[]u8,
 
     fn file_name(alloc: Allocator, seq: FileSeq) ![]const u8 {
         const res = std.fmt.allocPrint(alloc, "WAL{}.sst", .{seq.get()});
@@ -110,7 +78,7 @@ pub const Wal = struct {
         defer alloc.free(name);
 
         const file = try dir.openFile(io, name, .{ .mode = .read_write });
-        return .{ .file = file, .offset = Value(usize).init(0), .data = null };
+        return .{ .file = file };
     }
 
     pub fn is_wal_name(name: []const u8) bool {
@@ -128,7 +96,6 @@ pub const Wal = struct {
         dir: Dir,
         seq: FileSeq,
         version: ?*Version,
-        memtable_size: usize,
         io: Io,
         alloc: Allocator,
     ) !Wal {
@@ -137,18 +104,6 @@ pub const Wal = struct {
 
         const file = try dir.createFile(io, name, .{ .read = true });
         errdefer file.close(io);
-        const file_size = WalEntry.precalculate_size(memtable_size);
-
-        try file.setLength(io, file_size);
-        const mmap = try std.posix.mmap(
-            null,
-            file_size,
-            .{ .READ = true, .WRITE = true },
-            .{ .TYPE = .SHARED },
-            file.handle,
-            0,
-        );
-        errdefer std.posix.munmap(mmap);
 
         if (version) |v| {
             var edit = try VersionEdit.empty(alloc);
@@ -160,73 +115,57 @@ pub const Wal = struct {
 
         return .{
             .file = file,
-            .offset = Value(usize).init(0),
-            .data = mmap,
         };
     }
 
-    pub fn record(self: *Wal, entry: WalEntry) !void {
-        // TODO: This makes parsing a little bit harder than it should be. Imagine following:
-        //
-        //      T1:                                     T2:
-        //
-        //   new_offset = fetchAdd()
-        //
-        //                                            new_offset = fetchAdd();
-        //                                            <writes data>
-        //   crashes.
-        //
-        // It would mean that there is a hole in WAL.
-        //
-        // 1) Need a test for that
-        // 2) Need a parsing fix.
-        const my_offset = self.offset.fetchAdd(entry.full_size(), .monotonic);
-        const data = self.data.?;
-        var w = BufferWriter.init(data[my_offset .. my_offset + entry.full_size()]);
+    pub fn commit(self: *Wal, trans: Transaction, io: std.Io, alloc: Allocator) !void {
+        var size: usize = 0;
 
-        std.debug.assert(my_offset + entry.full_size() <= self.data.?.len);
+        {
+            var i = trans.iter();
 
+            while (i.next()) |e| {
+                size += full_size(&e.op);
+            }
+        }
+
+        const buffer = try alloc.alloc(u8, size);
+        defer alloc.free(buffer);
+
+        var w = self.file.writerStreaming(io, buffer);
+
+        {
+            var i = trans.iter();
+            while (i.next()) |e| {
+                Wal.record(e.op, &w.interface) catch @panic("must not fail");
+            }
+        }
+
+        try w.flush();
+    }
+
+    // Records one entry to the buffer
+    fn record(entry: WriteOp, w: *std.Io.Writer) !void {
         fi.crash(.after_wal_slot_allocation);
         test_utils.Scheduler.yield(.WalSlotAllocated);
 
         switch (entry) {
-            .Add => |add| {
-                w.writeAll(&std.mem.toBytes(AddMagic));
-                w.writeAll(&std.mem.toBytes(add.key.len));
-                w.writeAll(add.key);
-                w.writeAll(&std.mem.toBytes(add.value.len));
-                w.writeAll(add.value);
-                w.writeAll(&std.mem.toBytes(add.seq.get()));
-                w.writeAll(&std.mem.toBytes(entry.checksum()));
+            .Put => |add| {
+                try w.writeAll(&std.mem.toBytes(AddMagic));
+                try w.writeAll(&std.mem.toBytes(add.key.len));
+                try w.writeAll(add.key);
+                try w.writeAll(&std.mem.toBytes(add.value.len));
+                try w.writeAll(add.value);
+                try w.writeAll(&std.mem.toBytes(add.seq.get()));
+                try w.writeAll(&std.mem.toBytes(checksum(&entry)));
             },
             .Remove => |rem| {
-                w.writeAll(&std.mem.toBytes(RemoveMagic));
-                w.writeAll(&std.mem.toBytes(rem.key.len));
-                w.writeAll(rem.key);
-                w.writeAll(&std.mem.toBytes(rem.seq.get()));
-                w.writeAll(&std.mem.toBytes(entry.checksum()));
+                try w.writeAll(&std.mem.toBytes(RemoveMagic));
+                try w.writeAll(&std.mem.toBytes(rem.key.len));
+                try w.writeAll(rem.key);
+                try w.writeAll(&std.mem.toBytes(rem.seq.get()));
+                try w.writeAll(&std.mem.toBytes(checksum(&entry)));
             },
-        }
-
-        // TODO: this is insanely bad! I need to come up with better protocol here.
-        {
-            const page_size = std.heap.page_size_min;
-
-            const dt = self.data.?;
-            const base = @intFromPtr(dt.ptr);
-            const mapped_end = base + dt.len;
-
-            const start = @intFromPtr(w.buf.ptr);
-            const end = start + w.buf.len;
-
-            const aligned_start = std.mem.alignBackward(usize, start, page_size);
-            const aligned_end = @min(std.mem.alignForward(usize, end, page_size), mapped_end);
-
-            const off = aligned_start - base;
-            const len = aligned_end - aligned_start;
-
-            // tho in case of that error things would be quite fun...
-            try std.posix.msync(@alignCast(dt[off .. off + len]), std.posix.MSF.SYNC);
         }
     }
 
@@ -288,10 +227,10 @@ pub const Wal = struct {
                     if (size - iter < @sizeOf(u32))
                         return error.InvalidFormat;
 
-                    const checksum = std.mem.readInt(u32, mmap[iter..][0..@sizeOf(u32)], .little);
-                    const entry = WalEntry{ .Add = .{ .seq = seq, .key = key, .value = value } };
+                    const check = std.mem.readInt(u32, mmap[iter..][0..@sizeOf(u32)], .little);
+                    const entry = WriteOp{ .Put = .{ .seq = seq, .key = key, .value = value } };
 
-                    if (checksum != entry.checksum())
+                    if (check != checksum(&entry))
                         return error.InvalidChecksum;
 
                     iter += @sizeOf(u32);
@@ -307,29 +246,21 @@ pub const Wal = struct {
                     if (size - iter < @sizeOf(u32))
                         return error.InvalidFormat;
 
-                    const checksum = std.mem.readInt(u32, mmap[iter..][0..@sizeOf(u32)], .little);
-                    const entry = WalEntry{ .Remove = .{ .seq = seq, .key = key } };
+                    const check = std.mem.readInt(u32, mmap[iter..][0..@sizeOf(u32)], .little);
+                    const entry = WriteOp{ .Remove = .{ .seq = seq, .key = key } };
 
-                    if (checksum != entry.checksum())
+                    if (check != checksum(&entry))
                         return error.InvalidChecksum;
 
                     iter += @sizeOf(u32);
                     try to.remove_but_record(key, seq);
                 },
-                0 => return,
                 else => return error.InvalidFormat,
             }
         }
     }
 
     pub fn deinit(self: *Wal, io: std.Io) !void {
-        // Adjust file size to actually written amount.
-        try self.file.setLength(io, self.offset.load(.monotonic));
-
-        if (self.data) |data| {
-            std.posix.munmap(@alignCast(data));
-        }
-
         self.file.close(io);
     }
 };
@@ -395,6 +326,22 @@ fn expectReplayInvalidFormat(dir: Dir, seq: usize, data: []const u8, alloc: Allo
     try std.testing.expectError(error.InvalidFormat, wal.replay_to(&target, testing_io));
 }
 
+fn pushPut(trans: *Transaction, pending: *PendingWrite, key: []const u8, value: []const u8, seq: usize) void {
+    pending.* = .{
+        .op = .{ .Put = .{ .key = key, .value = value, .seq = KVSeq.init(seq) } },
+        .done = false,
+    };
+    trans.push_active(pending);
+}
+
+fn pushRemove(trans: *Transaction, pending: *PendingWrite, key: []const u8, seq: usize) void {
+    pending.* = .{
+        .op = .{ .Remove = .{ .key = key, .seq = KVSeq.init(seq) } },
+        .done = false,
+    };
+    trans.push_active(pending);
+}
+
 test "WAL serializes add record" {
     var arena = std.heap.DebugAllocator(.{}){};
     defer {
@@ -411,12 +358,18 @@ test "WAL serializes add record" {
         };
     }
 
-    var wal = try Wal.new(dir, FileSeq.init(1), null, TestWalMemtableSize, testing_io, allocator);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } });
+    var trans = Transaction{};
+    var pending: PendingWrite = undefined;
+    pushPut(&trans, &pending, "alpha", "one", 7);
+    const entry = pending.op;
+
+    var wal = try Wal.new(dir, FileSeq.init(1), null, testing_io, allocator);
+    try wal.commit(trans, testing_io, allocator);
     try wal.deinit(testing_io);
 
     const data = try readWalFile(dir, 1, allocator);
     defer allocator.free(data);
+    try std.testing.expectEqual(full_size(&entry), data.len);
 
     var pos: usize = 0;
     try std.testing.expectEqual(AddMagic, data[pos]);
@@ -431,10 +384,8 @@ test "WAL serializes add record" {
     pos += 3;
     try std.testing.expectEqual(@as(usize, 7), readUsize(data[pos .. pos + @sizeOf(usize)]));
     pos += @sizeOf(usize);
-    try std.testing.expectEqual(
-        (WalEntry{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }).checksum(),
-        readU32(data[pos .. pos + @sizeOf(u32)]),
-    );
+
+    try std.testing.expectEqual(checksum(&entry), readU32(data[pos .. pos + @sizeOf(u32)]));
     pos += @sizeOf(u32);
     try std.testing.expectEqual(data.len, pos);
 }
@@ -455,12 +406,18 @@ test "WAL serializes remove record" {
         };
     }
 
-    var wal = try Wal.new(dir, FileSeq.init(2), null, TestWalMemtableSize, testing_io, allocator);
-    try wal.record(.{ .Remove = .{ .key = "beta", .seq = KVSeq.init(42) } });
+    var trans = Transaction{};
+    var pending: PendingWrite = undefined;
+    pushRemove(&trans, &pending, "beta", 42);
+    const entry = pending.op;
+
+    var wal = try Wal.new(dir, FileSeq.init(2), null, testing_io, allocator);
+    try wal.commit(trans, testing_io, allocator);
     try wal.deinit(testing_io);
 
     const data = try readWalFile(dir, 2, allocator);
     defer allocator.free(data);
+    try std.testing.expectEqual(full_size(&entry), data.len);
 
     var pos: usize = 0;
     try std.testing.expectEqual(RemoveMagic, data[pos]);
@@ -471,10 +428,8 @@ test "WAL serializes remove record" {
     pos += 4;
     try std.testing.expectEqual(@as(usize, 42), readUsize(data[pos .. pos + @sizeOf(usize)]));
     pos += @sizeOf(usize);
-    try std.testing.expectEqual(
-        (WalEntry{ .Remove = .{ .key = "beta", .seq = KVSeq.init(42) } }).checksum(),
-        readU32(data[pos .. pos + @sizeOf(u32)]),
-    );
+
+    try std.testing.expectEqual(checksum(&entry), readU32(data[pos .. pos + @sizeOf(u32)]));
     pos += @sizeOf(u32);
     try std.testing.expectEqual(data.len, pos);
 }
@@ -495,13 +450,21 @@ test "WAL serializes records in append order" {
         };
     }
 
-    var wal = try Wal.new(dir, FileSeq.init(3), null, TestWalMemtableSize, testing_io, allocator);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } });
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } });
+    var trans = Transaction{};
+    var add: PendingWrite = undefined;
+    var remove: PendingWrite = undefined;
+    pushPut(&trans, &add, "alpha", "one", 7);
+    pushRemove(&trans, &remove, "alpha", 8);
+    const add_entry = add.op;
+    const remove_entry = remove.op;
+
+    var wal = try Wal.new(dir, FileSeq.init(3), null, testing_io, allocator);
+    try wal.commit(trans, testing_io, allocator);
     try wal.deinit(testing_io);
 
     const data = try readWalFile(dir, 3, allocator);
     defer allocator.free(data);
+    try std.testing.expectEqual(full_size(&add_entry) + full_size(&remove_entry), data.len);
 
     var pos: usize = 0;
     try std.testing.expectEqual(AddMagic, data[pos]);
@@ -516,10 +479,7 @@ test "WAL serializes records in append order" {
     pos += 3;
     try std.testing.expectEqual(@as(usize, 7), readUsize(data[pos .. pos + @sizeOf(usize)]));
     pos += @sizeOf(usize);
-    try std.testing.expectEqual(
-        (WalEntry{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } }).checksum(),
-        readU32(data[pos .. pos + @sizeOf(u32)]),
-    );
+    try std.testing.expectEqual(checksum(&add_entry), readU32(data[pos .. pos + @sizeOf(u32)]));
     pos += @sizeOf(u32);
 
     try std.testing.expectEqual(RemoveMagic, data[pos]);
@@ -531,10 +491,7 @@ test "WAL serializes records in append order" {
     pos += remove_size;
     try std.testing.expectEqual(@as(usize, 8), readUsize(data[pos .. pos + @sizeOf(usize)]));
     pos += @sizeOf(usize);
-    try std.testing.expectEqual(
-        (WalEntry{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } }).checksum(),
-        readU32(data[pos .. pos + @sizeOf(u32)]),
-    );
+    try std.testing.expectEqual(checksum(&remove_entry), readU32(data[pos .. pos + @sizeOf(u32)]));
     pos += @sizeOf(u32);
 
     try std.testing.expectEqual(data.len, pos);
@@ -556,9 +513,13 @@ test "WAL replay restores add record into target table" {
         };
     }
 
-    var wal = try Wal.new(dir, FileSeq.init(4), null, TestWalMemtableSize, testing_io, allocator);
+    var trans = Transaction{};
+    var pending: PendingWrite = undefined;
+    pushPut(&trans, &pending, "alpha", "one", 7);
+
+    var wal = try Wal.new(dir, FileSeq.init(4), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } });
+    try wal.commit(trans, testing_io, allocator);
 
     var target = try WalTable.new(dir, null, FileSeq.init(5), null, testing_io, allocator);
     defer target.deinit(allocator) catch unreachable;
@@ -570,7 +531,7 @@ test "WAL replay restores add record into target table" {
             defer allocator.free(v);
             try std.testing.expectEqualSlices(u8, "one", v);
         },
-        else => @panic("expected replayed value"),
+        else => try std.testing.expect(false),
     }
 }
 
@@ -590,9 +551,13 @@ test "WAL replay restores remove record into target table" {
         };
     }
 
-    var wal = try Wal.new(dir, FileSeq.init(6), null, TestWalMemtableSize, testing_io, allocator);
+    var trans = Transaction{};
+    var pending: PendingWrite = undefined;
+    pushRemove(&trans, &pending, "alpha", 8);
+
+    var wal = try Wal.new(dir, FileSeq.init(6), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } });
+    try wal.commit(trans, testing_io, allocator);
 
     var target = try WalTable.new(dir, null, FileSeq.init(7), null, testing_io, allocator);
     defer target.deinit(allocator) catch unreachable;
@@ -618,10 +583,15 @@ test "WAL replay applies later remove over earlier add" {
         };
     }
 
-    var wal = try Wal.new(dir, FileSeq.init(8), null, TestWalMemtableSize, testing_io, allocator);
+    var trans = Transaction{};
+    var add: PendingWrite = undefined;
+    var remove: PendingWrite = undefined;
+    pushPut(&trans, &add, "alpha", "one", 7);
+    pushRemove(&trans, &remove, "alpha", 8);
+
+    var wal = try Wal.new(dir, FileSeq.init(8), null, testing_io, allocator);
     defer wal.file.close(testing_io);
-    try wal.record(.{ .Add = .{ .key = "alpha", .value = "one", .seq = KVSeq.init(7) } });
-    try wal.record(.{ .Remove = .{ .key = "alpha", .seq = KVSeq.init(8) } });
+    try wal.commit(trans, testing_io, allocator);
 
     var target = try WalTable.new(dir, null, FileSeq.init(9), null, testing_io, allocator);
     defer target.deinit(allocator) catch unreachable;
@@ -636,7 +606,7 @@ test "WAL replay applies later remove over earlier add" {
             defer allocator.free(v);
             try std.testing.expectEqualSlices(u8, "one", v);
         },
-        else => @panic("expected older sequence to see original value"),
+        else => try std.testing.expect(false),
     }
 }
 
@@ -729,129 +699,4 @@ test "WAL replay rejects remove record without sequence number" {
     @memcpy(data[1 + @sizeOf(usize) ..], "alpha");
 
     try expectReplayInvalidFormat(dir, 13, &data, allocator);
-}
-
-var Stop = std.atomic.Value(bool).init(false);
-
-fn thread_big_insert(wal: *Wal, c: u8, alloc: Allocator) !void {
-    const key = try alloc.alloc(u8, 200 * 1024);
-    defer alloc.free(key);
-
-    const value = try alloc.alloc(u8, 200 * 1024);
-    defer alloc.free(value);
-
-    @memset(key, c);
-    @memset(value, c);
-
-    while (Stop.load(.monotonic) == false) {
-        const entry: WalEntry = .{ .Add = .{ .key = key, .value = value, .seq = KVSeq.init(0) } };
-
-        try wal.record(entry);
-    }
-}
-
-test "WAL concurency" {
-    var arena = std.heap.DebugAllocator(.{}){};
-    defer {
-        _ = arena.deinit();
-    }
-    const allocator = arena.allocator();
-    const dirname = "test_wal_replay_truncated_remove_seq";
-    const thread_count = 16;
-
-    var dir = try openTestDir(dirname);
-    defer {
-        dir.close(testing_io);
-        Dir.cwd().deleteTree(testing_io, dirname) catch {
-            @panic("failed to delete test wal dir");
-        };
-    }
-
-    var threads = try std.ArrayList(std.Thread).initCapacity(allocator, thread_count);
-    defer threads.deinit(allocator);
-
-    var wal = try Wal.new(dir, FileSeq.init(0), null, 10 << 30, testing_io, allocator);
-    const ch: u8 = 'a';
-
-    for (0..thread_count) |i| {
-        try threads.append(allocator, try std.Thread.spawn(.{}, thread_big_insert, .{
-            &wal,
-            ch + @as(u8, @intCast(i)),
-            allocator,
-        }));
-    }
-
-    try std.Io.sleep(testing_io, .fromSeconds(5), .awake);
-    Stop.store(true, .monotonic);
-
-    for (threads.items) |thread| {
-        thread.join();
-    }
-
-    // Check WAL sanity
-    var target = try WalTable.new(dir, null, FileSeq.init(0), null, testing_io, allocator);
-    defer target.deinit(allocator) catch unreachable;
-
-    try wal.replay_to(&target, testing_io);
-}
-
-fn push_to_wal(wal: *Wal, count: usize) !void {
-    var key: [200]u8 = undefined;
-    var value: [200]u8 = undefined;
-
-    @memset(&key, 'a');
-    @memset(&value, 'b');
-
-    for (0..count) |_| {
-        const entry: WalEntry = .{ .Add = .{
-            .key = &key,
-            .value = &value,
-            .seq = KVSeq.init(0),
-        } };
-
-        try wal.record(entry);
-    }
-}
-
-test "WAL hole" {
-    const prefix_records = 1;
-    const records_after_hole = 10;
-
-    var arena = std.heap.DebugAllocator(.{}){};
-    defer {
-        _ = arena.deinit();
-    }
-    const allocator = arena.allocator();
-    const dirname = "test_wal_hole_parsing";
-
-    var dir = try openTestDir(dirname);
-    defer {
-        dir.close(testing_io);
-        Dir.cwd().deleteTree(testing_io, dirname) catch {
-            @panic("failed to delete test wal dir");
-        };
-    }
-
-    var wal = try Wal.new(dir, FileSeq.init(0), null, 10 << 30, testing_io, allocator);
-    defer {
-        wal.deinit(testing_io) catch @panic("oh oh");
-    }
-
-    try push_to_wal(&wal, prefix_records);
-
-    var sched = try test_utils.Scheduler.Scheduler.new(allocator);
-    defer sched.deinit(allocator);
-
-    const first_writer = try sched.spawn(push_to_wal, .{ &wal, 1 }, allocator);
-    const second_writer = try sched.spawn(push_to_wal, .{ &wal, records_after_hole }, allocator);
-
-    sched.run_until_sleep(first_writer, .WalSlotAllocated);
-    sched.run_until_done(second_writer, allocator);
-
-    // Check WAL sanity.
-    var target = try WalTable.new(dir, null, FileSeq.init(1), null, testing_io, allocator);
-    defer target.deinit(allocator) catch @panic("oh oh");
-    try wal.replay_to(&target, testing_io);
-
-    try std.testing.expectEqual(@as(usize, prefix_records + records_after_hole), target.len());
 }
