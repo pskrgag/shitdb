@@ -11,6 +11,7 @@ const Version = @import("version.zig").Version;
 const Value = std.atomic.Value;
 const SleepingCounter = @import("sleeping_count.zig").SleepingCounter;
 const Transaction = @import("manager.zig").Transaction;
+const test_utils = @import("test_utils");
 
 pub const State = enum(u8) {
     active,
@@ -152,6 +153,8 @@ pub const WalTable = struct {
 
         // At this point we have entries that fit into memtable. Try to commit them to WAL.
         try self.wal.commit(commited, self.io, alloc);
+
+        test_utils.Injections.fault_injection.crash(.after_wal);
 
         // And then commit to active table. It must not fail, since memory was reserved.
         for (kvs.items) |kv| {
