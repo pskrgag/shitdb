@@ -13,6 +13,9 @@ const SleepingCounter = @import("sleeping_count.zig").SleepingCounter;
 const Transaction = @import("manager.zig").Transaction;
 const test_utils = @import("test_utils");
 const SmallVec = @import("adt").SmallVec;
+const PendingWrite = @import("manager.zig").PendingWrite;
+
+const KvArray = SmallVec(KeyValue, 10);
 
 pub const State = enum(u8) {
     active,
@@ -110,58 +113,74 @@ pub const WalTable = struct {
         self.in_progress.wait_zero();
     }
 
+    const Action = enum {
+        None,
+        Continue,
+        Break,
+    };
+
+    // This function must not return an error!
+    fn append_kv(
+        keyvalue: anyerror!KeyValue,
+        trans: *Transaction,
+        req: *PendingWrite,
+        kvarray: *KvArray,
+        full: *bool,
+        alloc: Allocator,
+    ) Action {
+        const kv = keyvalue catch |e| {
+            if (e == error.MemTableFull) {
+                full.* = false;
+                return .Break;
+            }
+
+            trans.ops.remove(&req.*.active_node);
+            req.err = e;
+            return .Continue;
+        };
+
+        kvarray.append(alloc, kv) catch |e| {
+            // Stop pushing to the array and break out of the loop.
+            trans.ops.remove(&req.active_node);
+            full.* = false;
+            req.err = e;
+            return .Break;
+        };
+
+        return .None;
+    }
+
     /// Tries to commit transaction. May commit only part of it
     pub fn commit(self: *WalTable, trans: *Transaction, alloc: Allocator) !bool {
         var full = true;
         var iter = trans.iter();
-        var kvs = SmallVec(KeyValue, 10).init();
+        var kvs = KvArray.init();
         var commited = Transaction{};
         defer kvs.deinit(alloc);
 
         // Pre-allocate as much as possible in the memtable allocator. If it's not possible
         // to allocate, these pending writes will be left for future.
         while (iter.next()) |i| {
-            // TODO: de-duplicate code for both branches.
             switch (i.op) {
                 .Put => |p| {
-                    const kv = self.table.create_add_kv(p.key, p.value, p.seq) catch |e| {
-                        if (e == error.MemTableFull) {
-                            full = false;
-                            break;
-                        }
+                    const kv = self.table.create_add_kv(p.key, p.value, p.seq);
+                    const res = WalTable.append_kv(kv, trans, i, &kvs, &full, alloc);
 
-                        trans.ops.remove(&i.*.active_node);
-                        i.err = e;
-                        continue;
-                    };
-
-                    kvs.append(alloc, kv) catch |e| {
-                        // Stop pushing to the array and break out of the loop.
-                        trans.ops.remove(&i.active_node);
-                        full = false;
-                        i.err = e;
-                        break;
-                    };
+                    switch (res) {
+                        .Continue => continue,
+                        .Break => break,
+                        .None => {},
+                    }
                 },
                 .Remove => |p| {
-                    const kv = self.table.create_remove_kv(p.key, p.seq) catch |e| {
-                        if (e == error.MemTableFull) {
-                            full = false;
-                            break;
-                        }
+                    const kv = self.table.create_remove_kv(p.key, p.seq);
+                    const res = WalTable.append_kv(kv, trans, i, &kvs, &full, alloc);
 
-                        trans.ops.remove(&i.*.active_node);
-                        i.err = e;
-                        continue;
-                    };
-
-                    kvs.append(alloc, kv) catch |e| {
-                        // Stop pushing to the array and break out of the loop.
-                        trans.ops.remove(&i.active_node);
-                        full = false;
-                        i.err = e;
-                        break;
-                    };
+                    switch (res) {
+                        .Continue => continue,
+                        .Break => break,
+                        .None => {},
+                    }
                 },
             }
 
