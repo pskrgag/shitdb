@@ -1,5 +1,5 @@
 const std = @import("std");
-const File = std.Io.File;
+const BufferedFile = @import("io").BufferedFile;
 const Dir = std.Io.Dir;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -72,7 +72,7 @@ pub const WalOpts = struct {
 
 pub const Wal = struct {
     // WAL file
-    file: File,
+    file: BufferedFile,
     // WAL user options
     opts: WalOpts,
 
@@ -90,7 +90,8 @@ pub const Wal = struct {
         defer alloc.free(name);
 
         const file = try dir.openFile(io, name, .{ .mode = .read_write });
-        return .{ .file = file, .opts = opts };
+        errdefer file.close(io);
+        return .{ .file = BufferedFile.readonly(file), .opts = opts };
     }
 
     pub fn is_wal_name(name: []const u8) bool {
@@ -127,58 +128,45 @@ pub const Wal = struct {
         }
 
         return .{
-            .file = file,
+            .file = try BufferedFile.new(file, alloc),
             .opts = opts,
         };
     }
 
     pub fn commit(self: *Wal, trans: Transaction, io: std.Io, alloc: Allocator) !void {
-        var size: usize = 0;
-
-        {
-            var i = trans.iter();
-
-            while (i.next()) |e| {
-                size += full_size(&e.op);
-            }
-        }
-
-        const buffer = try alloc.alloc(u8, size);
-        defer alloc.free(buffer);
-
-        var w = self.file.writerStreaming(io, buffer);
+        _ = alloc;
 
         {
             var i = trans.iter();
             while (i.next()) |e| {
-                Wal.record(e.op, &w.interface) catch @panic("must not fail");
+                Wal.record(e.op, &self.file, io) catch @panic("must not fail");
             }
         }
 
-        try ei.maybe_error(.wal_flush, w.flush());
+        try ei.maybe_error(.wal_flush, self.file.flush(io));
 
         if (self.opts.sync)
             try ei.maybe_error(.wal_sync, self.file.sync(io));
     }
 
     // Records one entry to the buffer
-    fn record(entry: WriteOp, w: *std.Io.Writer) !void {
+    fn record(entry: WriteOp, w: *BufferedFile, io: std.Io) !void {
         switch (entry) {
             .Put => |add| {
-                try w.writeAll(&std.mem.toBytes(AddMagic));
-                try w.writeAll(&std.mem.toBytes(add.key.len));
-                try w.writeAll(add.key);
-                try w.writeAll(&std.mem.toBytes(add.value.len));
-                try w.writeAll(add.value);
-                try w.writeAll(&std.mem.toBytes(add.seq.get()));
-                try w.writeAll(&std.mem.toBytes(checksum(&entry)));
+                try w.append(&std.mem.toBytes(AddMagic), io);
+                try w.append(&std.mem.toBytes(add.key.len), io);
+                try w.append(add.key, io);
+                try w.append(&std.mem.toBytes(add.value.len), io);
+                try w.append(add.value, io);
+                try w.append(&std.mem.toBytes(add.seq.get()), io);
+                try w.append(&std.mem.toBytes(checksum(&entry)), io);
             },
             .Remove => |rem| {
-                try w.writeAll(&std.mem.toBytes(RemoveMagic));
-                try w.writeAll(&std.mem.toBytes(rem.key.len));
-                try w.writeAll(rem.key);
-                try w.writeAll(&std.mem.toBytes(rem.seq.get()));
-                try w.writeAll(&std.mem.toBytes(checksum(&entry)));
+                try w.append(&std.mem.toBytes(RemoveMagic), io);
+                try w.append(&std.mem.toBytes(rem.key.len), io);
+                try w.append(rem.key, io);
+                try w.append(&std.mem.toBytes(rem.seq.get()), io);
+                try w.append(&std.mem.toBytes(checksum(&entry)), io);
             },
         }
     }
@@ -195,7 +183,7 @@ pub const Wal = struct {
             size,
             .{ .READ = true },
             .{ .TYPE = .SHARED },
-            self.file.handle,
+            self.file.file.handle,
             0,
         );
         defer std.posix.munmap(mmap);
@@ -274,8 +262,8 @@ pub const Wal = struct {
         }
     }
 
-    pub fn deinit(self: *Wal, io: std.Io) !void {
-        self.file.close(io);
+    pub fn deinit(self: *Wal, alloc: Allocator, io: std.Io) !void {
+        self.file.close(alloc, io);
     }
 };
 
@@ -332,7 +320,7 @@ fn expectReplayInvalidFormat(dir: Dir, seq: usize, data: []const u8, alloc: Allo
     try writeWalFile(dir, seq, data, alloc);
 
     var wal = try Wal.open(dir, FileSeq.init(seq), testing_io, alloc);
-    defer wal.file.close(testing_io);
+    defer wal.deinit(alloc, testing_io) catch unreachable;
 
     var target = try WalTable.new(dir, .{}, .{}, FileSeq.init(seq + 1000), null, testing_io, alloc);
     defer target.deinit(alloc) catch unreachable;
@@ -379,7 +367,7 @@ test "WAL serializes add record" {
 
     var wal = try Wal.new(dir, FileSeq.init(1), null, .{}, testing_io, allocator);
     try wal.commit(trans, testing_io, allocator);
-    try wal.deinit(testing_io);
+    try wal.deinit(allocator, testing_io);
 
     const data = try readWalFile(dir, 1, allocator);
     defer allocator.free(data);
@@ -427,7 +415,7 @@ test "WAL serializes remove record" {
 
     var wal = try Wal.new(dir, FileSeq.init(2), null, .{}, testing_io, allocator);
     try wal.commit(trans, testing_io, allocator);
-    try wal.deinit(testing_io);
+    try wal.deinit(allocator, testing_io);
 
     const data = try readWalFile(dir, 2, allocator);
     defer allocator.free(data);
@@ -474,7 +462,7 @@ test "WAL serializes records in append order" {
 
     var wal = try Wal.new(dir, FileSeq.init(3), null, .{}, testing_io, allocator);
     try wal.commit(trans, testing_io, allocator);
-    try wal.deinit(testing_io);
+    try wal.deinit(allocator, testing_io);
 
     const data = try readWalFile(dir, 3, allocator);
     defer allocator.free(data);
@@ -532,7 +520,7 @@ test "WAL replay restores add record into target table" {
     pushPut(&trans, &pending, "alpha", "one", 7);
 
     var wal = try Wal.new(dir, FileSeq.init(4), null, .{}, testing_io, allocator);
-    defer wal.file.close(testing_io);
+    defer wal.deinit(allocator, testing_io) catch unreachable;
     try wal.commit(trans, testing_io, allocator);
 
     var target = try WalTable.new(dir, .{}, .{}, FileSeq.init(5), null, testing_io, allocator);
@@ -570,7 +558,7 @@ test "WAL replay restores remove record into target table" {
     pushRemove(&trans, &pending, "alpha", 8);
 
     var wal = try Wal.new(dir, FileSeq.init(6), null, .{}, testing_io, allocator);
-    defer wal.file.close(testing_io);
+    defer wal.deinit(allocator, testing_io) catch unreachable;
     try wal.commit(trans, testing_io, allocator);
 
     var target = try WalTable.new(dir, .{}, .{}, FileSeq.init(7), null, testing_io, allocator);
@@ -604,7 +592,7 @@ test "WAL replay applies later remove over earlier add" {
     pushRemove(&trans, &remove, "alpha", 8);
 
     var wal = try Wal.new(dir, FileSeq.init(8), null, .{}, testing_io, allocator);
-    defer wal.file.close(testing_io);
+    defer wal.deinit(allocator, testing_io) catch unreachable;
     try wal.commit(trans, testing_io, allocator);
 
     var target = try WalTable.new(dir, .{}, .{}, FileSeq.init(9), null, testing_io, allocator);

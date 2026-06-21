@@ -1,5 +1,4 @@
 const std = @import("std");
-const utils = @import("utils.zig");
 const MemTable = @import("memtable.zig").MemTable;
 const GetResult = @import("memtable.zig").GetResult;
 const KeyValue = @import("memtable.zig").KeyValue;
@@ -199,7 +198,7 @@ pub const SSTable = struct {
     fn meta_from_file(file: []const u8) MetaBlock {
         var mt: MetaBlock = undefined;
 
-        @memcpy(utils.data_as_u8_ptr(&mt), file[file.len - @sizeOf(MetaBlock) ..]);
+        @memcpy(std.mem.asBytes(&mt), file[file.len - @sizeOf(MetaBlock) ..]);
         return mt;
     }
 
@@ -301,7 +300,7 @@ pub const SSTable = struct {
 
         for (value_meta.blocks.items) |mt| {
             const block_idx = BlockIndex{ .size = mt.size, .offset = offset, .key_size = mt.last_key.len };
-            const block_idx_ptr = utils.data_as_u8_const_ptr(&block_idx);
+            const block_idx_ptr = std.mem.asBytes(&block_idx);
 
             @memcpy(file[0..@sizeOf(BlockIndex)], block_idx_ptr);
             file = file[@sizeOf(BlockIndex)..];
@@ -319,7 +318,7 @@ pub const SSTable = struct {
     }
 
     fn write_meta(file: [*]u8, m: MetaBlock) !void {
-        @memcpy(file[0..@sizeOf(MetaBlock)], utils.data_as_u8_const_ptr(&m));
+        @memcpy(file[0..@sizeOf(MetaBlock)], std.mem.asBytes(&m));
     }
 
     fn read_block_first_key(block: []const u8) []const u8 {

@@ -232,7 +232,7 @@ pub const WalTable = struct {
 
     /// Deinits table
     pub fn deinit(self: *WalTable, alloc: Allocator) !void {
-        try self.wal.deinit(self.io);
+        try self.wal.deinit(alloc, self.io);
         self.table.deinit(alloc);
     }
 };

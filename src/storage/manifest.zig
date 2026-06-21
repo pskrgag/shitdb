@@ -1,11 +1,9 @@
 const std = @import("std");
-const utils = @import("utils.zig");
 const KeyValueOwned = @import("memtable.zig").KeyValueOwned;
 const KeyValue = @import("memtable.zig").KeyValue;
 const KVSeq = @import("memtable.zig").KVSeq;
 const Writer = std.Io.File.Writer;
 const Allocator = std.mem.Allocator;
-const data_as_u8_const_ptr = utils.data_as_u8_const_ptr;
 
 const AddMagic = 0x10;
 const NextFileNumberMagic = 0x12;
