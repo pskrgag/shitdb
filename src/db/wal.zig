@@ -142,8 +142,7 @@ pub const Wal = struct {
             }
         }
 
-        try ei.maybe_error(.wal_sync);
-        try w.flush();
+        try ei.maybe_error(.wal_sync, w.flush());
     }
 
     // Records one entry to the buffer

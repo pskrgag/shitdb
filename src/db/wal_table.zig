@@ -137,6 +137,7 @@ pub const WalTable = struct {
 
                     kvs.append(alloc, kv) catch |e| {
                         // Stop pushing to the array and break out of the loop.
+                        trans.ops.remove(&i.active_node);
                         full = false;
                         i.err = e;
                         break;
@@ -156,6 +157,7 @@ pub const WalTable = struct {
 
                     kvs.append(alloc, kv) catch |e| {
                         // Stop pushing to the array and break out of the loop.
+                        trans.ops.remove(&i.active_node);
                         full = false;
                         i.err = e;
                         break;

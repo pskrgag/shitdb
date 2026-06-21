@@ -10,6 +10,7 @@ const Statistics = @import("stat.zig").Statistics;
 const Mutex = @import("sync").mutex.Mutex;
 const Condition = @import("sync").cv.Condition;
 const KVSeq = @import("storage").KVSeq;
+const ei = @import("test_utils").Injections.error_injection;
 
 // Request kind of the write.
 pub const WriteOp = union(enum) {
@@ -173,7 +174,10 @@ pub const Manager = struct {
             self.writers_count += 1;
 
             while (pending.done == false and self.writers.first != &pending.pending_node) {
-                self.write_cv.wait(self.io, &self.dblock) catch |err| {
+                ei.maybe_error(.write_cv_wait, self.write_cv.wait(
+                    self.io,
+                    &self.dblock,
+                )) catch |err| {
                     self.dblock.assert_locked();
 
                     self.writers.remove(&pending.pending_node);
@@ -627,7 +631,6 @@ fn sanitize_manager_after_run(manager: *Manager, alloc: Allocator) !void {
 test "Transaction commit crash" {
     const Scheduler = test_utils.Scheduler.Scheduler;
     const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
-    const ei = test_utils.Injections.error_injection;
 
     ei.init();
     defer ei.clear();
@@ -711,7 +714,6 @@ test "Transaction commit crash" {
 test "Invalid argument in one request does not affect the whole group" {
     const Scheduler = test_utils.Scheduler.Scheduler;
     const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
-    const ei = test_utils.Injections.error_injection;
 
     ei.init();
     defer ei.clear();
@@ -785,6 +787,79 @@ test "Invalid argument in one request does not affect the whole group" {
             .fiber = t2,
             .run = .End,
         }, allocator);
+
+        try sched.run_with_plan(plan, allocator);
+    }
+    try sanitize_manager_after_run(&manager, allocator);
+}
+
+test "CV wait fail removes write from the queue" {
+    const Scheduler = test_utils.Scheduler.Scheduler;
+    const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
+
+    ei.init();
+    defer ei.clear();
+
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "invalid_val";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    const dir = try openOrCreateDir(io, dirname);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    defer manager.deinit(allocator);
+
+    {
+        var sched = try Scheduler.new(allocator);
+        defer sched.deinit(allocator);
+
+        const leader = try sched.spawn(
+            success_put,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        const t1 = try sched.spawn(
+            error_put,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        var plan = try SchedulerPlan.new(allocator);
+        defer plan.deinit(allocator);
+
+        // 1. Build transaction and release the mutex
+        try plan.add(
+            .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
+            allocator,
+        );
+        // 2. Take the mutex and wait for cv
+        try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
+        // 3. Run till the end
+        try plan.add(
+            .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
+            allocator,
+        );
+        // 4. Fail on cv
+        try plan.add(
+            .{
+                .fiber = leader,
+                .run = .{ .Sleep = .TransactionBuilt },
+                .inject_error = .write_cv_wait,
+            },
+            allocator,
+        );
 
         try sched.run_with_plan(plan, allocator);
     }

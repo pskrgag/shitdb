@@ -18,20 +18,23 @@ pub const Mutex = struct {
     };
 
     pub fn lockUncancelable(self: *Mutex, io: std.Io) void {
+        const tid = Thread.getCurrentId();
+
+        defer {
+            const old_owner = self.owner.swap(Thread.getCurrentId(), .monotonic);
+            std.debug.assert(old_owner == InvalidID);
+        }
+
         if (Scheduler.is_running()) {
             while (!self.mtx.tryLock()) {
                 Scheduler.yield(.MutexWait);
             }
         } else {
-            const tid = Thread.getCurrentId();
-
             if (self.owner.load(.monotonic) == tid) {
                 @panic("Mutex deadlock");
             }
 
             self.mtx.lockUncancelable(io);
-            const old_owner = self.owner.swap(Thread.getCurrentId(), .monotonic);
-            std.debug.assert(old_owner == InvalidID);
         }
     }
 
@@ -44,12 +47,10 @@ pub const Mutex = struct {
     }
 
     pub fn unlock(self: *Mutex, io: std.Io) void {
-        if (!Scheduler.is_running()) {
-            const tid = Thread.getCurrentId();
-            const old_owner = self.owner.swap(InvalidID, .monotonic);
+        const tid = Thread.getCurrentId();
+        const old_owner = self.owner.swap(InvalidID, .monotonic);
 
-            std.debug.assert(tid == old_owner);
-        }
+        std.debug.assert(tid == old_owner);
 
         self.mtx.unlock(io);
     }
