@@ -67,11 +67,16 @@ pub const Transaction = struct {
         self.ops.append(&op.active_node);
     }
 
+    pub fn abort(self: *Transaction, op: *PendingWrite, err: anyerror) void {
+        op.err = err;
+        self.ops.remove(&op.active_node);
+    }
+
     pub fn mark_error(self: *Transaction, err: anyerror) void {
         var i = self.iter();
 
         while (i.next()) |op| {
-            op.err = err;
+            self.abort(op, err);
         }
     }
 };
@@ -793,6 +798,88 @@ test "Invalid argument in one request does not affect the whole group" {
     try sanitize_manager_after_run(&manager, allocator);
 }
 
+test "Too large input is second in transaction" {
+    const Scheduler = test_utils.Scheduler.Scheduler;
+    const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
+
+    ei.init();
+    defer ei.clear();
+
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "too_large_second_in_transaction";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    const dir = try openOrCreateDir(io, dirname);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    defer manager.deinit(allocator);
+
+    {
+        var sched = try Scheduler.new(allocator);
+        defer sched.deinit(allocator);
+
+        const leader = try sched.spawn(
+            success_put,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        const t1 = try sched.spawn(
+            success_put,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        const t2 = try sched.spawn(
+            too_big,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        var plan = try SchedulerPlan.new(allocator);
+        defer plan.deinit(allocator);
+
+        // 1. Build transaction and release the mutex
+        try plan.add(
+            .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
+            allocator,
+        );
+        // 2. Take the mutex and wait for cv
+        try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
+        // 3. Take the mutex and wait for cv (queue length must be 2)
+        try plan.add(.{ .fiber = t2, .run = .{ .Sleep = .ConditionWait } }, allocator);
+        // 4. Commit first transaction
+        try plan.add(.{
+            .fiber = leader,
+            .run = .End,
+        }, allocator);
+        // 5. Commit transaction with valid request followed by too large request
+        try plan.add(.{
+            .fiber = t1,
+            .run = .End,
+        }, allocator);
+        // 6. Continue failed follower
+        try plan.add(.{
+            .fiber = t2,
+            .run = .End,
+        }, allocator);
+
+        try sched.run_with_plan(plan, allocator);
+    }
+    try sanitize_manager_after_run(&manager, allocator);
+}
+
 test "CV wait fail removes write from the queue" {
     const Scheduler = test_utils.Scheduler.Scheduler;
     const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
@@ -864,4 +951,37 @@ test "CV wait fail removes write from the queue" {
         try sched.run_with_plan(plan, allocator);
     }
     try sanitize_manager_after_run(&manager, allocator);
+}
+
+test "Too big record for memtable infinity loop" {
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "invalid_val";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    const dir = try openOrCreateDir(io, dirname);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    defer manager.deinit(allocator);
+
+    // This must not cause an infinity loop.
+    try std.testing.expectEqual(manager.put("a" ** 200, "b" ** 200, allocator), error.TooBig);
+
+    // Still should be fine to put after reject.
+    {
+        try manager.put("a" ** 20, "b" ** 20, allocator);
+        const value = (try manager.get("a" ** 20, allocator)).?;
+        defer allocator.free(value);
+        try std.testing.expectEqualSlices(u8, "b" ** 20, value);
+    }
 }

@@ -15,7 +15,7 @@ const test_utils = @import("test_utils");
 const SmallVec = @import("adt").SmallVec;
 const PendingWrite = @import("manager.zig").PendingWrite;
 
-const KvArray = SmallVec(KeyValue, 10);
+const KvArray = SmallVec(KeyValue, 30);
 
 pub const State = enum(u8) {
     active,
@@ -134,16 +134,14 @@ pub const WalTable = struct {
                 return .Break;
             }
 
-            trans.ops.remove(&req.*.active_node);
-            req.err = e;
+            trans.abort(req, e);
             return .Continue;
         };
 
         kvarray.append(alloc, kv) catch |e| {
             // Stop pushing to the array and break out of the loop.
-            trans.ops.remove(&req.active_node);
+            trans.abort(req, e);
             full.* = false;
-            req.err = e;
             return .Break;
         };
 
@@ -235,8 +233,5 @@ pub const WalTable = struct {
     pub fn deinit(self: *WalTable, alloc: Allocator) !void {
         try self.wal.deinit(self.io);
         self.table.deinit(alloc);
-
-        // if (@import("builtin").mode == .Debug)
-        //     @memset(std.mem.asBytes(self), 0xAA);
     }
 };

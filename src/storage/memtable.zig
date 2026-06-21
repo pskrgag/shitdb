@@ -226,6 +226,7 @@ pub const GetResult = union(enum) {
 /// MemTable that holds newly added key-value pairs
 pub const MemTable = struct {
     table: skiplist.SkipList(KeyValue),
+    opts: MemTableOpts,
     arena: Arena,
     max_seq: Value(KVSeq),
     size: Value(usize),
@@ -238,6 +239,7 @@ pub const MemTable = struct {
 
         const table = try skiplist.SkipList(KeyValue).new(alloc, io);
         return .{
+            .opts = opts,
             .arena = arena,
             .table = table,
             .max_seq = Value(KVSeq).init(KVSeq.init(0)),
@@ -260,49 +262,50 @@ pub const MemTable = struct {
         }
     }
 
+    fn map_kv_error(
+        self: *Self,
+        kv: anyerror!KeyValue,
+        key: []const u8,
+        value: ?[]const u8,
+    ) !KeyValue {
+        const res = kv catch |err| {
+            if (err == error.OutOfMemory) {
+                const full_size = KeyValue.calculate_size(key, value);
+
+                if (full_size > self.opts.memtable_size)
+                    return error.TooBig;
+
+                return error.MemTableFull;
+            }
+
+            return err;
+        };
+
+        return res;
+    }
+
     /// Creates a new KV using internal bounded arena
     pub fn create_add_kv(self: *Self, key: []const u8, value: []const u8, seq: KVSeq) !KeyValue {
         if (value.len == 0)
             return error.InvalidValue;
 
-        return KeyValue.new(key, value, seq, Type.Add, self.arena.allocator()) catch |e| {
-            if (e == error.OutOfMemory)
-                return error.MemTableFull;
-
-            return e;
-        };
+        return self.map_kv_error(
+            KeyValue.new(key, value, seq, Type.Add, self.arena.allocator()),
+            key,
+            value,
+        );
     }
 
     pub fn create_remove_kv(self: *Self, key: []const u8, seq: KVSeq) !KeyValue {
-        return KeyValue.new(key, null, seq, Type.Delete, self.arena.allocator()) catch |e| {
-            if (e == error.OutOfMemory)
-                return error.MemTableFull;
-
-            return e;
-        };
+        return self.map_kv_error(
+            KeyValue.new(key, null, seq, Type.Delete, self.arena.allocator()),
+            key,
+            null,
+        );
     }
 
     /// Puts kv previously constructed by MemTable::create_kv
     pub fn put_kv(self: *Self, kv: KeyValue) !void {
-        // This would be nice, but actually it's too optimistic:
-        //
-        // Imagine following execution path:
-        //
-        // Thread A:           Thread B:
-        //   manager.put
-        //   Get seq N
-        //   Writes to WAL
-        //   yields
-        //                        manager.put
-        //                        Get seq N + 1
-        //                        Writes to WAL
-        //                        writes to memtable
-        //
-        //  writes to memtable
-        //
-        // I am not sure if OOO write is fine or not, but let's leave it for now.
-        // std.debug.assert(seq.get() >= self.max_seq.get());
-
         try self.table.insert(kv);
         self.update_max_seq(kv.as_seq());
     }
