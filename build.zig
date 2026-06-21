@@ -23,14 +23,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("zbench");
 
-    const slab = b.addModule("slab", .{
-        .root_source_file = b.path("src/slab/root.zig"),
+    const adt = b.addModule("adt", .{
+        .root_source_file = b.path("src/adt/root.zig"),
         .target = target,
         .sanitize_thread = tsan,
     });
 
-    const sync = b.addModule("sync", .{
-        .root_source_file = b.path("src/sync/root.zig"),
+    const slab = b.addModule("slab", .{
+        .root_source_file = b.path("src/slab/root.zig"),
         .target = target,
         .sanitize_thread = tsan,
     });
@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .sanitize_thread = tsan,
     });
+
     const merging_iterator = b.addModule("merging_iterator ", .{
         .root_source_file = b.path("src/merging_iterator/iterator.zig"),
         .target = target,
@@ -64,6 +65,15 @@ pub fn build(b: *std.Build) void {
         .sanitize_thread = tsan,
     });
 
+    const sync = b.addModule("sync", .{
+        .root_source_file = b.path("src/sync/root.zig"),
+        .target = target,
+        .sanitize_thread = tsan,
+        .imports = &.{
+            .{ .name = "test_utils", .module = test_utils },
+        },
+    });
+
     const storage = b.addModule("storage", .{
         .root_source_file = b.path("src/storage/memtable.zig"),
         .target = target,
@@ -84,6 +94,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "test_utils", .module = test_utils },
             .{ .name = "slab", .module = slab },
             .{ .name = "sync", .module = sync },
+            .{ .name = "adt", .module = adt },
         },
     });
 
@@ -96,6 +107,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "test_utils", .module = test_utils },
             .{ .name = "slab", .module = slab },
             .{ .name = "sync", .module = sync },
+            .{ .name = "adt", .module = adt },
         },
     });
 

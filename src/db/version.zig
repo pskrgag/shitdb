@@ -170,9 +170,17 @@ pub const Version = struct {
         if (!full) {
             // This means that active memtable is full. Uncommitted requests are left in `t`.
             // Need to allocate new active table and retry the request
-
             const next_file = self.new_file_seq();
             const new_table = self.slab.alloc();
+
+            errdefer |e| {
+                // There was an error while processing transaction. We need to mark all pending
+                // transactions as failed to propagate this info to callers.
+                //
+                // If error happened in active.commit, it will return !full and
+                // we will retry the request.
+                trans.mark_error(e);
+            }
 
             new_table.* = try WalTable.new(dir, self.opts, next_file, self, io, alloc);
             self.flusher.insert(self.active);

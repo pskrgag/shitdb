@@ -12,6 +12,7 @@ const Value = std.atomic.Value;
 const SleepingCounter = @import("sleeping_count.zig").SleepingCounter;
 const Transaction = @import("manager.zig").Transaction;
 const test_utils = @import("test_utils");
+const SmallVec = @import("adt").SmallVec;
 
 pub const State = enum(u8) {
     active,
@@ -113,14 +114,15 @@ pub const WalTable = struct {
     pub fn commit(self: *WalTable, trans: *Transaction, alloc: Allocator) !bool {
         var full = true;
         var iter = trans.iter();
-        var kvs = try std.ArrayList(KeyValue).initCapacity(alloc, 0);
+        var kvs = SmallVec(KeyValue, 10).init();
         var commited = Transaction{};
         defer kvs.deinit(alloc);
 
         // Pre-allocate as much as possible in the memtable allocator. If it's not possible
         // to allocate, these pending writes will be left for future.
-        while (iter.next()) |*i| {
-            switch (i.*.op) {
+        while (iter.next()) |i| {
+            // TODO: de-duplicate code for both branches.
+            switch (i.op) {
                 .Put => |p| {
                     const kv = self.table.create_add_kv(p.key, p.value, p.seq) catch |e| {
                         if (e == error.MemTableFull) {
@@ -128,10 +130,17 @@ pub const WalTable = struct {
                             break;
                         }
 
-                        return e;
+                        trans.ops.remove(&i.*.active_node);
+                        i.err = e;
+                        continue;
                     };
 
-                    try kvs.append(alloc, kv);
+                    kvs.append(alloc, kv) catch |e| {
+                        // Stop pushing to the array and break out of the loop.
+                        full = false;
+                        i.err = e;
+                        break;
+                    };
                 },
                 .Remove => |p| {
                     const kv = self.table.create_remove_kv(p.key, p.seq) catch |e| {
@@ -140,15 +149,27 @@ pub const WalTable = struct {
                             break;
                         }
 
-                        return e;
+                        trans.ops.remove(&i.*.active_node);
+                        i.err = e;
+                        continue;
                     };
 
-                    try kvs.append(alloc, kv);
+                    kvs.append(alloc, kv) catch |e| {
+                        // Stop pushing to the array and break out of the loop.
+                        full = false;
+                        i.err = e;
+                        break;
+                    };
                 },
             }
 
-            trans.ops.remove(&i.*.active_node);
-            commited.push_active(i.*);
+            trans.ops.remove(&i.active_node);
+            commited.push_active(i);
+        }
+
+        errdefer |e| {
+            // If appending to WAL failed we have to mark the whole transaction as failed.
+            commited.mark_error(e);
         }
 
         // At this point we have entries that fit into memtable. Try to commit them to WAL.
@@ -157,7 +178,7 @@ pub const WalTable = struct {
         test_utils.Injections.fault_injection.crash(.after_wal);
 
         // And then commit to active table. It must not fail, since memory was reserved.
-        for (kvs.items) |kv| {
+        for (kvs.items()) |kv| {
             self.table.put_kv(kv) catch @panic("must not panic here");
         }
 

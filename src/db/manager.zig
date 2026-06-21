@@ -8,6 +8,7 @@ const WalTable = @import("wal_table.zig").WalTable;
 const test_utils = @import("test_utils");
 const Statistics = @import("stat.zig").Statistics;
 const Mutex = @import("sync").mutex.Mutex;
+const Condition = @import("sync").cv.Condition;
 const KVSeq = @import("storage").KVSeq;
 
 // Request kind of the write.
@@ -53,7 +54,7 @@ pub const TransactionIter = struct {
 pub const Transaction = struct {
     // List of pending writers.
     ops: std.DoublyLinkedList = .{},
-    // Count
+    // Initial count of pending requests.
     count: usize = 0,
 
     pub fn iter(self: *const Transaction) TransactionIter {
@@ -64,13 +65,27 @@ pub const Transaction = struct {
         self.count += 1;
         self.ops.append(&op.active_node);
     }
+
+    pub fn mark_error(self: *Transaction, err: anyerror) void {
+        var i = self.iter();
+
+        while (i.next()) |op| {
+            op.err = err;
+        }
+    }
 };
 
 // Pending write request
 pub const PendingWrite = struct {
+    // Write request kin
     op: WriteOp,
-    done: bool,
+    // If request was done by the leader
+    done: bool = false,
+    // Request error if any
+    err: ?anyerror = null,
+    // Linked list node for pending list
     pending_node: std.DoublyLinkedList.Node = .{},
+    // Linked list node for in-flight list
     active_node: std.DoublyLinkedList.Node = .{},
 };
 
@@ -80,7 +95,7 @@ pub const Manager = struct {
     // Mutex that protects new table creation
     dblock: Mutex,
     // CV for writers
-    write_cv: std.Io.Condition,
+    write_cv: Condition,
     // MemTable options
     opts: MemTableOpts,
     // Current version of db
@@ -114,7 +129,7 @@ pub const Manager = struct {
         return .{
             .writers = std.DoublyLinkedList{},
             .writers_count = 0,
-            .write_cv = std.Io.Condition.init,
+            .write_cv = Condition.init,
             .version = version,
             .root = dir,
             .dblock = Mutex.init,
@@ -148,7 +163,6 @@ pub const Manager = struct {
     fn write(self: *Self, op: WriteOp, alloc: Allocator) !void {
         var pending = PendingWrite{
             .op = op,
-            .done = false,
         };
 
         const transaction = blk: {
@@ -159,7 +173,19 @@ pub const Manager = struct {
             self.writers_count += 1;
 
             while (pending.done == false and self.writers.first != &pending.pending_node) {
-                try self.write_cv.wait(self.io, &self.dblock.mtx);
+                self.write_cv.wait(self.io, &self.dblock) catch |err| {
+                    self.dblock.assert_locked();
+
+                    self.writers.remove(&pending.pending_node);
+                    self.writers_count -= 1;
+                    return err;
+                };
+            }
+
+            // There was an error during request handling
+            if (pending.err) |err| {
+                std.debug.assert(pending.done == true);
+                return err;
             }
 
             // It was completed by the leader.
@@ -170,10 +196,15 @@ pub const Manager = struct {
             break :blk self.build_transaction();
         };
 
+        test_utils.Scheduler.yield(.TransactionBuilt);
+
         // Now mutex is released and we can push to memtable and write WAL.
         // self.dblock.assert_not_locked();
-        // TODO: handle
-        try self.version.commit(transaction, self.root, self.io, alloc);
+        //
+        // Each request is either completed via done or marked with error. In any case
+        // caller return pending.err. Failure of this call does not mean that current write
+        // has failed. In means that some of writes failed.
+        self.version.commit(transaction, self.root, self.io, alloc) catch {};
 
         // Now take the mutex back and remove all pending writes from the queue.
         self.dblock.lockUncancelable(self.io);
@@ -189,6 +220,7 @@ pub const Manager = struct {
 
         self.dblock.unlock(self.io);
         self.write_cv.broadcast(self.io);
+        return if (pending.err) |e| e else {};
     }
 
     /// Puts new value into memtable.
@@ -543,4 +575,218 @@ test "WAL GC crash" {
     const value = (try manager.get("a" ** 10, allocator)).?;
     defer allocator.free(value);
     try std.testing.expectEqualSlices(u8, "a" ** 10, value);
+}
+
+const SuccessKey = "a" ** 10;
+const SuccessValue = "aa" ** 10;
+
+const FailKey = "b" ** 10;
+const FailKeySmall = "bb" ** 10;
+const FailValueBig = "bb" ** (40 << 10);
+
+fn success_put(man: *Manager, alloc: Allocator) !void {
+    // This one must not fail
+    try man.put(SuccessKey, SuccessValue, alloc);
+}
+
+fn error_put(man: *Manager, alloc: Allocator) !void {
+    man.put(FailKey, FailKeySmall, alloc) catch |e| {
+        try std.testing.expectEqual(error.InjectedError, e);
+        return;
+    };
+
+    return error.UnexpectedReturn;
+}
+
+fn too_big(man: *Manager, alloc: Allocator) !void {
+    man.put(FailKey, FailValueBig, alloc) catch |e| {
+        try std.testing.expectEqual(error.TooBig, e);
+        return;
+    };
+
+    return error.UnexpectedReturn;
+}
+
+fn sanitize_manager_after_run(manager: *Manager, alloc: Allocator) !void {
+    // try to push smth and verify that it still works
+    {
+        try manager.put("z", "z", alloc);
+        const value = (try manager.get("z", alloc)).?;
+        defer alloc.free(value);
+        try std.testing.expectEqualSlices(u8, "z", value);
+    }
+
+    // Check that successful key is there
+    {
+        const value = (try manager.get(SuccessKey, alloc)).?;
+        defer alloc.free(value);
+        try std.testing.expectEqualSlices(u8, SuccessValue, value);
+    }
+}
+
+test "Transaction commit crash" {
+    const Scheduler = test_utils.Scheduler.Scheduler;
+    const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
+    const ei = test_utils.Injections.error_injection;
+
+    ei.init();
+    defer ei.clear();
+
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "commit_crash";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    const dir = try openOrCreateDir(io, dirname);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    defer manager.deinit(allocator);
+
+    {
+        var sched = try Scheduler.new(allocator);
+        defer sched.deinit(allocator);
+
+        const leader = try sched.spawn(
+            success_put,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        const t1 = try sched.spawn(
+            error_put,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        const t2 = try sched.spawn(
+            error_put,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        var plan = try SchedulerPlan.new(allocator);
+        defer plan.deinit(allocator);
+
+        // 1. Build transaction and release the mutex
+        try plan.add(
+            .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
+            allocator,
+        );
+        // 2. Take the mutex and wait for cv
+        try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
+        // 3. Take the mutex and wait for cv (queue length must be 2)
+        try plan.add(.{ .fiber = t2, .run = .{ .Sleep = .ConditionWait } }, allocator);
+        // 4. Commit first transaction
+        try plan.add(.{
+            .fiber = leader,
+            .run = .End,
+        }, allocator);
+        // 4. Run failing transaction
+        try plan.add(.{
+            .fiber = t1,
+            .run = .End,
+            .inject_error = .wal_sync,
+        }, allocator);
+        // 5. Continue follower
+        try plan.add(.{
+            .fiber = t2,
+            .run = .End,
+        }, allocator);
+
+        try sched.run_with_plan(plan, allocator);
+    }
+    try sanitize_manager_after_run(&manager, allocator);
+}
+
+test "Invalid argument in one request does not affect the whole group" {
+    const Scheduler = test_utils.Scheduler.Scheduler;
+    const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
+    const ei = test_utils.Injections.error_injection;
+
+    ei.init();
+    defer ei.clear();
+
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "invalid_val";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    const dir = try openOrCreateDir(io, dirname);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    defer manager.deinit(allocator);
+
+    {
+        var sched = try Scheduler.new(allocator);
+        defer sched.deinit(allocator);
+
+        const leader = try sched.spawn(
+            success_put,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        const t1 = try sched.spawn(
+            too_big,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        const t2 = try sched.spawn(
+            success_put,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        var plan = try SchedulerPlan.new(allocator);
+        defer plan.deinit(allocator);
+
+        // 1. Build transaction and release the mutex
+        try plan.add(
+            .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
+            allocator,
+        );
+        // 2. Take the mutex and wait for cv
+        try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
+        // 3. Take the mutex and wait for cv (queue length must be 2)
+        try plan.add(.{ .fiber = t2, .run = .{ .Sleep = .ConditionWait } }, allocator);
+        // 4. Commit first transaction
+        try plan.add(.{
+            .fiber = leader,
+            .run = .End,
+        }, allocator);
+        // 4. Run failing transaction
+        try plan.add(.{
+            .fiber = t1,
+            .run = .End,
+        }, allocator);
+        // 5. Continue follower
+        try plan.add(.{
+            .fiber = t2,
+            .run = .End,
+        }, allocator);
+
+        try sched.run_with_plan(plan, allocator);
+    }
+    try sanitize_manager_after_run(&manager, allocator);
 }

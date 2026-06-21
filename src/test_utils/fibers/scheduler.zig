@@ -1,6 +1,7 @@
 const std = @import("std");
 const Fiber = @import("fiber.zig").Fiber;
 const SleepPoint = @import("fiber.zig").SleepPoint;
+const ei = @import("../injection/ei.zig");
 const List = std.DoublyLinkedList;
 const Allocator = std.mem.Allocator;
 
@@ -18,6 +19,7 @@ pub const SchedulerPlanEntry = struct {
         Sleep: SleepPoint,
         End: void,
     },
+    inject_error: ?ei.ErrorKind = null,
 };
 
 /// Predefined scheduler plan
@@ -124,6 +126,10 @@ pub const Scheduler = struct {
             // This is insanely unsafe, but let's assume caller is not an asshole
             const fiber = fiber_from_handle(entry.fiber);
 
+            if (entry.inject_error) |err| {
+                try ei.enable(err, 1);
+            }
+
             switch (entry.run) {
                 .End => {
                     while (!fiber.is_done()) {
@@ -135,11 +141,12 @@ pub const Scheduler = struct {
                 },
                 .Sleep => |p| {
                     while (true) {
-                        if (fiber.sleep == p)
+                        if (fiber.sleep == p) {
                             break;
+                        }
 
                         if (fiber.is_done()) {
-                            std.debug.print("Cannot run fiber till sleep point '{}'. It has finished earlier\n", .{p});
+                            std.debug.print("Cannot run fiber till sleep point '{}'. It has finished earlier\n", .{p,});
                             @panic("Incorrect scheduling plan");
                         }
 
@@ -181,10 +188,13 @@ pub const Scheduler = struct {
     }
 };
 
-pub fn yield(point: SleepPoint) void {
+pub fn is_running() bool {
     const builtin = @import("builtin");
+    return builtin.is_test and SchedulerContext != null;
+}
 
-    if (builtin.is_test and SchedulerContext != null) {
+pub fn yield(point: SleepPoint) void {
+    if (is_running()) {
         CurrentFiber.sleep = point;
         defer CurrentFiber.sleep = null;
 

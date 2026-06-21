@@ -16,6 +16,7 @@ const fi = test_utils.Injections.fault_injection;
 const Transaction = @import("manager.zig").Transaction;
 const WriteOp = @import("manager.zig").WriteOp;
 const PendingWrite = @import("manager.zig").PendingWrite;
+const ei = test_utils.Injections.error_injection;
 
 const AddMagic: u8 = 0x10;
 const RemoveMagic: u8 = 0x12;
@@ -141,14 +142,12 @@ pub const Wal = struct {
             }
         }
 
+        try ei.maybe_error(.wal_sync);
         try w.flush();
     }
 
     // Records one entry to the buffer
     fn record(entry: WriteOp, w: *std.Io.Writer) !void {
-        fi.crash(.after_wal_slot_allocation);
-        test_utils.Scheduler.yield(.WalSlotAllocated);
-
         switch (entry) {
             .Put => |add| {
                 try w.writeAll(&std.mem.toBytes(AddMagic));
