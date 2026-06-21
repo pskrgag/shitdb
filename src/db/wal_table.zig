@@ -3,6 +3,7 @@ const MemTable = @import("storage").MemTable;
 const Wal = @import("wal.zig").Wal;
 const Allocator = std.mem.Allocator;
 const MemTableOpts = @import("storage").MemTableOpts;
+const WalOpts = @import("wal.zig").WalOpts;
 const GetResult = @import("storage").GetResult;
 const KeyValue = @import("storage").KeyValue;
 const KVSeq = @import("storage").KVSeq;
@@ -35,17 +36,16 @@ pub const WalTable = struct {
     /// Constructs new WAL+MemTable
     pub fn new(
         dir: std.Io.Dir,
-        user_opts: ?MemTableOpts,
+        memtable_opts: MemTableOpts,
+        wal_opts: WalOpts,
         seq: FileSeq,
         version: ?*Version,
         io: std.Io,
         alloc: Allocator,
     ) !WalTable {
-        const opts = user_opts orelse MemTableOpts.default();
-
         return .{
-            .table = try MemTable.new(alloc, io, opts),
-            .wal = try Wal.new(dir, seq, version, io, alloc),
+            .table = try MemTable.new(alloc, io, memtable_opts),
+            .wal = try Wal.new(dir, seq, version, wal_opts, io, alloc),
             .seq = seq,
             .io = io,
             .state = Value(State).init(.active),
@@ -57,14 +57,15 @@ pub const WalTable = struct {
     /// Opens existing WAL
     pub fn open(
         dir: std.Io.Dir,
-        user_opts: MemTableOpts,
+        memtable_opts: MemTableOpts,
+        wal_opts: WalOpts,
         seq: FileSeq,
         io: std.Io,
         alloc: Allocator,
     ) !WalTable {
         var self = WalTable{
-            .table = try MemTable.new(alloc, io, user_opts),
-            .wal = try Wal.open(dir, seq, io, alloc),
+            .table = try MemTable.new(alloc, io, memtable_opts),
+            .wal = try Wal.open_with_opts(dir, seq, wal_opts, io, alloc),
             .seq = seq,
             .io = io,
             .state = Value(State).init(.active),

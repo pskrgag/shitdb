@@ -696,7 +696,7 @@ test "Simple find and create" {
     var dir = try cwd.openDir(testing_io, "test_db", .{});
     defer dir.close(testing_io);
 
-    var tb = try MemTable.new(allocator, testing_io, null);
+    var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
     const name = try generate_lvl_name(allocator, 0);
     defer allocator.free(name);
@@ -754,7 +754,7 @@ test "SSTable persists min and max keys" {
     var dir = try cwd.openDir(testing_io, "test_sstable_min_max", .{});
     defer dir.close(testing_io);
 
-    var tb = try MemTable.new(allocator, testing_io, null);
+    var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
 
     try tb.put("m", "middle", KVSeq.init(1));
@@ -800,7 +800,7 @@ test "SSTable min and max keys include tombstones" {
     var dir = try cwd.openDir(testing_io, "test_sstable_min_max_tombstones", .{});
     defer dir.close(testing_io);
 
-    var tb = try MemTable.new(allocator, testing_io, null);
+    var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
 
     try tb.remove("a", KVSeq.init(1));
@@ -845,7 +845,7 @@ test "Remove" {
     var dir = try cwd.openDir(testing_io, "test_db", .{});
     defer dir.close(testing_io);
 
-    var tb = try MemTable.new(allocator, testing_io, null);
+    var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
     const name = try generate_lvl_name(allocator, 0);
     defer allocator.free(name);
@@ -884,7 +884,7 @@ test "Remove more than one block" {
     var dir = try cwd.openDir(testing_io, "test_db", .{});
     defer dir.close(testing_io);
 
-    var tb = try MemTable.new(allocator, testing_io, null);
+    var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
 
     try tb.put("b" ** (BlockSize / 4), "b" ** (BlockSize / 4), KVSeq.init(1));
@@ -936,7 +936,7 @@ test "Merge" {
     var dir = try cwd.openDir(testing_io, "test_db", .{});
     defer dir.close(testing_io);
 
-    var tb = try MemTable.new(allocator, testing_io, null);
+    var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
     const name = try generate_lvl_name(allocator, 0);
     defer allocator.free(name);
@@ -948,7 +948,7 @@ test "Merge" {
     var table = try SSTable.create(dir, name, &tb, 0, testing_io, allocator);
     defer table.deinit();
 
-    var tb1 = try MemTable.new(allocator, testing_io, null);
+    var tb1 = try MemTable.new(allocator, testing_io, .{});
     defer tb1.deinit(allocator);
 
     inline for (1..Repeats) |i| {
@@ -992,12 +992,12 @@ test "Merged SSTable persists min and max keys" {
     var dir = try cwd.openDir(testing_io, "test_sstable_merge_min_max", .{});
     defer dir.close(testing_io);
 
-    var tb = try MemTable.new(allocator, testing_io, null);
+    var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
     try tb.put("b", "left", KVSeq.init(1));
     try tb.put("m", "middle", KVSeq.init(2));
 
-    var tb1 = try MemTable.new(allocator, testing_io, null);
+    var tb1 = try MemTable.new(allocator, testing_io, .{});
     defer tb1.deinit(allocator);
     try tb1.remove("a", KVSeq.init(3));
     try tb1.put("z", "right", KVSeq.init(4));
@@ -1083,8 +1083,8 @@ test "Merge with remove and overlapping regions" {
     var dir = try cwd.openDir(testing_io, "test_db", .{});
     defer dir.close(testing_io);
 
-    var tb = try MemTable.new(allocator, testing_io, null);
-    var tb1 = try MemTable.new(allocator, testing_io, null);
+    var tb = try MemTable.new(allocator, testing_io, .{});
+    var tb1 = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
     defer tb1.deinit(allocator);
 

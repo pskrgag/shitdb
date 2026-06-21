@@ -202,11 +202,7 @@ const FindKey = struct {
 };
 
 pub const MemTableOpts = struct {
-    memtable_size: usize,
-
-    pub fn default() MemTableOpts {
-        return .{ .memtable_size = 1 << 20 };
-    }
+    memtable_size: usize = 1 << 20,
 };
 
 /// Result of the search
@@ -233,8 +229,7 @@ pub const MemTable = struct {
 
     const Self = @This();
 
-    pub fn new(alloc: Allocator, io: std.Io, user_opts: ?MemTableOpts) !Self {
-        const opts = user_opts orelse MemTableOpts.default();
+    pub fn new(alloc: Allocator, io: std.Io, opts: MemTableOpts) !Self {
         const arena = try Arena.new(alloc, opts.memtable_size);
 
         const table = try skiplist.SkipList(KeyValue).new(alloc, io);
@@ -380,7 +375,7 @@ test "Basic test" {
     }
     const allocator = arena.allocator();
 
-    var tb = try MemTable.new(allocator, std.testing.io, null);
+    var tb = try MemTable.new(allocator, std.testing.io, .{});
     defer tb.deinit(allocator);
 
     {
@@ -427,7 +422,7 @@ test "Try overwriting the key" {
     }
     const allocator = arena.allocator();
 
-    var tb = try MemTable.new(allocator, std.testing.io, null);
+    var tb = try MemTable.new(allocator, std.testing.io, .{});
     defer tb.deinit(allocator);
 
     try tb.put("hello", "world", KVSeq.init(0));
@@ -468,6 +463,6 @@ test "HashTable equivalence" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const tb = try MemTable.new(allocator, std.testing.io, null);
+    const tb = try MemTable.new(allocator, std.testing.io, .{});
     try HashTableTest.test_hash_table_equavalance(tb, false, 1000);
 }

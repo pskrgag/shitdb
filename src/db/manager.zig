@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const KeyValue = @import("storage").KeyValue;
 const Version = @import("version.zig").Version;
 const WalTable = @import("wal_table.zig").WalTable;
+const WalOpts = @import("wal.zig").WalOpts;
 const test_utils = @import("test_utils");
 const Statistics = @import("stat.zig").Statistics;
 const Mutex = @import("sync").mutex.Mutex;
@@ -117,15 +118,15 @@ pub const Manager = struct {
 
     const Self = @This();
 
-    pub fn new(dir: Dir, alloc: Allocator, io: std.Io, opts: ?MemTableOpts) !Self {
-        const real_opts = opts orelse MemTableOpts.default();
+    pub fn new(dir: Dir, alloc: Allocator, io: std.Io, opts: MemTableOpts, wal_opts: WalOpts) !Self {
         const stat = try Statistics.new(alloc);
         errdefer stat.deinit(alloc);
 
         const version = try Version.from_file(
             dir,
             "MANIFEST",
-            real_opts,
+            opts,
+            wal_opts,
             stat,
             true,
             io,
@@ -139,7 +140,7 @@ pub const Manager = struct {
             .version = version,
             .root = dir,
             .dblock = Mutex.init,
-            .opts = real_opts,
+            .opts = opts,
             .io = io,
             .stat = stat,
         };
@@ -313,7 +314,7 @@ fn add_test_sstable(
     const KeyOwned = storage.manifest.KeyOwned;
     const VersionEdit = @import("version.zig").VersionEdit;
 
-    var memtable = try MemTable.new(alloc, manager.io, null);
+    var memtable = try MemTable.new(alloc, manager.io, .{});
     defer memtable.deinit(alloc);
     try memtable.put(key, value, storage.KVSeq.init(value_seq));
 
@@ -356,7 +357,7 @@ test "Disk search checks newest SSTable first" {
         };
     }
 
-    var manager = try Manager.new(dir, allocator, io, null);
+    var manager = try Manager.new(dir, allocator, io, .{}, .{});
     defer manager.deinit(allocator);
 
     try add_test_sstable(&manager, 100, 10, "shared", "old", allocator);
@@ -438,7 +439,7 @@ test "Flusher searches new memtables first" {
         };
     }
 
-    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 }, .{});
     defer manager.deinit(allocator);
 
     try std.testing.expectEqual(manager.version.flusher.count, 0);
@@ -472,7 +473,7 @@ test "Removed in flusher does not result in disk search" {
         };
     }
 
-    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 }, .{});
     defer manager.deinit(allocator);
 
     try insert_values_until_flushed(&manager, 0, 10, allocator);
@@ -503,7 +504,7 @@ test "WAL GC no crash" {
     }
 
     {
-        var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+        var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 }, .{});
         defer manager.deinit(allocator);
 
         while (manager.version.stat.read(.memtable_flush) < 3) {
@@ -511,7 +512,7 @@ test "WAL GC no crash" {
         }
     }
 
-    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 }, .{});
     defer manager.deinit(allocator);
 
     var diriter = dir.iterate();
@@ -553,7 +554,7 @@ test "WAL GC crash" {
         fn run(child_dir: Dir, child_alloc: Allocator, child_io: std.Io) void {
             var manager = Manager.new(child_dir, child_alloc, child_io, .{
                 .memtable_size = 500,
-            }) catch |e| {
+            }, .{}) catch |e| {
                 std.debug.print("Unexpected error returned during create {}\n", .{e});
                 std.process.exit(0);
             };
@@ -569,7 +570,7 @@ test "WAL GC crash" {
 
     try test_utils.fork.expectCrash(Child.run, .{ dir, allocator, io });
 
-    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 }, .{});
     defer manager.deinit(allocator);
 
     var diriter = dir.iterate();
@@ -657,7 +658,7 @@ test "Transaction commit crash" {
         };
     }
 
-    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 }, .{});
     defer manager.deinit(allocator);
 
     {
@@ -703,7 +704,7 @@ test "Transaction commit crash" {
         try plan.add(.{
             .fiber = t1,
             .run = .End,
-            .inject_error = .wal_sync,
+            .inject_error = .wal_flush,
         }, allocator);
         // 5. Continue follower
         try plan.add(.{
@@ -713,6 +714,91 @@ test "Transaction commit crash" {
 
         try sched.run_with_plan(plan, allocator);
     }
+    try sanitize_manager_after_run(&manager, allocator);
+}
+
+test "WAL sync failure fails the whole transaction" {
+    const Scheduler = test_utils.Scheduler.Scheduler;
+    const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
+
+    ei.init();
+    defer ei.clear();
+
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "wal_sync_failure";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    const dir = try openOrCreateDir(io, dirname);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 }, .{ .sync = true });
+    defer manager.deinit(allocator);
+
+    {
+        var sched = try Scheduler.new(allocator);
+        defer sched.deinit(allocator);
+
+        const leader = try sched.spawn(
+            success_put,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        const t1 = try sched.spawn(
+            error_put,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        const t2 = try sched.spawn(
+            error_put,
+            .{ &manager, allocator },
+            allocator,
+        );
+
+        var plan = try SchedulerPlan.new(allocator);
+        defer plan.deinit(allocator);
+
+        // 1. Build transaction and release the mutex
+        try plan.add(
+            .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
+            allocator,
+        );
+        // 2. Take the mutex and wait for cv
+        try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
+        // 3. Take the mutex and wait for cv (queue length must be 2)
+        try plan.add(.{ .fiber = t2, .run = .{ .Sleep = .ConditionWait } }, allocator);
+        // 4. Commit first transaction
+        try plan.add(.{
+            .fiber = leader,
+            .run = .End,
+        }, allocator);
+        // 5. Fail while syncing the grouped transaction
+        try plan.add(.{
+            .fiber = t1,
+            .run = .End,
+            .inject_error = .wal_sync,
+        }, allocator);
+        // 6. Continue follower
+        try plan.add(.{
+            .fiber = t2,
+            .run = .End,
+        }, allocator);
+
+        try sched.run_with_plan(plan, allocator);
+    }
+
+    try std.testing.expectEqual(null, try manager.get(FailKey, allocator));
     try sanitize_manager_after_run(&manager, allocator);
 }
 
@@ -740,7 +826,7 @@ test "Invalid argument in one request does not affect the whole group" {
         };
     }
 
-    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 }, .{});
     defer manager.deinit(allocator);
 
     {
@@ -822,7 +908,7 @@ test "Too large input is second in transaction" {
         };
     }
 
-    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 }, .{});
     defer manager.deinit(allocator);
 
     {
@@ -904,7 +990,7 @@ test "CV wait fail removes write from the queue" {
         };
     }
 
-    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 }, .{});
     defer manager.deinit(allocator);
 
     {
@@ -971,7 +1057,7 @@ test "Too big record for memtable infinity loop" {
         };
     }
 
-    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 });
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 }, .{});
     defer manager.deinit(allocator);
 
     // This must not cause an infinity loop.

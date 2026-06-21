@@ -13,6 +13,7 @@ const FileSeq = @import("storage").manifest.FileSeq;
 const KeyOwned = @import("storage").manifest.KeyOwned;
 const WalTable = @import("wal_table.zig").WalTable;
 const Wal = @import("wal.zig").Wal;
+const WalOpts = @import("wal.zig").WalOpts;
 const MemTableOpts = @import("storage").MemTableOpts;
 const KVSeq = @import("storage").KVSeq;
 const Statistics = @import("stat.zig").Statistics;
@@ -109,6 +110,8 @@ pub const Version = struct {
     active: *WalTable,
     // Memtable opts
     opts: MemTableOpts,
+    // WAL opts
+    wal_opts: WalOpts,
 
     const Self = @This();
 
@@ -182,7 +185,7 @@ pub const Version = struct {
                 trans.mark_error(e);
             }
 
-            new_table.* = try WalTable.new(dir, self.opts, next_file, self, io, alloc);
+            new_table.* = try WalTable.new(dir, self.opts, self.wal_opts, next_file, self, io, alloc);
             self.flusher.insert(self.active);
             self.active = new_table;
 
@@ -215,6 +218,7 @@ pub const Version = struct {
         dir: std.Io.Dir,
         path: []const u8,
         opts: MemTableOpts,
+        wal_opts: WalOpts,
         stat: *Statistics,
         sanitize: bool,
         io: std.Io,
@@ -247,6 +251,7 @@ pub const Version = struct {
             .active_tables = [_]u8{0} ** MaxLevel,
             .stat = stat,
             .opts = opts,
+            .wal_opts = wal_opts,
             .active = undefined,
         };
         errdefer res.deinit(io, alloc);
@@ -264,12 +269,12 @@ pub const Version = struct {
 
             var rep = try manifest.ManifestRecord.deserialize_from(mmap, alloc);
             defer rep.deinit(alloc);
-            try res.replay(dir, rep, opts, io, alloc);
+            try res.replay(dir, rep, opts, wal_opts, io, alloc);
         }
 
         const active = res.slab.alloc();
 
-        active.* = try WalTable.new(dir, opts, res.new_file_seq(), res, io, alloc);
+        active.* = try WalTable.new(dir, opts, wal_opts, res.new_file_seq(), res, io, alloc);
         res.active = active;
 
         if (sanitize)
@@ -464,6 +469,7 @@ pub const Version = struct {
         dir: std.Io.Dir,
         edits: std.ArrayList(manifest.ManifestRecord),
         opts: MemTableOpts,
+        wal_opts: WalOpts,
         io: std.Io,
         alloc: Allocator,
     ) !void {
@@ -531,7 +537,7 @@ pub const Version = struct {
         for (self.wals.items) |wal| {
             const alive_wal = self.slab.alloc();
 
-            alive_wal.* = try WalTable.open(dir, opts, wal, io, alloc);
+            alive_wal.* = try WalTable.open(dir, opts, wal_opts, wal, io, alloc);
 
             if (alive_wal.max_seq().get() > self.next_sequence.load(.monotonic).get()) {
                 self.next_sequence.store(KVSeq.init(alive_wal.max_seq().get() + 1), .monotonic);
@@ -673,7 +679,7 @@ test "Version serialization" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     {
@@ -694,7 +700,7 @@ fn test_file_meta(
     max_key: []const u8,
     max_value: []const u8,
 ) !FileMeta {
-    var memtable = try MemTable.new(alloc, std.testing.io, null);
+    var memtable = try MemTable.new(alloc, std.testing.io, .{});
     defer memtable.deinit(alloc);
 
     try memtable.put(min_key, min_value, KVSeq.init(seq));
@@ -719,7 +725,7 @@ fn create_test_sstable(
     file_seq: usize,
     keys: []const TestSSTableKV,
 ) !FileMeta {
-    var memtable = try MemTable.new(alloc, io, null);
+    var memtable = try MemTable.new(alloc, io, .{});
     defer memtable.deinit(alloc);
 
     for (keys) |kv| {
@@ -853,7 +859,7 @@ test "Version apply persists edits that reopen can replay" {
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
+        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
         defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
@@ -875,7 +881,7 @@ test "Version apply persists edits that reopen can replay" {
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
+        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 13), reopened.current_seq().get());
@@ -906,7 +912,7 @@ test "lvl0 compaction merges overlapping lvl1 table" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -990,7 +996,7 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1077,7 +1083,7 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1164,7 +1170,7 @@ test "lvl0 compaction physically deletes obsolete input files" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1246,7 +1252,7 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1328,7 +1334,7 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
+        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
         defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
@@ -1383,7 +1389,7 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
+        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 1), reopened.tables.items.len);
@@ -1419,7 +1425,7 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
+        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
         defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
@@ -1474,7 +1480,7 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, &stat, false, testing_io, allocator);
+        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 2), reopened.tables.items.len);

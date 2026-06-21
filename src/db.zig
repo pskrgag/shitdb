@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const MemTable = @import("storage").MemTable;
 const MemTableOpts = @import("storage").MemTableOpts;
+const WalOpts = @import("db/wal.zig").WalOpts;
 const Manager = @import("db/manager.zig").Manager;
 const HashTableTest = @import("test_utils").HashTableTest;
 const Dir = std.Io.Dir;
@@ -22,7 +23,8 @@ fn openOrCreateDir(io: std.Io, path: []const u8) !Dir {
 
 /// key value storage options
 pub const KeyValueOptions = struct {
-    memtable: MemTableOpts,
+    memtable: MemTableOpts = .{},
+    wal: WalOpts = .{},
 };
 
 /// Frontend class that provides an API for the database
@@ -47,11 +49,9 @@ pub const KeyValue = struct {
     }
 
     /// Creates new key value storage at specific directory.
-    pub fn new(path: []const u8, alloc: Allocator, io: std.Io, opts: ?KeyValueOptions) !Self {
+    pub fn new(path: []const u8, alloc: Allocator, io: std.Io, opts: KeyValueOptions) !Self {
         const dir = try openOrCreateDir(io, path);
-        const mem_opts = if (opts) |o| o.memtable else null;
-
-        return .{ .manager = try Manager.new(dir, alloc, io, mem_opts) };
+        return .{ .manager = try Manager.new(dir, alloc, io, opts.memtable, opts.wal) };
     }
 
     /// De-initializes db session
@@ -69,7 +69,7 @@ test "Simple API Test" {
     const io = std.testing.io;
 
     std.Io.Dir.cwd().deleteTree(io, "test_db2") catch {};
-    var new = try KeyValue.new("test_db2", allocator, io, null);
+    var new = try KeyValue.new("test_db2", allocator, io, .{});
     defer {
         new.deinit(allocator);
         std.Io.Dir.cwd().deleteTree(io, "test_db2") catch {
@@ -122,7 +122,7 @@ test "Shutdown and then boot" {
     const allocator = arena.allocator();
 
     std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {};
-    var old = try KeyValue.new("test_db3", allocator, io, null);
+    var old = try KeyValue.new("test_db3", allocator, io, .{});
     defer {
         std.Io.Dir.cwd().deleteTree(io, "test_db3") catch {
             @panic("gg");
@@ -135,7 +135,7 @@ test "Shutdown and then boot" {
 
     old.deinit(allocator);
 
-    var new = try KeyValue.new("test_db3", allocator, io, null);
+    var new = try KeyValue.new("test_db3", allocator, io, .{});
     defer new.deinit(allocator);
 
     inline for (1..200) |i| {
@@ -179,7 +179,7 @@ test "WAL startup recovery" {
 
     const Child = struct {
         fn run(child_alloc: Allocator, child_io: std.Io) !void {
-            var new = try KeyValue.new("test_db4", child_alloc, child_io, null);
+            var new = try KeyValue.new("test_db4", child_alloc, child_io, .{});
 
             inline for (1..Repeats * 2) |i| {
                 try new.put("a" ** i, "a" ** i, child_alloc);
@@ -190,7 +190,7 @@ test "WAL startup recovery" {
     try test_utils.fork.expectCrash(Child.run, .{ allocator, io });
 
     // Now try to check WAL
-    var new = try KeyValue.new("test_db4", allocator, io, null);
+    var new = try KeyValue.new("test_db4", allocator, io, .{});
     defer new.deinit(allocator);
 
     try std.testing.expectEqual(new.manager.version.current_seq().get(), Repeats);
