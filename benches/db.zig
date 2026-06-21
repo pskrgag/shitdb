@@ -58,7 +58,7 @@ fn clean_dir(name: []const u8) void {
     };
 }
 
-fn open_db(memtable_size: usize) void {
+fn open_db(memtable_size: usize, sync: bool) void {
     DirName = next_dir_name();
     clean_dir(DirName);
 
@@ -70,7 +70,7 @@ fn open_db(memtable_size: usize) void {
         DirName,
         allocator(),
         io(),
-        DbOptions{ .memtable = .{ .memtable_size = memtable_size } },
+        DbOptions{ .memtable = .{ .memtable_size = memtable_size }, .wal = .{ .sync = sync } },
     ) catch {
         @panic("failed to open benchmark db");
     };
@@ -87,11 +87,15 @@ fn close_db() void {
 }
 
 fn setup_large_memtable() void {
-    open_db(1 << 30);
+    open_db(1 << 30, false);
+}
+
+fn setup_large_memtable_sync() void {
+    open_db(1 << 30, true);
 }
 
 fn setup_small_memtable() void {
-    open_db(32 << 10);
+    open_db(32 << 10, false);
 }
 
 fn seed_db(count: usize) void {
@@ -106,12 +110,12 @@ fn seed_db(count: usize) void {
 }
 
 fn setup_active_gets() void {
-    open_db(1 << 30);
+    open_db(1 << 30, false);
     seed_db(InsertCount);
 }
 
 fn setup_sstable() void {
-    open_db(1 << 30);
+    open_db(1 << 30, false);
     seed_db(InsertCount);
     close_db();
 
@@ -208,6 +212,14 @@ pub fn add_benches(bench: *zbench.Benchmark) !void {
         .iterations = 3,
     });
 
+    try bench.add(create_name_insert("DB put sequential large memtable+sync"), put_sequential, .{
+        .hooks = .{
+            .before_each = setup_large_memtable_sync,
+            .after_each = teardown_db,
+        },
+        .iterations = 3,
+    });
+
     try bench.add(create_name_insert("DB put sequential small memtable"), put_sequential, .{
         .hooks = .{
             .before_each = setup_small_memtable,
@@ -215,7 +227,7 @@ pub fn add_benches(bench: *zbench.Benchmark) !void {
         },
         .iterations = 3,
     });
-    
+
     try bench.add(create_find_insert("DB get active memtable hit"), get_existing, .{
         .hooks = .{
             .before_each = setup_active_gets,
@@ -223,7 +235,7 @@ pub fn add_benches(bench: *zbench.Benchmark) !void {
         },
         .iterations = 5,
     });
-    
+
     try bench.add(create_find_insert("DB get SSTable hit"), get_existing, .{
         .hooks = .{
             .before_each = setup_sstable,
@@ -231,7 +243,7 @@ pub fn add_benches(bench: *zbench.Benchmark) !void {
         },
         .iterations = 5,
     });
-    
+
     try bench.add(create_find_insert("DB get missing"), get_missing, .{
         .hooks = .{
             .before_each = setup_sstable,
