@@ -1,5 +1,6 @@
 const std = @import("std");
 const BufferedFile = @import("io").BufferedFile;
+const map_error = @import("generic_utils").map_error;
 const Dir = std.Io.Dir;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -70,6 +71,13 @@ pub const WalOpts = struct {
     sync: bool = false,
 };
 
+pub const WalError = error{
+    // File write error.
+    WriteError,
+    // File sync error.
+    SyncError,
+};
+
 pub const Wal = struct {
     // WAL file
     file: BufferedFile,
@@ -90,7 +98,6 @@ pub const Wal = struct {
         defer alloc.free(name);
 
         const file = try dir.openFile(io, name, .{ .mode = .read_write });
-        errdefer file.close(io);
         return .{ .file = BufferedFile.readonly(file), .opts = opts };
     }
 
@@ -133,20 +140,38 @@ pub const Wal = struct {
         };
     }
 
-    pub fn commit(self: *Wal, trans: Transaction, io: std.Io, alloc: Allocator) !void {
-        _ = alloc;
+    pub fn commit(self: *Wal, t: Transaction, io: std.Io) WalError!void {
+        var trans = t;
 
-        {
-            var i = trans.iter();
-            while (i.next()) |e| {
-                Wal.record(e.op, &self.file, io) catch @panic("must not fail");
-            }
+        // Any error inside this block means that it was not possible to write to the WAL.
+        // There are 2 cases: I/O error and OOM.
+        //
+        // In any case Version must mark table as immutable and flush it,
+        // since we cannot believe WAL anymore
+
+        var i = trans.iter();
+        while (i.next()) |e| {
+            try map_error(Wal.record(e.op, &self.file, io), WalError.WriteError);
         }
 
-        try ei.maybe_error(.wal_flush, self.file.flush(io));
+        try map_error(
+            ei.maybe_error_specific(
+                .wal_flush,
+                self.file.flush(io),
+                WalError.WriteError,
+            ),
+            WalError.WriteError,
+        );
 
         if (self.opts.sync)
-            try ei.maybe_error(.wal_sync, self.file.sync(io));
+            try map_error(
+                ei.maybe_error_specific(
+                    .wal_sync,
+                    self.file.sync(io),
+                    WalError.SyncError,
+                ),
+                WalError.SyncError,
+            );
     }
 
     // Records one entry to the buffer
@@ -366,7 +391,7 @@ test "WAL serializes add record" {
     const entry = pending.op;
 
     var wal = try Wal.new(dir, FileSeq.init(1), null, .{}, testing_io, allocator);
-    try wal.commit(trans, testing_io, allocator);
+    try wal.commit(trans, testing_io);
     try wal.deinit(allocator, testing_io);
 
     const data = try readWalFile(dir, 1, allocator);
@@ -414,7 +439,7 @@ test "WAL serializes remove record" {
     const entry = pending.op;
 
     var wal = try Wal.new(dir, FileSeq.init(2), null, .{}, testing_io, allocator);
-    try wal.commit(trans, testing_io, allocator);
+    try wal.commit(trans, testing_io);
     try wal.deinit(allocator, testing_io);
 
     const data = try readWalFile(dir, 2, allocator);
@@ -461,7 +486,7 @@ test "WAL serializes records in append order" {
     const remove_entry = remove.op;
 
     var wal = try Wal.new(dir, FileSeq.init(3), null, .{}, testing_io, allocator);
-    try wal.commit(trans, testing_io, allocator);
+    try wal.commit(trans, testing_io);
     try wal.deinit(allocator, testing_io);
 
     const data = try readWalFile(dir, 3, allocator);
@@ -521,7 +546,7 @@ test "WAL replay restores add record into target table" {
 
     var wal = try Wal.new(dir, FileSeq.init(4), null, .{}, testing_io, allocator);
     defer wal.deinit(allocator, testing_io) catch unreachable;
-    try wal.commit(trans, testing_io, allocator);
+    try wal.commit(trans, testing_io);
 
     var target = try WalTable.new(dir, .{}, .{}, FileSeq.init(5), null, testing_io, allocator);
     defer target.deinit(allocator) catch unreachable;
@@ -559,7 +584,7 @@ test "WAL replay restores remove record into target table" {
 
     var wal = try Wal.new(dir, FileSeq.init(6), null, .{}, testing_io, allocator);
     defer wal.deinit(allocator, testing_io) catch unreachable;
-    try wal.commit(trans, testing_io, allocator);
+    try wal.commit(trans, testing_io);
 
     var target = try WalTable.new(dir, .{}, .{}, FileSeq.init(7), null, testing_io, allocator);
     defer target.deinit(allocator) catch unreachable;
@@ -593,7 +618,7 @@ test "WAL replay applies later remove over earlier add" {
 
     var wal = try Wal.new(dir, FileSeq.init(8), null, .{}, testing_io, allocator);
     defer wal.deinit(allocator, testing_io) catch unreachable;
-    try wal.commit(trans, testing_io, allocator);
+    try wal.commit(trans, testing_io);
 
     var target = try WalTable.new(dir, .{}, .{}, FileSeq.init(9), null, testing_io, allocator);
     defer target.deinit(allocator) catch unreachable;

@@ -37,6 +37,8 @@ pub const Flusher = struct {
     io: std.Io,
     // Version manager
     version: *Version,
+    // Error from the thread
+    err: ?anyerror,
 
     // NOTE: we hold the lock there to keep consistency:
     //
@@ -44,8 +46,6 @@ pub const Flusher = struct {
     //   the first table would be unreachable from the user.
     fn flush_one(self: *Flusher) !void {
         const first = self.list[0].?;
-
-        // first.assert_immutable();
 
         @memmove(self.list[0 .. MaxNumTables - 1], self.list[1..MaxNumTables]);
         self.list[MaxNumTables - 1] = null;
@@ -59,7 +59,7 @@ pub const Flusher = struct {
         self.version.stat.inc(.memtable_flush);
     }
 
-    fn flusher_thread_impl(self: *Flusher) !void {
+    fn flusher_thread(self: *Flusher) void {
         while (!self.stop.load(.monotonic)) {
             self.mutex.lockUncancelable(self.io);
 
@@ -71,16 +71,23 @@ pub const Flusher = struct {
                 return;
             }
 
-            try self.flush_one();
+            self.flush_one() catch |e| {
+                self.err = e;
+                self.mutex.unlock(self.io);
+
+                self.full_cv.signal(self.io);
+                return;
+            };
 
             self.full_cv.signal(self.io);
             self.mutex.unlock(self.io);
         }
     }
 
-    fn flusher_thread(self: *Flusher) !void {
-        // TODO: smth better please
-        flusher_thread_impl(self) catch @panic("Flusher thread panicked");
+    fn is_healthy(self: *Flusher) !void {
+        if (self.err) |e| {
+            return e;
+        }
     }
 
     pub fn new(alloc: Allocator, version: *Version, dir: std.Io.Dir, io: std.Io) !*Flusher {
@@ -96,6 +103,7 @@ pub const Flusher = struct {
         flusher.version = version;
         flusher.dir = dir;
         flusher.io = io;
+        flusher.err = null;
 
         // Spawning a thread is a release operation, so all writes should be reversed.
         flusher.thread = try Thread.spawn(.{}, Flusher.flusher_thread, .{flusher});
@@ -103,9 +111,11 @@ pub const Flusher = struct {
         return flusher;
     }
 
-    pub fn insert(self: *Flusher, table: *WalTable) void {
+    pub fn insert(self: *Flusher, table: *WalTable) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+
+        try self.is_healthy();
 
         if (self.count < MaxNumTables) {
             self.list[self.count] = table;
@@ -121,9 +131,23 @@ pub const Flusher = struct {
         }
     }
 
+    pub fn flush_all(self: *Flusher) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        self.empty_cv.signal(self.io);
+
+        while (self.count > 0 and self.err == null)
+            self.full_cv.waitUncancelable(self.io, &self.mutex);
+
+        try self.is_healthy();
+    }
+
     pub fn get(self: *Flusher, key: []const u8, seq: KVSeq, alloc: Allocator) !GetResult {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+
+        try self.is_healthy();
 
         for (0..self.count) |i| {
             const table: *WalTable = self.list[self.count - 1 - i].?;

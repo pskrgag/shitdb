@@ -50,6 +50,26 @@ pub fn maybe_error(
     return result;
 }
 
+pub fn maybe_error_specific(
+    comptime kind: ErrorKind,
+    result: anytype,
+    needed_error: anyerror,
+) anyerror!ErrorUnionPayload(@TypeOf(result)) {
+    if (!initialized)
+        return result;
+
+    const val = ErrorPoints.getPtr(kind);
+    if (val) |v| {
+        if (v.count.fetchSub(1, .monotonic) == 1) {
+            return needed_error;
+        } else {
+            return result;
+        }
+    }
+
+    return result;
+}
+
 // Enable panic point
 pub fn enable(kind: ErrorKind, count: usize) !void {
     init();

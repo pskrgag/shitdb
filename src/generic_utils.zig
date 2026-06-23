@@ -1,5 +1,16 @@
 const std = @import("std");
 
+fn ErrorUnionPayload(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .error_union => |error_union| error_union.payload,
+        else => @compileError("map_error expects an error union, got " ++ @typeName(T)),
+    };
+}
+
+pub fn map_error(result: anytype, mapped_error: anytype) @TypeOf(mapped_error)!ErrorUnionPayload(@TypeOf(result)) {
+    return result catch mapped_error;
+}
+
 fn is_primitive_type(Key: type) bool {
     return switch (@typeInfo(Key)) {
         .int, .float, .bool => true,

@@ -15,12 +15,20 @@ const Transaction = @import("manager.zig").Transaction;
 const test_utils = @import("test_utils");
 const SmallVec = @import("adt").SmallVec;
 const PendingWrite = @import("manager.zig").PendingWrite;
+const Slot = @import("storage").Slot;
 
-const KvArray = SmallVec(KeyValue, 30);
+const SlotArray = SmallVec(Slot, 30);
 
 pub const State = enum(u8) {
     active,
     immutable,
+};
+
+pub const WalTableCommitResult = struct {
+    // Need memtable rotation
+    need_rotate: bool,
+    // WAL commit failed. Need direct flush
+    wal_failed: bool = false,
 };
 
 /// Memtable + WAL
@@ -122,10 +130,10 @@ pub const WalTable = struct {
 
     // This function must not return an error!
     fn append_kv(
-        keyvalue: anyerror!KeyValue,
+        keyvalue: anyerror!Slot,
         trans: *Transaction,
         req: *PendingWrite,
-        kvarray: *KvArray,
+        kvarray: *SlotArray,
         full: *bool,
         alloc: Allocator,
     ) Action {
@@ -150,20 +158,20 @@ pub const WalTable = struct {
     }
 
     /// Tries to commit transaction. May commit only part of it
-    pub fn commit(self: *WalTable, trans: *Transaction, alloc: Allocator) !bool {
+    pub fn commit(self: *WalTable, trans: *Transaction, alloc: Allocator) WalTableCommitResult {
         var full = true;
         var iter = trans.iter();
-        var kvs = KvArray.init();
+        var slots = SlotArray.init();
         var commited = Transaction{};
-        defer kvs.deinit(alloc);
+        defer slots.deinit(alloc);
 
         // Pre-allocate as much as possible in the memtable allocator. If it's not possible
         // to allocate, these pending writes will be left for future.
         while (iter.next()) |i| {
             switch (i.op) {
                 .Put => |p| {
-                    const kv = self.table.create_add_kv(p.key, p.value, p.seq);
-                    const res = WalTable.append_kv(kv, trans, i, &kvs, &full, alloc);
+                    const kv = self.table.allocate_put_slot(p.key, p.value, p.seq);
+                    const res = WalTable.append_kv(kv, trans, i, &slots, &full, alloc);
 
                     switch (res) {
                         .Continue => continue,
@@ -172,8 +180,8 @@ pub const WalTable = struct {
                     }
                 },
                 .Remove => |p| {
-                    const kv = self.table.create_remove_kv(p.key, p.seq);
-                    const res = WalTable.append_kv(kv, trans, i, &kvs, &full, alloc);
+                    const kv = self.table.allocate_remove_slot(p.key, p.seq);
+                    const res = WalTable.append_kv(kv, trans, i, &slots, &full, alloc);
 
                     switch (res) {
                         .Continue => continue,
@@ -187,22 +195,25 @@ pub const WalTable = struct {
             commited.push_active(i);
         }
 
-        errdefer |e| {
-            // If appending to WAL failed we have to mark the whole transaction as failed.
-            commited.mark_error(e);
-        }
-
         // At this point we have entries that fit into memtable. Try to commit them to WAL.
-        try self.wal.commit(commited, self.io, alloc);
+        self.wal.commit(commited, self.io) catch {
+            // If WAL commit failed, we can try to commit into MemTable and then flush it. This we
+            // can overcome WAL failures.
+            for (slots.items()) |slot| {
+                self.table.commit_slot(slot) catch @panic("must not panic here");
+            }
+
+            return .{ .need_rotate = !full, .wal_failed = true };
+        };
 
         test_utils.Injections.fault_injection.crash(.after_wal);
 
         // And then commit to active table. It must not fail, since memory was reserved.
-        for (kvs.items()) |kv| {
-            self.table.put_kv(kv) catch @panic("must not panic here");
+        for (slots.items()) |slot| {
+            self.table.commit_slot(slot) catch @panic("must not panic here");
         }
 
-        return full;
+        return .{ .need_rotate = !full, };
     }
 
     /// Retrieves value from the memtable

@@ -96,6 +96,13 @@ pub const PendingWrite = struct {
     active_node: std.DoublyLinkedList.Node = .{},
 };
 
+pub const ManagerState = enum(u8) {
+    // DB is fine.
+    Healthy,
+    // Something went wrong and db does not accept new requests.
+    Broken,
+};
+
 pub const Manager = struct {
     // Root folder
     root: Dir,
@@ -115,6 +122,8 @@ pub const Manager = struct {
     writers: std.DoublyLinkedList,
     // Number of writers
     writers_count: usize,
+    // State of the database
+    state: ManagerState,
 
     const Self = @This();
 
@@ -143,7 +152,13 @@ pub const Manager = struct {
             .opts = opts,
             .io = io,
             .stat = stat,
+            .state = .Healthy,
         };
+    }
+
+    fn is_healty(self: *Self) !void {
+        if (self.state == .Broken)
+            return error.Broken;
     }
 
     fn build_transaction(self: *Self) Transaction {
@@ -214,7 +229,10 @@ pub const Manager = struct {
         // Each request is either completed via done or marked with error. In any case
         // caller return pending.err. Failure of this call does not mean that current write
         // has failed. In means that some of writes failed.
-        self.version.commit(transaction, self.root, self.io, alloc) catch {};
+        const broken = self.version.commit(transaction, self.root, self.io, alloc) catch true;
+
+        if (broken)
+            self.state = .Broken;
 
         // Now take the mutex back and remove all pending writes from the queue.
         self.dblock.lockUncancelable(self.io);
@@ -235,16 +253,20 @@ pub const Manager = struct {
 
     /// Puts new value into memtable.
     pub fn put(self: *Self, key: []const u8, value: []const u8, alloc: Allocator) !void {
+        try self.is_healty();
         try self.write(WriteOp{ .Put = .{ .key = key, .value = value, .seq = undefined } }, alloc);
     }
 
     /// Removes a value from database
     pub fn remove(self: *Self, key: []const u8, alloc: Allocator) !void {
+        try self.is_healty();
         try self.write(WriteOp{ .Remove = .{ .key = key, .seq = undefined } }, alloc);
     }
 
     /// Retrieves a value from database
     pub fn get(self: *Self, key: []const u8, alloc: Allocator) !?[]u8 {
+        try self.is_healty();
+
         self.dblock.lockUncancelable(self.io);
         defer self.dblock.unlock(self.io);
 
@@ -590,6 +612,12 @@ test "WAL GC crash" {
 const SuccessKey = "a" ** 10;
 const SuccessValue = "aa" ** 10;
 
+const Success1Key = "c" ** 10;
+const Success1Value = "cc" ** 10;
+
+const Success2Key = "d" ** 10;
+const Success2Value = "dd" ** 10;
+
 const FailKey = "b" ** 10;
 const FailKeySmall = "bb" ** 10;
 const FailValueBig = "bb" ** (40 << 10);
@@ -599,9 +627,31 @@ fn success_put(man: *Manager, alloc: Allocator) !void {
     try man.put(SuccessKey, SuccessValue, alloc);
 }
 
+fn success_put_wal_fail(man: *Manager, alloc: Allocator) !void {
+    // This one must not fail
+    try man.put(SuccessKey, SuccessValue, alloc);
+}
+
 fn error_put(man: *Manager, alloc: Allocator) !void {
     man.put(FailKey, FailKeySmall, alloc) catch |e| {
         try std.testing.expectEqual(error.InjectedError, e);
+        return;
+    };
+
+    return error.UnexpectedReturn;
+}
+
+fn wal_write_error_put(man: *Manager, alloc: Allocator) !void {
+    try man.put(Success1Key, Success1Value, alloc);
+}
+
+fn wal_write_error_put1(man: *Manager, alloc: Allocator) !void {
+    try man.put(Success2Key, Success2Value, alloc);
+}
+
+fn wal_sync_error_put(man: *Manager, alloc: Allocator) !void {
+    man.put(FailKey, FailKeySmall, alloc) catch |e| {
+        try std.testing.expectEqual(error.SyncError, e);
         return;
     };
 
@@ -672,13 +722,13 @@ test "Transaction commit crash" {
         );
 
         const t1 = try sched.spawn(
-            error_put,
+            wal_write_error_put,
             .{ &manager, allocator },
             allocator,
         );
 
         const t2 = try sched.spawn(
-            error_put,
+            wal_write_error_put1,
             .{ &manager, allocator },
             allocator,
         );
@@ -715,6 +765,18 @@ test "Transaction commit crash" {
         try sched.run_with_plan(plan, allocator);
     }
     try sanitize_manager_after_run(&manager, allocator);
+
+    // They should be found on disk.
+    {
+        const value = (try manager.get(Success1Key, allocator)).?;
+        defer allocator.free(value);
+        try std.testing.expectEqualSlices(u8, Success1Value, value);
+    }
+    {
+        const value = (try manager.get(Success2Key, allocator)).?;
+        defer allocator.free(value);
+        try std.testing.expectEqualSlices(u8, Success2Value, value);
+    }
 }
 
 test "WAL sync failure fails the whole transaction" {
@@ -755,13 +817,13 @@ test "WAL sync failure fails the whole transaction" {
         );
 
         const t1 = try sched.spawn(
-            error_put,
+            wal_write_error_put,
             .{ &manager, allocator },
             allocator,
         );
 
         const t2 = try sched.spawn(
-            error_put,
+            wal_write_error_put1,
             .{ &manager, allocator },
             allocator,
         );
@@ -800,6 +862,18 @@ test "WAL sync failure fails the whole transaction" {
 
     try std.testing.expectEqual(null, try manager.get(FailKey, allocator));
     try sanitize_manager_after_run(&manager, allocator);
+
+    // They should be found on disk.
+    {
+        const value = (try manager.get(Success1Key, allocator)).?;
+        defer allocator.free(value);
+        try std.testing.expectEqualSlices(u8, Success1Value, value);
+    }
+    {
+        const value = (try manager.get(Success2Key, allocator)).?;
+        defer allocator.free(value);
+        try std.testing.expectEqualSlices(u8, Success2Value, value);
+    }
 }
 
 test "Invalid argument in one request does not affect the whole group" {

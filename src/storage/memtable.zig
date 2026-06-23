@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const Node = std.DoublyLinkedList.Node;
 const HashTableTest = @import("test_utils").HashTableTest;
 const Value = std.atomic.Value;
+const SkiplistNode = skiplist.Node;
 
 pub const sstable = @import("sstable.zig");
 pub const manifest = @import("manifest.zig");
@@ -219,6 +220,11 @@ pub const GetResult = union(enum) {
     }
 };
 
+/// Pre-allocated slot in memtable.
+pub const Slot = struct {
+    node: *SkiplistNode(KeyValue),
+};
+
 /// MemTable that holds newly added key-value pairs
 pub const MemTable = struct {
     table: skiplist.SkipList(KeyValue),
@@ -280,29 +286,37 @@ pub const MemTable = struct {
     }
 
     /// Creates a new KV using internal bounded arena
-    pub fn create_add_kv(self: *Self, key: []const u8, value: []const u8, seq: KVSeq) !KeyValue {
+    pub fn allocate_put_slot(
+        self: *Self,
+        key: []const u8,
+        value: []const u8,
+        seq: KVSeq,
+    ) !Slot {
         if (value.len == 0)
             return error.InvalidValue;
 
-        return self.map_kv_error(
+        const kv = try self.map_kv_error(
             KeyValue.new(key, value, seq, Type.Add, self.arena.allocator()),
             key,
             value,
         );
+        return .{ .node = try self.table.preallocate_node(kv) };
     }
 
-    pub fn create_remove_kv(self: *Self, key: []const u8, seq: KVSeq) !KeyValue {
-        return self.map_kv_error(
+    pub fn allocate_remove_slot(self: *Self, key: []const u8, seq: KVSeq) !Slot {
+        const kv = try self.map_kv_error(
             KeyValue.new(key, null, seq, Type.Delete, self.arena.allocator()),
             key,
             null,
         );
+
+        return .{ .node = try self.table.preallocate_node(kv) };
     }
 
     /// Puts kv previously constructed by MemTable::create_kv
-    pub fn put_kv(self: *Self, kv: KeyValue) !void {
-        try self.table.insert(kv);
-        self.update_max_seq(kv.as_seq());
+    pub fn commit_slot(self: *Self, slot: Slot) !void {
+        try self.table.insert_node(slot.node);
+        self.update_max_seq(slot.node.key.as_seq());
     }
 
     /// Inserts new value into MemTable
@@ -310,20 +324,14 @@ pub const MemTable = struct {
         if (value.len == 0)
             return error.InvalidValue;
 
-        const kv = try KeyValue.new(key, value, seq, Type.Add, self.arena.allocator());
-        return self.put_kv(kv);
+        const kv = try self.allocate_put_slot(key, value, seq);
+        return self.commit_slot(kv);
     }
 
     // Removes value from MemTable
     pub fn remove(self: *Self, key: []const u8, seq: KVSeq) !void {
-        const kv = try KeyValue.new(key, "", seq, Type.Delete, self.arena.allocator());
-
-        std.debug.assert(kv.is_tombstone());
-        // See comment above.
-        // std.debug.assert(seq.get() >= self.max_seq.get());
-
-        self.update_max_seq(seq);
-        _ = try self.table.insert(kv);
+        const kv = try self.allocate_remove_slot(key, seq);
+        return self.commit_slot(kv);
     }
 
     /// Retries value from MemTable

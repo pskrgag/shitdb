@@ -166,16 +166,24 @@ pub const Version = struct {
         }
     }
 
-    pub fn commit(self: *Self, t: Transaction, dir: std.Io.Dir, io: std.Io, alloc: Allocator) !void {
+    pub fn rotate_active(self: *Self, dir: std.Io.Dir, flush: bool, io: std.Io, alloc: Allocator) !void {
+        const next_file = self.new_file_seq();
+        const new_table = self.slab.alloc();
+
+        new_table.* = try WalTable.new(dir, self.opts, self.wal_opts, next_file, self, io, alloc);
+        try self.flusher.insert(self.active);
+        self.active = new_table;
+
+        if (flush)
+            try self.flusher.flush_all();
+    }
+
+    pub fn commit(self: *Self, t: Transaction, dir: std.Io.Dir, io: std.Io, alloc: Allocator) anyerror!bool {
         var trans = t;
+        var broken = false;
 
-        const full = try self.active.commit(&trans, alloc);
-        if (!full) {
-            // This means that active memtable is full. Uncommitted requests are left in `t`.
-            // Need to allocate new active table and retry the request
-            const next_file = self.new_file_seq();
-            const new_table = self.slab.alloc();
-
+        const res = self.active.commit(&trans, alloc);
+        if (res.need_rotate or res.wal_failed) {
             errdefer |e| {
                 // There was an error while processing transaction. We need to mark all pending
                 // transactions as failed to propagate this info to callers.
@@ -185,13 +193,18 @@ pub const Version = struct {
                 trans.mark_error(e);
             }
 
-            new_table.* = try WalTable.new(dir, self.opts, self.wal_opts, next_file, self, io, alloc);
-            self.flusher.insert(self.active);
-            self.active = new_table;
+            self.rotate_active(dir, res.wal_failed, io, alloc) catch |e| {
+                broken = true;
+
+                // FIXME: wtf is wrong with zig?
+                return @as(anyerror!bool, e);
+            };
 
             // Try to commit to new table
-            try self.commit(trans, dir, io, alloc);
+            broken = broken or try self.commit(trans, dir, io, alloc);
         }
+
+        return broken;
     }
 
     pub fn allocate_seqs(self: *Self, count: usize) KVSeq {
@@ -284,8 +297,8 @@ pub const Version = struct {
     }
 
     // Inserts new immutable memtable
-    pub fn insert(self: *Version, table: *WalTable) void {
-        self.flusher.insert(table);
+    pub fn insert(self: *Version, table: *WalTable) !void {
+        try self.flusher.insert(table);
     }
 
     fn file_name(seq: FileSeq, alloc: Allocator) ![]const u8 {
@@ -544,7 +557,7 @@ pub const Version = struct {
             }
 
             alive_wal.make_immune();
-            self.insert(alive_wal);
+            try self.insert(alive_wal);
         }
     }
 
@@ -573,7 +586,7 @@ pub const Version = struct {
 
     // De-initializes version
     pub fn deinit(self: *Version, io: std.Io, alloc: Allocator) void {
-        self.flusher.insert(self.active);
+        self.flusher.insert(self.active) catch @panic("todo");
         self.active = undefined;
 
         // It's required to destroy flusher first, since it may want to apply some changes to version.

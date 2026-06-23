@@ -34,7 +34,7 @@ fn NodeRef(T: type) type {
     };
 }
 
-fn Node(T: type) type {
+pub fn Node(T: type) type {
     return struct {
         key: T,
         next: std.ArrayList(std.atomic.Value(NodeRef(T))),
@@ -173,6 +173,15 @@ pub fn SkipList(T: type) type {
             }
         }
 
+        // Pre-allocates node
+        pub fn preallocate_node(self: *Self, val: T) !*Node(T) {
+            const lvl = Self.random_lvl();
+            const node = try self.arena.allocator().create(Node(T));
+
+            node.* = try Node(T).new(lvl, val, self.arena.allocator());
+            return node;
+        }
+
         /// Constructs new SkipList with `bound` memory usage.
         pub fn new(alloc: Allocator, io: std.Io) !Self {
             var arena = try Arena.new(alloc, io);
@@ -191,11 +200,16 @@ pub fn SkipList(T: type) type {
             const node = try self.arena.allocator().create(Node(T));
             node.* = try Node(T).new(lvl, val, self.arena.allocator());
 
+            return self.insert_node(node);
+        }
+
+        /// Inserts pre-allocated node into skiplist.
+        pub fn insert_node(self: *Self, node: *Node(T)) !void {
             var linked_lvl: usize = 0;
+            const lvl = node.heigth();
 
             std.debug.assert(lvl > 0);
             std.debug.assert(lvl < MaxHeigth);
-            std.debug.assert(node.heigth() > 0);
 
             outer: while (true) {
                 var prev: [MaxHeigth]*Node(T) = undefined;
@@ -204,7 +218,7 @@ pub fn SkipList(T: type) type {
 
                 std.debug.assert(max_h < MaxHeigth);
 
-                const found = self.find_insert_spot(T, val, max_h, prev[0..], succ[0..], linked_lvl);
+                const found = self.find_insert_spot(T, node.key, max_h, prev[0..], succ[0..], linked_lvl);
                 if (found != null)
                     return error.AlreadyExists;
 
