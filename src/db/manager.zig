@@ -346,22 +346,22 @@ fn add_test_sstable(
     try memtable.put(key, value, storage.KVSeq.init(value_seq));
 
     const file = FileSeq.init(file_seq);
-    const name = try std.fmt.allocPrint(alloc, "memtable{}.sst", .{file.get()});
+    var meta = FileMeta{
+        .lvl = 0,
+        .max = try KeyOwned.from_kv(memtable.max().?, alloc),
+        .min = try KeyOwned.from_kv(memtable.min().?, alloc),
+        .file_seq = file,
+        .value_seq = storage.KVSeq.init(value_seq),
+    };
 
-    var sstable = try SSTable.create(manager.root, name, &memtable, 0, manager.io, alloc);
+    var sstable = try SSTable.create(manager.root, meta, &memtable, 0, manager.io, alloc);
     defer sstable.deinit();
+    meta.value_seq = sstable.maximum_seq();
 
     var edit = try VersionEdit.empty(alloc);
     defer edit.deinit(alloc);
 
-    try edit.new_files.append(alloc, FileMeta{
-        .lvl = 0,
-        .name = name,
-        .max = try KeyOwned.from_raw(sstable.max(), alloc),
-        .min = try KeyOwned.from_raw(sstable.min(), alloc),
-        .file_seq = file,
-        .value_seq = sstable.maximum_seq(),
-    });
+    try edit.new_files.append(alloc, meta);
 
     try manager.version.apply(edit, manager.root, manager.io, alloc);
 }

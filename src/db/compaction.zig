@@ -1,0 +1,110 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const FileMeta = @import("storage").manifest.FileMeta;
+
+pub const MaxLevel: usize = 2;
+pub const MaxTablesLVL0: usize = 5;
+
+pub const CompactionOptions = union(enum) {
+    Default: void,
+    ForceMergeLvl0: void,
+};
+
+pub const CompactionPlan = struct {
+    input_files: std.ArrayList(FoundFile),
+    overlap_files: std.ArrayList(FoundFile),
+    dst_lvl: u8,
+
+    const FoundFile = struct {
+        meta: FileMeta,
+        idx: usize,
+    };
+
+    fn find_cadidates_lvl0(files: []FileMeta, alloc: Allocator, lvl: u8) !std.ArrayList(FoundFile) {
+        var res = try std.ArrayList(FoundFile).initCapacity(alloc, 2);
+        var found: usize = 0;
+
+        for (files, 0..) |file, idx| {
+            if (file.lvl == lvl) {
+                try res.append(alloc, .{ .meta = file, .idx = idx });
+                found += 1;
+
+                if (found == 2)
+                    break;
+            }
+        }
+
+        std.debug.assert(found == 2);
+        return res;
+    }
+
+    fn find_cadidates(files: []FileMeta, alloc: Allocator, lvl: u8) !std.ArrayList(FoundFile) {
+        if (lvl == 0) {
+            return CompactionPlan.find_cadidates_lvl0(files, alloc, lvl);
+        } else {
+            @panic("todo");
+        }
+    }
+
+    fn should_compact_lvl0(files: []FileMeta, opts: CompactionOptions) bool {
+        var count: usize = 0;
+
+        for (files) |f| {
+            if (f.lvl == 0) {
+                count += 1;
+            }
+        }
+
+        return (count > 0 and opts == .ForceMergeLvl0) or count > MaxTablesLVL0;
+    }
+
+    fn should_compact(files: []FileMeta, opts: CompactionOptions) ?u8 {
+        if (CompactionPlan.should_compact_lvl0(files, opts)) {
+            return 0;
+        }
+
+        return null;
+    }
+
+    pub fn new(files: []FileMeta, opts: CompactionOptions, alloc: Allocator) !?CompactionPlan {
+        if (CompactionPlan.should_compact(files, opts)) |lvl| {
+            var candidates = try CompactionPlan.find_cadidates(files, alloc, lvl);
+            errdefer candidates.deinit(alloc);
+
+            var next_lvl_files = try std.ArrayList(FoundFile).initCapacity(alloc, 0);
+            errdefer next_lvl_files.deinit(alloc);
+
+            // Step 2: once we've found them. Find all lvl1 tables that have overlapping key ranges
+            for (files, 0..) |file, idx| {
+                if (file.lvl == lvl + 1) {
+                    var should_consider = false;
+
+                    for (candidates.items) |candidate| {
+                        should_consider |= file.key_range_overlap(
+                            candidate.meta.min.data,
+                            candidate.meta.max.data,
+                        );
+                        if (should_consider)
+                            break;
+                    }
+
+                    if (should_consider)
+                        try next_lvl_files.append(alloc, .{ .meta = file, .idx = idx });
+                }
+            }
+
+            return .{
+                .dst_lvl = lvl + 1,
+                .input_files = candidates,
+                .overlap_files = next_lvl_files,
+            };
+        } else {
+            return null;
+        }
+    }
+
+    pub fn deinit(self: *CompactionPlan, alloc: Allocator) void {
+        self.overlap_files.deinit(alloc);
+        self.input_files.deinit(alloc);
+    }
+};

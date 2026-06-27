@@ -47,9 +47,12 @@ pub const KeyOwned = struct {
     }
 };
 
-// TODO: I really think storing filename is overkill. We can generate it from sequence+lvl
+pub fn alloc_sstable_name(seq: FileSeq, alloc: Allocator) ![]const u8 {
+    const res = std.fmt.allocPrint(alloc, "memtable{}.sst", .{seq.get()});
+    return res;
+}
+
 pub const FileMeta = struct {
-    name: []const u8,
     max: KeyOwned,
     min: KeyOwned,
     lvl: u8,
@@ -65,7 +68,6 @@ pub const FileMeta = struct {
     }
 
     pub fn deinit(self: *FileMeta, alloc: Allocator) void {
-        alloc.free(self.name);
         self.max.deinit(alloc);
         self.min.deinit(alloc);
     }
@@ -80,8 +82,7 @@ pub const FileMeta = struct {
     }
 
     pub fn serialize_size(self: *const FileMeta) usize {
-        return ManifestRecord.string_size(self.name) +
-            ManifestRecord.string_size(self.max.data) +
+        return ManifestRecord.string_size(self.max.data) +
             ManifestRecord.string_size(self.min.data) +
             @sizeOf(@TypeOf(self.lvl)) +
             @sizeOf(@TypeOf(self.file_seq)) +
@@ -192,7 +193,6 @@ pub const ManifestRecord = union(enum) {
                 Self.put_int(usize, &data, add.file_seq.get());
                 Self.put_int(usize, &data, add.value_seq.get());
 
-                Self.put_slice(&data, add.name);
                 Self.put_slice(&data, add.max.data);
                 Self.put_slice(&data, add.min.data);
             },
@@ -227,13 +227,11 @@ pub const ManifestRecord = union(enum) {
                     const lvl = Self.get_int(u8, &iter);
                     const file_seq = FileSeq.init(Self.get_int(usize, &iter));
                     const value_seq = KVSeq.init(Self.get_int(usize, &iter));
-                    const name = Self.get_slice(&iter);
                     const max = Self.get_slice(&iter);
                     const min = Self.get_slice(&iter);
 
                     try res.append(alloc, .{ .AddFile = .{
                         .lvl = lvl,
-                        .name = try alloc.dupe(u8, name),
                         .min = try KeyOwned.from_raw(min, alloc),
                         .max = try KeyOwned.from_raw(max, alloc),
                         .file_seq = file_seq,
