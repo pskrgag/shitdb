@@ -294,17 +294,19 @@ pub const Version = struct {
             alloc,
         );
 
-        errdefer {
-            for (new.items) |*meta| {
-                meta.deinit(alloc);
-            }
-        }
-
         defer {
             new.deinit(alloc);
         }
 
-        try edit.new_files.appendSlice(alloc, new.items);
+        // There is a hacky ownership transfer. In case of success of this push, transfer is moved
+        // to edit. Otherwise we need to free min/max allocated in SSTable.merge.
+        edit.new_files.appendSlice(alloc, new.items) catch |e| {
+            for (new.items) |*meta| {
+                meta.deinit(alloc);
+            }
+            return e;
+        };
+
         try self.apply(edit, dir, io, alloc);
     }
 
@@ -316,10 +318,14 @@ pub const Version = struct {
         alloc: Allocator,
     ) !void {
         while (true) {
-            self.mutex.lockUncancelable(io);
-            errdefer self.mutex.unlock(io);
-            const p = try CompactionPlan.new(self.tables.items, opts, alloc);
-            self.mutex.unlock(io);
+            // Plans borrow FileMeta key slices. This is safe because compaction is single-threaded
+            // in the flusher, and only compaction removes table metadata.
+            const p = blk: {
+                self.mutex.lockUncancelable(io);
+                defer self.mutex.unlock(io);
+
+                break :blk try CompactionPlan.new(self.tables.items, opts, alloc);
+            };
 
             if (p) |pp| {
                 // fucking zig, lol. Captures are const, so I have to make an extra local variable here
@@ -332,64 +338,6 @@ pub const Version = struct {
             }
         }
     }
-
-    // fn compact_lvl0(self: *Version, dir: std.Io.Dir, io: std.Io, alloc: Allocator) !void {
-    //     std.debug.assert(self.tables.items.len >= MaxLevel);
-    //     std.debug.assert(MaxLevel >= 2);
-    //
-    //     var opened_tables = try std.ArrayList(SSTable).initCapacity(alloc, 0);
-    //
-    //     self.mutex.lockUncancelable(io);
-    //     errdefer self.mutex.unlock(io);
-    //
-    //     var plan = try CompactionPlan.new(self.tables.items, 0, alloc);
-    //     defer plan.deinit(alloc);
-    //     self.mutex.unlock(io);
-    //
-    //     const merged_seq = self.new_file_seq();
-    //     // name will be freed later, since it will be added to tables array
-    //     const name = try Self.file_name(merged_seq, alloc);
-    //
-    //     defer {
-    //         for (opened_tables.items) |sstable|
-    //             sstable.deinit();
-    //
-    //         opened_tables.deinit(alloc);
-    //     }
-    //
-    //     for (plan.overlap_files.items) |lvl1| {
-    //         try opened_tables.append(alloc, try SSTable.open(dir, io, lvl1.meta.name));
-    //     }
-    //
-    //     for (plan.input_files.items) |lvl1| {
-    //         try opened_tables.append(alloc, try SSTable.open(dir, io, lvl1.meta.name));
-    //     }
-    //
-    //     const new = try SSTable.merge(dir, name, io, opened_tables.items, 1, alloc);
-    //     defer new.deinit();
-    //
-    //     var edit = try VersionEdit.empty(alloc);
-    //     defer edit.deinit(alloc);
-    //
-    //     try edit.new_files.append(alloc, FileMeta{
-    //         .lvl = 1,
-    //         .name = name,
-    //         .max = try KeyOwned.from_raw(new.max(), alloc),
-    //         .min = try KeyOwned.from_raw(new.min(), alloc),
-    //         .file_seq = merged_seq,
-    //         .value_seq = new.maximum_seq(),
-    //     });
-    //
-    //     for (plan.input_files.items) |lvl1| {
-    //         try edit.deleted_files.append(alloc, .{ .file = lvl1.meta.file_seq, .lvl = 0 });
-    //     }
-    //
-    //     for (plan.overlap_files.items) |lvl1| {
-    //         try edit.deleted_files.append(alloc, .{ .file = lvl1.meta.file_seq, .lvl = 1 });
-    //     }
-    //
-    //     try self.apply(edit, dir, io, alloc);
-    // }
 
     // Flushes a memtable synchronously into an SSTable and records it in the manifest.
     pub fn flush_memtable(
