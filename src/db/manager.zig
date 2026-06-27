@@ -186,10 +186,13 @@ pub const Manager = struct {
         var pending = PendingWrite{
             .op = op,
         };
+        var broken = false;
 
         const transaction = blk: {
             self.dblock.lockUncancelable(self.io);
             defer self.dblock.unlock(self.io);
+
+            try self.is_healty();
 
             self.writers.append(&pending.pending_node);
             self.writers_count += 1;
@@ -229,13 +232,15 @@ pub const Manager = struct {
         // Each request is either completed via done or marked with error. In any case
         // caller return pending.err. Failure of this call does not mean that current write
         // has failed. In means that some of writes failed.
-        const broken = self.version.commit(transaction, self.root, self.io, alloc) catch true;
-
-        if (broken)
-            self.state = .Broken;
+        self.version.commit(transaction, self.root, self.io, alloc) catch {
+            broken = true;
+        };
 
         // Now take the mutex back and remove all pending writes from the queue.
         self.dblock.lockUncancelable(self.io);
+
+        if (broken)
+            self.state = .Broken;
 
         for (0..transaction.count) |_| {
             const old = self.writers.popFirst();
@@ -754,7 +759,7 @@ test "Transaction commit crash" {
         try plan.add(.{
             .fiber = t1,
             .run = .End,
-            .inject_error = .wal_flush,
+            .inject_error = &.{.wal_flush},
         }, allocator);
         // 5. Continue follower
         try plan.add(.{
@@ -849,7 +854,7 @@ test "WAL sync failure fails the whole transaction" {
         try plan.add(.{
             .fiber = t1,
             .run = .End,
-            .inject_error = .wal_sync,
+            .inject_error = &.{.wal_sync},
         }, allocator);
         // 6. Continue follower
         try plan.add(.{
@@ -1103,7 +1108,7 @@ test "CV wait fail removes write from the queue" {
             .{
                 .fiber = leader,
                 .run = .{ .Sleep = .TransactionBuilt },
-                .inject_error = .write_cv_wait,
+                .inject_error = &.{.write_cv_wait},
             },
             allocator,
         );
@@ -1144,4 +1149,100 @@ test "Too big record for memtable infinity loop" {
         defer allocator.free(value);
         try std.testing.expectEqualSlices(u8, "b" ** 20, value);
     }
+}
+
+test "Failed WAL sync makes table broken" {
+    const Scheduler = test_utils.Scheduler.Scheduler;
+    const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
+
+    ei.init();
+    defer ei.clear();
+
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "failed_wal_sync_makes_table_broken";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    const dir = try openOrCreateDir(io, dirname);
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    {
+        var manager = try Manager.new(dir, allocator, io, .{ .memtable_size = 200 }, .{
+            .sync = true,
+        });
+        defer manager.deinit(allocator);
+
+        try ei.enable(.memtable_flush, 1);
+
+        {
+            var sched = try Scheduler.new(allocator);
+            defer sched.deinit(allocator);
+
+            const leader = try sched.spawn(
+                success_put,
+                .{ &manager, allocator },
+                allocator,
+            );
+
+            const t1 = try sched.spawn(
+                wal_write_error_put,
+                .{ &manager, allocator },
+                allocator,
+            );
+
+            const t2 = try sched.spawn(
+                wal_write_error_put1,
+                .{ &manager, allocator },
+                allocator,
+            );
+
+            var plan = try SchedulerPlan.new(allocator);
+            defer plan.deinit(allocator);
+
+            // 1. Build transaction and release the mutex
+            try plan.add(
+                .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
+                allocator,
+            );
+            // 2. Take the mutex and wait for cv
+            try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
+            // 3. Take the mutex and wait for cv (queue length must be 2)
+            try plan.add(.{ .fiber = t2, .run = .{ .Sleep = .ConditionWait } }, allocator);
+            // 4. Commit first transaction
+            try plan.add(.{
+                .fiber = leader,
+                .run = .End,
+            }, allocator);
+            // 5. Fail WAL sync; forced MemTable flush is already armed to fail.
+            try plan.add(.{
+                .fiber = t1,
+                .run = .End,
+                .inject_error = &.{ .wal_sync, .memtable_flush },
+            }, allocator);
+            // 6. Continue follower
+            try plan.add(.{
+                .fiber = t2,
+                .run = .End,
+            }, allocator);
+
+            try sched.run_with_plan(plan, allocator);
+        }
+
+        try std.testing.expectEqual(ManagerState.Broken, manager.state);
+        try std.testing.expectError(error.Broken, manager.put("z", "z", allocator));
+        try std.testing.expectError(error.Broken, manager.remove("z", allocator));
+        try std.testing.expectError(error.Broken, manager.get(SuccessKey, allocator));
+    }
+
+    var manager = try Manager.new(dir, allocator, io, .{}, .{});
+    defer manager.deinit(allocator);
 }

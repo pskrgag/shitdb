@@ -19,7 +19,7 @@ pub const SchedulerPlanEntry = struct {
         Sleep: SleepPoint,
         End: void,
     },
-    inject_error: ?ei.ErrorKind = null,
+    inject_error: []const ei.ErrorKind = &.{},
 };
 
 /// Predefined scheduler plan
@@ -126,7 +126,7 @@ pub const Scheduler = struct {
             // This is insanely unsafe, but let's assume caller is not an asshole
             const fiber = fiber_from_handle(entry.fiber);
 
-            if (entry.inject_error) |err| {
+            for (entry.inject_error) |err| {
                 try ei.enable(err, 1);
             }
 
@@ -146,7 +146,9 @@ pub const Scheduler = struct {
                         }
 
                         if (fiber.is_done()) {
-                            std.debug.print("Cannot run fiber till sleep point '{}'. It has finished earlier\n", .{p,});
+                            std.debug.print("Cannot run fiber till sleep point '{}'. It has finished earlier\n", .{
+                                p,
+                            });
                             @panic("Incorrect scheduling plan");
                         }
 

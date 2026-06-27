@@ -11,6 +11,7 @@ const SSTable = @import("storage").sstable.SSTable;
 const WalTable = @import("wal_table.zig").WalTable;
 const KVSeq = @import("storage").KVSeq;
 const GetResult = @import("storage").GetResult;
+const ei = @import("test_utils").Injections.error_injection;
 
 const MaxNumTables: usize = 5;
 
@@ -71,7 +72,7 @@ pub const Flusher = struct {
                 return;
             }
 
-            self.flush_one() catch |e| {
+            ei.maybe_error(.memtable_flush, self.flush_one()) catch |e| {
                 self.err = e;
                 self.mutex.unlock(self.io);
 

@@ -5,6 +5,7 @@ pub const ErrorKind = enum {
     wal_flush,
     wal_sync,
     write_cv_wait,
+    memtable_flush,
 };
 
 const ErrorPoint = struct {

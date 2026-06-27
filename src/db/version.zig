@@ -178,10 +178,16 @@ pub const Version = struct {
             try self.flusher.flush_all();
     }
 
-    pub fn commit(self: *Self, t: Transaction, dir: std.Io.Dir, io: std.Io, alloc: Allocator) anyerror!bool {
+    // Tries to commits transaction into DB. In case of any failure it must mark failed requests
+    // with an error.
+    pub fn commit(
+        self: *Self,
+        t: Transaction,
+        dir: std.Io.Dir,
+        io: std.Io,
+        alloc: Allocator,
+    ) !void {
         var trans = t;
-        var broken = false;
-
         const res = self.active.commit(&trans, alloc);
         if (res.need_rotate or res.wal_failed) {
             errdefer |e| {
@@ -193,18 +199,10 @@ pub const Version = struct {
                 trans.mark_error(e);
             }
 
-            self.rotate_active(dir, res.wal_failed, io, alloc) catch |e| {
-                broken = true;
-
-                // FIXME: wtf is wrong with zig?
-                return @as(anyerror!bool, e);
-            };
-
+            try self.rotate_active(dir, res.wal_failed, io, alloc);
             // Try to commit to new table
-            broken = broken or try self.commit(trans, dir, io, alloc);
+            try self.commit(trans, dir, io, alloc);
         }
-
-        return broken;
     }
 
     pub fn allocate_seqs(self: *Self, count: usize) KVSeq {
@@ -586,7 +584,10 @@ pub const Version = struct {
 
     // De-initializes version
     pub fn deinit(self: *Version, io: std.Io, alloc: Allocator) void {
-        self.flusher.insert(self.active) catch @panic("todo");
+        self.flusher.insert(self.active) catch {
+            std.debug.print("Failed to insert data into flusher\n", .{});
+            self.active.deinit(alloc) catch @panic("todo");
+        };
         self.active = undefined;
 
         // It's required to destroy flusher first, since it may want to apply some changes to version.
