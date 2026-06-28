@@ -35,8 +35,6 @@ pub const Version = struct {
     next_sequence: Value(KVSeq),
     // Alive SSTables
     tables: std.ArrayList(FileMeta),
-    // Alive WALs
-    wals: std.ArrayList(FileSeq),
     // Protects concurrent edit applies
     mutex: Mutex,
     // Flusher that periodically flushes immutable tables
@@ -141,16 +139,8 @@ pub const Version = struct {
         return self.next_sequence.fetchAdd(KVSeq.init(count), .monotonic);
     }
 
-    pub fn next_seq(self: *Self) KVSeq {
-        return self.next_sequence.fetchAdd(KVSeq.init(1), .monotonic);
-    }
-
     pub fn current_seq(self: *Self) KVSeq {
         return self.next_sequence.load(.monotonic);
-    }
-
-    pub fn current_file_seq(self: *Self) FileSeq {
-        return self.next_file.load(.monotonic);
     }
 
     pub fn new_file_seq(self: *Self) FileSeq {
@@ -189,7 +179,6 @@ pub const Version = struct {
             .next_file = Value(FileSeq).init(FileSeq.init(0)),
             .next_sequence = Value(KVSeq).init(KVSeq.init(0)),
             .mutex = Mutex.init,
-            .wals = try std.ArrayList(FileSeq).initCapacity(alloc, 0),
             .stat = stat,
             .opts = opts,
             .active = undefined,
@@ -358,7 +347,8 @@ pub const Version = struct {
         };
         try edit.new_files.append(alloc, meta);
 
-        // TODO: maybe make SSTable::create generic over table type? Accessing table.table is ugly af.
+        // TODO: maybe make SSTable::create generic over table type? Accessing table.table is ugly
+        // af.
         var sstable = try SSTable.create(dir, meta, &table.table, 0, io, alloc);
         defer sstable.deinit();
 
@@ -449,6 +439,9 @@ pub const Version = struct {
         io: std.Io,
         alloc: Allocator,
     ) !void {
+        var wals = try std.ArrayList(FileSeq).initCapacity(alloc, 0);
+        defer wals.deinit(alloc);
+
         for (edits.items) |edit| {
             switch (edit) {
                 .NextFileNumber => |next| self.next_file.store(next, .monotonic),
@@ -465,9 +458,9 @@ pub const Version = struct {
                         self.next_sequence.store(KVSeq.init(f.value_seq.get() + 1), .monotonic);
                     }
 
-                    for (self.wals.items, 0..) |wal, idx| {
+                    for (wals.items, 0..) |wal, idx| {
                         if (wal.get() == f.file_seq.get()) {
-                            const old_wal = self.wals.swapRemove(idx);
+                            const old_wal = wals.swapRemove(idx);
 
                             // I don't really want to abort initialization in of WAL GC failure.
                             Wal.unlink(dir, old_wal, io, alloc) catch |e| {
@@ -478,7 +471,7 @@ pub const Version = struct {
                     }
                 },
                 .AddWal => |wal| {
-                    try self.wals.append(alloc, wal);
+                    try wals.append(alloc, wal);
                 },
                 .DeleteFile => |f| {
                     var found = false;
@@ -510,7 +503,7 @@ pub const Version = struct {
         }
 
         // Replay from active WALs
-        for (self.wals.items) |wal| {
+        for (wals.items) |wal| {
             const alive_wal = self.slab.alloc();
 
             alive_wal.* = try WalTable.open(dir, opts, wal_opts, wal, io, alloc);
@@ -568,7 +561,6 @@ pub const Version = struct {
         }
 
         self.tables.deinit(alloc);
-        self.wals.deinit(alloc);
         self.file.close(io);
         alloc.destroy(self);
     }

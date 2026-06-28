@@ -4,7 +4,7 @@ const Value = std.atomic.Value;
 const Scheduler = @import("test_utils").Scheduler;
 
 // FIXME: assume linux semantics where TID != 0.
-const InvalidID: Thread.Id = 0;
+pub const InvalidID: Thread.Id = 0;
 const AtomicID = Value(Thread.Id);
 
 // Mutex with perks
@@ -51,7 +51,6 @@ pub const Mutex = struct {
         const old_owner = self.owner.swap(InvalidID, .monotonic);
 
         std.debug.assert(tid == old_owner);
-
         self.mtx.unlock(io);
     }
 };

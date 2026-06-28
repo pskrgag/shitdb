@@ -5,8 +5,8 @@ const ei = @import("../injection/ei.zig");
 const List = std.DoublyLinkedList;
 const Allocator = std.mem.Allocator;
 
-var SchedulerContext: ?*Fiber = null;
-var CurrentFiber: *Fiber = undefined;
+threadlocal var SchedulerContext: ?*Fiber = null;
+threadlocal var CurrentFiber: ?*Fiber = null;
 
 /// Opaque fiber handle
 pub const FiberHandle = struct {
@@ -85,7 +85,7 @@ pub const Scheduler = struct {
     fn run_one(self: *Scheduler, fiber: *Fiber) void {
         _ = self;
         CurrentFiber = fiber;
-        defer CurrentFiber = undefined;
+        defer CurrentFiber = null;
 
         fiber.switch_from(SchedulerContext.?);
     }
@@ -197,10 +197,12 @@ pub fn is_running() bool {
 
 pub fn yield(point: SleepPoint) void {
     if (is_running()) {
-        CurrentFiber.sleep = point;
-        defer CurrentFiber.sleep = null;
+        const fiber = CurrentFiber orelse return;
 
-        SchedulerContext.?.switch_from(CurrentFiber);
+        fiber.sleep = point;
+        defer fiber.sleep = null;
+
+        SchedulerContext.?.switch_from(fiber);
     }
 }
 
@@ -264,7 +266,7 @@ test "Ping pong" {
 }
 
 fn test_sleep() void {
-    std.debug.assert(CurrentFiber.sleep == null);
+    std.debug.assert(CurrentFiber.?.sleep == null);
     yield(.Test);
 }
 

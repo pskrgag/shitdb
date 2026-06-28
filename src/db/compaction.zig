@@ -12,6 +12,12 @@ pub const CompactionOptions = struct {
     max_lvl: usize = 2,
     // Maximum number of lvl0 sstables.
     max_lvl0: usize = 5,
+    // Target size for one sstable.
+    sstable_target_size: usize = 2 << 20,
+    // LVL1 compaction threshold (10 Mb by default)
+    lvl1_byte_threshold: usize = 10 << 20,
+    // LVL > 1 compaction threshold multiplier
+    fanout: usize = 10,
 
     pub fn sanitize(self: *const CompactionOptions) !void {
         if (self.max_lvl0 < 1)
@@ -19,6 +25,15 @@ pub const CompactionOptions = struct {
 
         if (self.max_lvl0 < 1)
             return error.InvalidMaxLvl0;
+
+        if (self.lvl1_byte_threshold < 1)
+            return error.InvalidLvl1Threshold;
+
+        if (self.sstable_target_size < 1)
+            return error.InvalidSstableTargetSize;
+
+        if (self.fanout < 2)
+            return error.InvalidFanout;
     }
 };
 

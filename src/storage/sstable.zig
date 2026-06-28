@@ -116,6 +116,7 @@ pub const OutputFileSource = struct {
     nextFile: *const fn (ctx: *anyopaque) anyerror!FileSeq,
 };
 
+/// Result of merging sstables
 pub const MergeResult = std.ArrayList(FileMeta);
 
 pub const SSTable = struct {
@@ -213,8 +214,13 @@ pub const SSTable = struct {
         return mt;
     }
 
-    fn meta(self: *const Self) MetaBlock {
-        return Self.meta_from_file(self.file);
+    fn meta(self: *const Self) !MetaBlock {
+        const mt = Self.meta_from_file(self.file);
+
+        if (mt.magic != Magic)
+            return error.CorruptedFile;
+
+        return mt;
     }
 
     fn calculate_file_size(tbl: *const MemTable) usize {
@@ -460,7 +466,7 @@ pub const SSTable = struct {
 
     /// Return an iterator over key-value pairs
     pub fn iterator(self: *const Self) Iterator {
-        const mt = self.meta();
+        const mt = self.meta() catch @panic("Opened corrupted file");
 
         return .{ .data = self.file[0..mt.index_offset] };
     }
@@ -545,11 +551,7 @@ pub const SSTable = struct {
 
     /// Finds value in SSTable
     pub fn find_value(self: *const Self, key: []const u8, alloc: Allocator) !GetResult {
-        const meta_block = self.meta();
-
-        if (meta_block.magic != Magic)
-            return error.CorruptedFile;
-
+        const meta_block = try self.meta();
         const index = self.file[meta_block.index_offset .. meta_block.index_offset + meta_block.index_size];
 
         // We found a block that may contain a value. Try to find a value there
@@ -587,7 +589,7 @@ pub const SSTable = struct {
 
         for (tables) |i| {
             // We need extra array, since IteratorWrapper accepts pointer
-            try iter_wrappers.append(alloc, i.iterator());
+            iter_wrappers.append(alloc, i.iterator()) catch unreachable;
 
             // This is safe, since iter_wrappers has pre-allocated capacity.
             try iters.append(

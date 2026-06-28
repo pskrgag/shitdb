@@ -190,7 +190,7 @@ test "WAL startup recovery" {
     defer new.deinit(allocator);
 
     try std.testing.expectEqual(new.manager.version.current_seq().get(), Repeats);
-    try std.testing.expect(new.manager.version.current_file_seq().get() != 0);
+    try std.testing.expect(new.manager.version.next_file.load(.monotonic).get() != 0);
 
     inline for (1..Repeats) |i| {
         const val = (try new.get("a" ** i, allocator)).?;

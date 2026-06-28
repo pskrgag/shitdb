@@ -12,6 +12,8 @@ const WalTable = @import("wal_table.zig").WalTable;
 const KVSeq = @import("storage").KVSeq;
 const GetResult = @import("storage").GetResult;
 const ei = @import("test_utils").Injections.error_injection;
+const Mutex = @import("sync").mutex.Mutex;
+const Condition = @import("sync").cv.Condition;
 
 const MaxNumTables: usize = 5;
 
@@ -23,11 +25,11 @@ pub const Flusher = struct {
     // Flusher thread
     thread: std.Thread,
     // Protects concurrent access to list
-    mutex: std.Io.Mutex,
+    mutex: Mutex,
     // CV for empty state
-    empty_cv: std.Io.Condition,
+    empty_cv: Condition,
     // CV for full state
-    full_cv: std.Io.Condition,
+    full_cv: Condition,
     // Allocator
     alloc: std.mem.Allocator,
     // Stop flag
@@ -74,8 +76,8 @@ pub const Flusher = struct {
 
             ei.maybe_error(.memtable_flush, self.flush_one()) catch |e| {
                 self.err = e;
-                self.mutex.unlock(self.io);
 
+                self.mutex.unlock(self.io);
                 self.full_cv.signal(self.io);
                 return;
             };
@@ -93,18 +95,22 @@ pub const Flusher = struct {
 
     pub fn new(alloc: Allocator, version: *Version, dir: std.Io.Dir, io: std.Io) !*Flusher {
         const flusher = try alloc.create(Flusher);
+        errdefer alloc.destroy(flusher);
 
-        flusher.list = .{null} ** MaxNumTables;
-        flusher.count = 0;
-        flusher.mutex = std.Io.Mutex.init;
-        flusher.empty_cv = std.Io.Condition.init;
-        flusher.full_cv = std.Io.Condition.init;
-        flusher.alloc = alloc;
-        flusher.stop = std.atomic.Value(bool).init(false);
-        flusher.version = version;
-        flusher.dir = dir;
-        flusher.io = io;
-        flusher.err = null;
+        flusher.* = .{
+            .list = .{null} ** MaxNumTables,
+            .count = 0,
+            .mutex = Mutex.init,
+            .empty_cv = Condition.init,
+            .full_cv = Condition.init,
+            .alloc = alloc,
+            .stop = std.atomic.Value(bool).init(false),
+            .version = version,
+            .dir = dir,
+            .io = io,
+            .err = null,
+            .thread = undefined,
+        };
 
         // Spawning a thread is a release operation, so all writes should be reversed.
         flusher.thread = try Thread.spawn(.{}, Flusher.flusher_thread, .{flusher});
