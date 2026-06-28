@@ -1,12 +1,12 @@
 const std = @import("std");
-const MemTable = @import("storage").MemTable;
+const MemTable = @import("storage").memtable.MemTable;
 const Wal = @import("wal.zig").Wal;
 const Allocator = std.mem.Allocator;
-const MemTableOpts = @import("storage").MemTableOpts;
+const MemTableOpts = @import("storage").memtable.MemTableOpts;
 const WalOpts = @import("wal.zig").WalOpts;
-const GetResult = @import("storage").GetResult;
-const KeyValue = @import("storage").KeyValue;
-const KVSeq = @import("storage").KVSeq;
+const GetResult = @import("storage").memtable.GetResult;
+const KeyValue = @import("storage").memtable.KeyValue;
+const KVSeq = @import("storage").memtable.KVSeq;
 const FileSeq = @import("storage").manifest.FileSeq;
 const Version = @import("version.zig").Version;
 const Value = std.atomic.Value;
@@ -15,7 +15,7 @@ const Transaction = @import("manager.zig").Transaction;
 const test_utils = @import("test_utils");
 const SmallVec = @import("adt").SmallVec;
 const PendingWrite = @import("manager.zig").PendingWrite;
-const Slot = @import("storage").Slot;
+const Slot = @import("storage").memtable.Slot;
 
 const SlotArray = SmallVec(Slot, 30);
 

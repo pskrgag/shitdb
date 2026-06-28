@@ -1,5 +1,5 @@
 const std = @import("std");
-const MemTableOpts = @import("storage").MemTableOpts;
+const MemTableOpts = @import("storage").memtable.MemTableOpts;
 const Dir = std.Io.Dir;
 const Allocator = std.mem.Allocator;
 const KeyValue = @import("storage").KeyValue;
@@ -10,7 +10,7 @@ const test_utils = @import("test_utils");
 const Statistics = @import("stat.zig").Statistics;
 const Mutex = @import("sync").mutex.Mutex;
 const Condition = @import("sync").cv.Condition;
-const KVSeq = @import("storage").KVSeq;
+const KVSeq = @import("storage").memtable.KVSeq;
 const ei = @import("test_utils").Injections.error_injection;
 const CompactionOptions = @import("compaction.zig").CompactionOptions;
 
@@ -350,7 +350,7 @@ fn add_test_sstable(
     alloc: Allocator,
 ) !void {
     const storage = @import("storage");
-    const MemTable = storage.MemTable;
+    const MemTable = storage.memtable.MemTable;
     const SSTable = storage.sstable.SSTable;
     const FileMeta = storage.manifest.FileMeta;
     const FileSeq = storage.manifest.FileSeq;
@@ -359,7 +359,7 @@ fn add_test_sstable(
 
     var memtable = try MemTable.new(alloc, manager.io, .{});
     defer memtable.deinit(alloc);
-    try memtable.put(key, value, storage.KVSeq.init(value_seq));
+    try memtable.put(key, value, storage.memtable.KVSeq.init(value_seq));
 
     const file = FileSeq.init(file_seq);
     var meta = FileMeta{
@@ -367,7 +367,7 @@ fn add_test_sstable(
         .max = try KeyOwned.from_kv(memtable.max().?, alloc),
         .min = try KeyOwned.from_kv(memtable.min().?, alloc),
         .file_seq = file,
-        .value_seq = storage.KVSeq.init(value_seq),
+        .value_seq = storage.memtable.KVSeq.init(value_seq),
     };
 
     var sstable = try SSTable.create(manager.root, meta, &memtable, 0, manager.io, alloc);
