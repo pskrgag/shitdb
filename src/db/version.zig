@@ -22,8 +22,9 @@ const MemTableSlab = Slab(WalTable, 20);
 const Transaction = @import("manager.zig").Transaction;
 const CompactionPlan = @import("compaction.zig").CompactionPlan;
 const OutputFileSource = @import("storage").sstable.OutputFileSource;
-const MaxLevel = @import("compaction.zig").MaxLevel;
+const MaxSupportedLvls = @import("compaction.zig").MaxSupportedLvls;
 const CompactionOptions = @import("compaction.zig").CompactionOptions;
+const KeyValueOptions = @import("manager.zig").KeyValueOptions;
 
 pub const Version = struct {
     // File handle
@@ -40,18 +41,14 @@ pub const Version = struct {
     mutex: Mutex,
     // Flusher that periodically flushes immutable tables
     flusher: *Flusher,
-    // Active tables on each lvl
-    active_tables: [MaxLevel]u8,
     // Stats
     stat: *Statistics,
     // Slab for freeing memtables
     slab: *MemTableSlab,
     // Active MemTable
     active: *WalTable,
-    // Memtable opts
-    opts: MemTableOpts,
-    // WAL opts
-    wal_opts: WalOpts,
+    // Options
+    opts: KeyValueOptions,
 
     const Self = @This();
 
@@ -79,9 +76,6 @@ pub const Version = struct {
 
         for (edit.new_files.items) |file| {
             try self.tables.append(alloc, file);
-
-            std.debug.assert(file.lvl < MaxLevel);
-            self.active_tables[file.lvl] += 1;
         }
 
         // it's n^2, but len(deleted_files) should be small
@@ -90,8 +84,6 @@ pub const Version = struct {
                 if (f.file_seq.get() == file.file.get()) {
                     var res = self.tables.swapRemove(i);
                     res.deinit(alloc);
-
-                    self.active_tables[file.lvl] -= 1;
 
                     const fname = try Self.file_name(file.file, alloc);
                     defer alloc.free(fname);
@@ -110,7 +102,7 @@ pub const Version = struct {
         const next_file = self.new_file_seq();
         const new_table = self.slab.alloc();
 
-        new_table.* = try WalTable.new(dir, self.opts, self.wal_opts, next_file, self, io, alloc);
+        new_table.* = try WalTable.new(dir, self.opts.memtable, self.opts.wal, next_file, self, io, alloc);
         try self.flusher.insert(self.active);
         self.active = new_table;
 
@@ -168,8 +160,7 @@ pub const Version = struct {
     pub fn from_file(
         dir: std.Io.Dir,
         path: []const u8,
-        opts: MemTableOpts,
-        wal_opts: WalOpts,
+        opts: KeyValueOptions,
         stat: *Statistics,
         sanitize: bool,
         io: std.Io,
@@ -199,10 +190,8 @@ pub const Version = struct {
             .next_sequence = Value(KVSeq).init(KVSeq.init(0)),
             .mutex = Mutex.init,
             .wals = try std.ArrayList(FileSeq).initCapacity(alloc, 0),
-            .active_tables = [_]u8{0} ** MaxLevel,
             .stat = stat,
             .opts = opts,
-            .wal_opts = wal_opts,
             .active = undefined,
         };
         errdefer res.deinit(io, alloc);
@@ -220,12 +209,15 @@ pub const Version = struct {
 
             var rep = try manifest.ManifestRecord.deserialize_from(mmap, alloc);
             defer rep.deinit(alloc);
-            try res.replay(dir, rep, opts, wal_opts, io, alloc);
+            try res.replay(dir, rep, opts.memtable, opts.wal, io, alloc);
         }
 
         const active = res.slab.alloc();
 
-        active.* = try WalTable.new(dir, opts, wal_opts, res.new_file_seq(), res, io, alloc);
+        active.* = try WalTable.new(dir, opts.memtable, opts.wal, res.new_file_seq(), res, io, alloc);
+        errdefer {
+            active.deinit(alloc) catch @panic("Should not happen, since MemTable is empty");
+        }
         res.active = active;
 
         if (sanitize)
@@ -328,7 +320,8 @@ pub const Version = struct {
             };
 
             if (p) |pp| {
-                // fucking zig, lol. Captures are const, so I have to make an extra local variable here
+                // fucking zig, lol. Captures are const, so I have to make an extra local variable
+                // here
                 var plan = pp;
                 defer plan.deinit(alloc);
 
@@ -370,7 +363,7 @@ pub const Version = struct {
         defer sstable.deinit();
 
         try self.apply(edit, dir, io, alloc);
-        try self.compact(dir, .Default, io, alloc);
+        try self.compact(dir, self.opts.compaction, io, alloc);
     }
 
     // Resolves value request.
@@ -462,8 +455,7 @@ pub const Version = struct {
                 .NextSeqNumber => |next| self.next_sequence.store(KVSeq.init(next), .monotonic),
                 .AddFile => |f| {
                     try self.tables.append(alloc, f);
-                    std.debug.assert(f.lvl < MaxLevel);
-                    self.active_tables[f.lvl] += 1;
+                    std.debug.assert(f.lvl < MaxSupportedLvls);
 
                     if (self.next_file.load(.monotonic).get() <= f.file_seq.get()) {
                         self.next_file.store(FileSeq.init(f.file_seq.get() + 1), .monotonic);
@@ -495,8 +487,6 @@ pub const Version = struct {
                         if (file.file_seq.get() == f.get()) {
                             var res = self.tables.swapRemove(idx);
                             res.deinit(alloc);
-
-                            self.active_tables[file.lvl] -= 1;
 
                             const name = try manifest.alloc_sstable_name(file.file_seq, alloc);
                             defer alloc.free(name);
@@ -642,6 +632,7 @@ pub const VersionEdit = struct {
 };
 
 const testing_memtable_opts = MemTableOpts{ .memtable_size = 1 << 20 };
+const testing_opts = KeyValueOptions{ .memtable = testing_memtable_opts };
 
 const TestSSTableKV = struct {
     key: []const u8,
@@ -671,7 +662,7 @@ test "Version serialization" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     {
@@ -755,6 +746,16 @@ fn expect_l1_non_overlapping(version: *const Version) !void {
             try std.testing.expect(!lhs.key_range_overlap(rhs.min.data, rhs.max.data));
         }
     }
+}
+
+fn table_count_at_lvl(version: *const Version, lvl: u8) usize {
+    var count: usize = 0;
+
+    for (version.tables.items) |table| {
+        count += @intFromBool(table.lvl == lvl);
+    }
+
+    return count;
 }
 
 fn expect_file_exists(dir: std.Io.Dir, io: std.Io, name: []const u8) !void {
@@ -859,7 +860,7 @@ test "Version apply persists edits that reopen can replay" {
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
+        var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
         defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
@@ -880,7 +881,7 @@ test "Version apply persists edits that reopen can replay" {
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
+        var reopened = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 13), reopened.current_seq().get());
@@ -916,7 +917,7 @@ test "lvl0 compaction merges overlapping lvl1 table" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -967,11 +968,11 @@ test "lvl0 compaction merges overlapping lvl1 table" {
     );
 
     try version.apply(edit, dir, testing_io, allocator);
-    try version.compact(dir, .ForceMergeLvl0, testing_io, allocator);
+    try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
 
     try std.testing.expectEqual(@as(usize, 1), version.tables.items.len);
-    try std.testing.expectEqual(@as(u8, 0), version.active_tables[0]);
-    try std.testing.expectEqual(@as(u8, 1), version.active_tables[1]);
+    try std.testing.expectEqual(@as(usize, 0), table_count_at_lvl(version, 0));
+    try std.testing.expectEqual(@as(usize, 1), table_count_at_lvl(version, 1));
     try std.testing.expectEqual(@as(u8, 1), version.tables.items[0].lvl);
     try expect_l1_non_overlapping(version);
 
@@ -1000,7 +1001,7 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1051,11 +1052,11 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
     );
 
     try version.apply(edit, dir, testing_io, allocator);
-    try version.compact(dir, .ForceMergeLvl0, testing_io, allocator);
+    try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
 
     try std.testing.expectEqual(@as(usize, 2), version.tables.items.len);
-    try std.testing.expectEqual(@as(u8, 0), version.active_tables[0]);
-    try std.testing.expectEqual(@as(u8, 2), version.active_tables[1]);
+    try std.testing.expectEqual(@as(usize, 0), table_count_at_lvl(version, 0));
+    try std.testing.expectEqual(@as(usize, 2), table_count_at_lvl(version, 1));
     try expect_l1_non_overlapping(version);
 
     const old = (try version.get("z", dir, testing_io, allocator)).?;
@@ -1087,7 +1088,7 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1139,11 +1140,11 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
     );
 
     try version.apply(edit, dir, testing_io, allocator);
-    try version.compact(dir, .ForceMergeLvl0, testing_io, allocator);
+    try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
 
     try std.testing.expectEqual(@as(usize, 1), version.tables.items.len);
-    try std.testing.expectEqual(@as(u8, 0), version.active_tables[0]);
-    try std.testing.expectEqual(@as(u8, 1), version.active_tables[1]);
+    try std.testing.expectEqual(@as(usize, 0), table_count_at_lvl(version, 0));
+    try std.testing.expectEqual(@as(usize, 1), table_count_at_lvl(version, 1));
     try expect_l1_non_overlapping(version);
 
     try std.testing.expectEqual(null, try version.get("b", dir, testing_io, allocator));
@@ -1174,7 +1175,7 @@ test "lvl0 compaction physically deletes obsolete input files" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1229,7 +1230,7 @@ test "lvl0 compaction physically deletes obsolete input files" {
     try expect_file_exists(dir, testing_io, "memtable2.sst");
     try expect_file_exists(dir, testing_io, "memtable3.sst");
 
-    try version.compact(dir, .ForceMergeLvl0, testing_io, allocator);
+    try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
 
     try expect_file_deleted(dir, testing_io, "memtable1.sst");
     try expect_file_deleted(dir, testing_io, "memtable2.sst");
@@ -1261,7 +1262,7 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1312,7 +1313,7 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
     );
 
     try version.apply(edit, dir, testing_io, allocator);
-    try version.compact(dir, .ForceMergeLvl0, testing_io, allocator);
+    try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
 
     try expect_file_exists(dir, testing_io, "memtable1.sst");
     try expect_file_deleted(dir, testing_io, "memtable2.sst");
@@ -1345,7 +1346,7 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
+        var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
         defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
@@ -1396,16 +1397,16 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
         );
 
         try version.apply(edit, dir, testing_io, allocator);
-        try version.compact(dir, .ForceMergeLvl0, testing_io, allocator);
+        try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
+        var reopened = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 1), reopened.tables.items.len);
-        try std.testing.expectEqual(@as(u8, 0), reopened.active_tables[0]);
-        try std.testing.expectEqual(@as(u8, 1), reopened.active_tables[1]);
+        try std.testing.expectEqual(@as(usize, 0), table_count_at_lvl(reopened, 0));
+        try std.testing.expectEqual(@as(usize, 1), table_count_at_lvl(reopened, 1));
         try std.testing.expectEqual(@as(u8, 1), reopened.tables.items[0].lvl);
         try expect_l1_non_overlapping(reopened);
 
@@ -1436,7 +1437,7 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
+        var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
         defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
@@ -1487,16 +1488,16 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
         );
 
         try version.apply(edit, dir, testing_io, allocator);
-        try version.compact(dir, .ForceMergeLvl0, testing_io, allocator);
+        try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", testing_memtable_opts, .{}, &stat, false, testing_io, allocator);
+        var reopened = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 2), reopened.tables.items.len);
-        try std.testing.expectEqual(@as(u8, 0), reopened.active_tables[0]);
-        try std.testing.expectEqual(@as(u8, 2), reopened.active_tables[1]);
+        try std.testing.expectEqual(@as(usize, 0), table_count_at_lvl(reopened, 0));
+        try std.testing.expectEqual(@as(usize, 2), table_count_at_lvl(reopened, 1));
         try expect_l1_non_overlapping(reopened);
 
         const old = (try reopened.get("z", dir, testing_io, allocator)).?;

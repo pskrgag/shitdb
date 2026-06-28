@@ -734,6 +734,7 @@ fn test_deinit_merge_result(res: *MergeResult, alloc: Allocator) void {
 
 fn repeatChar(allocator: std.mem.Allocator, char: u8, count: usize) ![]u8 {
     const result = try allocator.alloc(u8, count);
+
     @memset(result, char);
     return result;
 }
@@ -1084,7 +1085,10 @@ test "Merged SSTable persists min and max keys" {
     var table1 = try SSTable.create(dir, meta1, &tb1, 0, testing_io, allocator);
     defer table1.deinit();
 
-    var merge_res = try SSTable.merge(dir, test_output_file_source(&merged_seq), testing_io, &[_]SSTable{ table, table1 }, 1, allocator);
+    var merge_res = try SSTable.merge(dir, test_output_file_source(&merged_seq), testing_io, &[_]SSTable{
+        table,
+        table1,
+    }, 1, allocator);
     defer test_deinit_merge_result(&merge_res, allocator);
 
     {

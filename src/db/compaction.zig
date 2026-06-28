@@ -2,12 +2,24 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const FileMeta = @import("storage").manifest.FileMeta;
 
-pub const MaxLevel: usize = 2;
-pub const MaxTablesLVL0: usize = 5;
+pub const MaxSupportedLvls: usize = 5;
 
-pub const CompactionOptions = union(enum) {
-    Default: void,
-    ForceMergeLvl0: void,
+/// Compaction options specified by the user
+///
+/// For now only leveling is supported.
+pub const CompactionOptions = struct {
+    // Maximum level of sstables
+    max_lvl: usize = 2,
+    // Maximum number of lvl0 sstables.
+    max_lvl0: usize = 5,
+
+    pub fn sanitize(self: *const CompactionOptions) !void {
+        if (self.max_lvl0 < 1)
+            return error.InvalidMaxLvl;
+
+        if (self.max_lvl0 < 1)
+            return error.InvalidMaxLvl0;
+    }
 };
 
 pub const CompactionPlan = struct {
@@ -55,7 +67,7 @@ pub const CompactionPlan = struct {
             }
         }
 
-        return (count > 0 and opts == .ForceMergeLvl0) or count > MaxTablesLVL0;
+        return count > opts.max_lvl0;
     }
 
     fn should_compact(files: []FileMeta, opts: CompactionOptions) ?u8 {
@@ -74,7 +86,6 @@ pub const CompactionPlan = struct {
             var next_lvl_files = try std.ArrayList(FoundFile).initCapacity(alloc, 0);
             errdefer next_lvl_files.deinit(alloc);
 
-            // Step 2: once we've found them. Find all lvl1 tables that have overlapping key ranges
             for (files, 0..) |file, idx| {
                 if (file.lvl == lvl + 1) {
                     var should_consider = false;

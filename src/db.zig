@@ -2,9 +2,9 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const MemTable = @import("storage").MemTable;
 const MemTableOpts = @import("storage").MemTableOpts;
-const WalOpts = @import("db/wal.zig").WalOpts;
 const Manager = @import("db/manager.zig").Manager;
 const HashTableTest = @import("test_utils").HashTableTest;
+const KeyValueOptions = @import("db/manager.zig").KeyValueOptions;
 const Dir = std.Io.Dir;
 const test_utils = @import("test_utils");
 
@@ -20,12 +20,6 @@ fn openOrCreateDir(io: std.Io, path: []const u8) !Dir {
         else => return err,
     };
 }
-
-/// key value storage options
-pub const KeyValueOptions = struct {
-    memtable: MemTableOpts = .{},
-    wal: WalOpts = .{},
-};
 
 /// Frontend class that provides an API for the database
 pub const KeyValue = struct {
@@ -50,8 +44,10 @@ pub const KeyValue = struct {
 
     /// Creates new key value storage at specific directory.
     pub fn new(path: []const u8, alloc: Allocator, io: std.Io, opts: KeyValueOptions) !Self {
+        try opts.sanitize();
+
         const dir = try openOrCreateDir(io, path);
-        return .{ .manager = try Manager.new(dir, alloc, io, opts.memtable, opts.wal) };
+        return .{ .manager = try Manager.new(dir, alloc, io, opts) };
     }
 
     /// De-initializes db session
