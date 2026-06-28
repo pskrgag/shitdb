@@ -18,6 +18,7 @@ const Transaction = @import("manager.zig").Transaction;
 const WriteOp = @import("manager.zig").WriteOp;
 const PendingWrite = @import("manager.zig").PendingWrite;
 const ei = test_utils.Injections.error_injection;
+const Storage = @import("storage").storage.Storage;
 
 const AddMagic: u8 = 0x10;
 const RemoveMagic: u8 = 0x12;
@@ -89,15 +90,13 @@ pub const Wal = struct {
         return res;
     }
 
-    pub fn open(dir: Dir, seq: FileSeq, io: Io, alloc: Allocator) !Wal {
-        return open_with_opts(dir, seq, .{}, io, alloc);
+    pub fn open(storage: *Storage, seq: FileSeq, io: Io, alloc: Allocator) !Wal {
+        return open_with_opts(storage, seq, .{}, io, alloc);
     }
 
-    pub fn open_with_opts(dir: Dir, seq: FileSeq, opts: WalOpts, io: Io, alloc: Allocator) !Wal {
-        const name = try Wal.file_name(alloc, seq);
-        defer alloc.free(name);
+    pub fn open_with_opts(storage: *Storage, seq: FileSeq, opts: WalOpts, io: Io, alloc: Allocator) !Wal {
+        const file = try storage.open_wal(seq, io, alloc);
 
-        const file = try dir.openFile(io, name, .{ .mode = .read_write });
         return .{ .file = BufferedFile.readonly(file), .opts = opts };
     }
 
@@ -105,25 +104,19 @@ pub const Wal = struct {
         return std.mem.startsWith(u8, name, "WAL") and std.mem.endsWith(u8, name, ".sst");
     }
 
-    pub fn unlink(dir: Dir, seq: FileSeq, io: std.Io, alloc: Allocator) !void {
-        const name = try Wal.file_name(alloc, seq);
-        defer alloc.free(name);
-
-        try dir.deleteFile(io, name);
+    pub fn unlink(storage: *Storage, seq: FileSeq, io: std.Io, alloc: Allocator) !void {
+        try storage.unlink_wal(seq, io, alloc);
     }
 
     pub fn new(
-        dir: Dir,
+        storage: *Storage,
         seq: FileSeq,
         version: ?*Version,
         opts: WalOpts,
         io: Io,
         alloc: Allocator,
     ) !Wal {
-        const name = try Wal.file_name(alloc, seq);
-        defer alloc.free(name);
-
-        const file = try dir.createFile(io, name, .{ .read = true });
+        const file = try storage.create_wal(seq, io, alloc);
         errdefer file.close(io);
 
         if (version) |v| {
@@ -131,7 +124,7 @@ pub const Wal = struct {
             defer edit.deinit(alloc);
 
             edit.add_wal = seq;
-            try v.apply(edit, dir, io, alloc);
+            try v.apply(edit, storage, io, alloc);
         }
 
         return .{
@@ -341,13 +334,14 @@ fn readU32(data: []const u8) u32 {
     return std.mem.readInt(u32, data[0..@sizeOf(u32)], .little);
 }
 
-fn expectReplayInvalidFormat(dir: Dir, seq: usize, data: []const u8, alloc: Allocator) !void {
+fn expectReplayInvalidFormat(storage: *Storage, seq: usize, data: []const u8, alloc: Allocator) !void {
+    const dir = storage.dir;
     try writeWalFile(dir, seq, data, alloc);
 
-    var wal = try Wal.open(dir, FileSeq.init(seq), testing_io, alloc);
+    var wal = try Wal.open(storage, FileSeq.init(seq), testing_io, alloc);
     defer wal.deinit(alloc, testing_io) catch unreachable;
 
-    var target = try WalTable.new(dir, .{}, .{}, FileSeq.init(seq + 1000), null, testing_io, alloc);
+    var target = try WalTable.new(storage, .{}, .{}, FileSeq.init(seq + 1000), null, testing_io, alloc);
     defer target.deinit(alloc) catch unreachable;
 
     try std.testing.expectError(error.InvalidFormat, wal.replay_to(&target, testing_io));
@@ -377,9 +371,10 @@ test "WAL serializes add record" {
     const allocator = arena.allocator();
     const dirname = "test_wal_add_record";
 
-    var dir = try openTestDir(dirname);
+    const dir = try openTestDir(dirname);
+    var storage = try Storage.new(dir);
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -390,7 +385,7 @@ test "WAL serializes add record" {
     pushPut(&trans, &pending, "alpha", "one", 7);
     const entry = pending.op;
 
-    var wal = try Wal.new(dir, FileSeq.init(1), null, .{}, testing_io, allocator);
+    var wal = try Wal.new(&storage, FileSeq.init(1), null, .{}, testing_io, allocator);
     try wal.commit(trans, testing_io);
     try wal.deinit(allocator, testing_io);
 
@@ -425,9 +420,10 @@ test "WAL serializes remove record" {
     const allocator = arena.allocator();
     const dirname = "test_wal_remove_record";
 
-    var dir = try openTestDir(dirname);
+    const dir = try openTestDir(dirname);
+    var storage = try Storage.new(dir);
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -438,7 +434,7 @@ test "WAL serializes remove record" {
     pushRemove(&trans, &pending, "beta", 42);
     const entry = pending.op;
 
-    var wal = try Wal.new(dir, FileSeq.init(2), null, .{}, testing_io, allocator);
+    var wal = try Wal.new(&storage, FileSeq.init(2), null, .{}, testing_io, allocator);
     try wal.commit(trans, testing_io);
     try wal.deinit(allocator, testing_io);
 
@@ -469,9 +465,10 @@ test "WAL serializes records in append order" {
     const allocator = arena.allocator();
     const dirname = "test_wal_multiple_records";
 
-    var dir = try openTestDir(dirname);
+    const dir = try openTestDir(dirname);
+    var storage = try Storage.new(dir);
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -485,7 +482,7 @@ test "WAL serializes records in append order" {
     const add_entry = add.op;
     const remove_entry = remove.op;
 
-    var wal = try Wal.new(dir, FileSeq.init(3), null, .{}, testing_io, allocator);
+    var wal = try Wal.new(&storage, FileSeq.init(3), null, .{}, testing_io, allocator);
     try wal.commit(trans, testing_io);
     try wal.deinit(allocator, testing_io);
 
@@ -532,9 +529,10 @@ test "WAL replay restores add record into target table" {
     const allocator = arena.allocator();
     const dirname = "test_wal_replay_add";
 
-    var dir = try openTestDir(dirname);
+    const dir = try openTestDir(dirname);
+    var storage = try Storage.new(dir);
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -544,11 +542,11 @@ test "WAL replay restores add record into target table" {
     var pending: PendingWrite = undefined;
     pushPut(&trans, &pending, "alpha", "one", 7);
 
-    var wal = try Wal.new(dir, FileSeq.init(4), null, .{}, testing_io, allocator);
+    var wal = try Wal.new(&storage, FileSeq.init(4), null, .{}, testing_io, allocator);
     defer wal.deinit(allocator, testing_io) catch unreachable;
     try wal.commit(trans, testing_io);
 
-    var target = try WalTable.new(dir, .{}, .{}, FileSeq.init(5), null, testing_io, allocator);
+    var target = try WalTable.new(&storage, .{}, .{}, FileSeq.init(5), null, testing_io, allocator);
     defer target.deinit(allocator) catch unreachable;
     try wal.replay_to(&target, testing_io);
 
@@ -570,9 +568,10 @@ test "WAL replay restores remove record into target table" {
     const allocator = arena.allocator();
     const dirname = "test_wal_replay_remove";
 
-    var dir = try openTestDir(dirname);
+    const dir = try openTestDir(dirname);
+    var storage = try Storage.new(dir);
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -582,11 +581,11 @@ test "WAL replay restores remove record into target table" {
     var pending: PendingWrite = undefined;
     pushRemove(&trans, &pending, "alpha", 8);
 
-    var wal = try Wal.new(dir, FileSeq.init(6), null, .{}, testing_io, allocator);
+    var wal = try Wal.new(&storage, FileSeq.init(6), null, .{}, testing_io, allocator);
     defer wal.deinit(allocator, testing_io) catch unreachable;
     try wal.commit(trans, testing_io);
 
-    var target = try WalTable.new(dir, .{}, .{}, FileSeq.init(7), null, testing_io, allocator);
+    var target = try WalTable.new(&storage, .{}, .{}, FileSeq.init(7), null, testing_io, allocator);
     defer target.deinit(allocator) catch unreachable;
     try wal.replay_to(&target, testing_io);
 
@@ -602,9 +601,10 @@ test "WAL replay applies later remove over earlier add" {
     const allocator = arena.allocator();
     const dirname = "test_wal_replay_add_remove";
 
-    var dir = try openTestDir(dirname);
+    const dir = try openTestDir(dirname);
+    var storage = try Storage.new(dir);
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -616,11 +616,11 @@ test "WAL replay applies later remove over earlier add" {
     pushPut(&trans, &add, "alpha", "one", 7);
     pushRemove(&trans, &remove, "alpha", 8);
 
-    var wal = try Wal.new(dir, FileSeq.init(8), null, .{}, testing_io, allocator);
+    var wal = try Wal.new(&storage, FileSeq.init(8), null, .{}, testing_io, allocator);
     defer wal.deinit(allocator, testing_io) catch unreachable;
     try wal.commit(trans, testing_io);
 
-    var target = try WalTable.new(dir, .{}, .{}, FileSeq.init(9), null, testing_io, allocator);
+    var target = try WalTable.new(&storage, .{}, .{}, FileSeq.init(9), null, testing_io, allocator);
     defer target.deinit(allocator) catch unreachable;
     try wal.replay_to(&target, testing_io);
 
@@ -645,9 +645,10 @@ test "WAL replay rejects unknown record magic" {
     const allocator = arena.allocator();
     const dirname = "test_wal_replay_bad_magic";
 
-    var dir = try openTestDir(dirname);
+    const dir = try openTestDir(dirname);
+    var storage = try Storage.new(dir);
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -657,7 +658,7 @@ test "WAL replay rejects unknown record magic" {
     data[0] = 0xff;
     @memcpy(data[1..], &std.mem.toBytes(@as(usize, 0)));
 
-    try expectReplayInvalidFormat(dir, 10, &data, allocator);
+    try expectReplayInvalidFormat(&storage, 10, &data, allocator);
 }
 
 test "WAL replay rejects truncated record size" {
@@ -668,16 +669,17 @@ test "WAL replay rejects truncated record size" {
     const allocator = arena.allocator();
     const dirname = "test_wal_replay_truncated_size";
 
-    var dir = try openTestDir(dirname);
+    const dir = try openTestDir(dirname);
+    var storage = try Storage.new(dir);
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
     }
 
     const data = [_]u8{ AddMagic, 1, 2, 3 };
-    try expectReplayInvalidFormat(dir, 11, &data, allocator);
+    try expectReplayInvalidFormat(&storage, 11, &data, allocator);
 }
 
 test "WAL replay rejects add record with truncated payload" {
@@ -688,9 +690,10 @@ test "WAL replay rejects add record with truncated payload" {
     const allocator = arena.allocator();
     const dirname = "test_wal_replay_truncated_add";
 
-    var dir = try openTestDir(dirname);
+    const dir = try openTestDir(dirname);
+    var storage = try Storage.new(dir);
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -701,7 +704,7 @@ test "WAL replay rejects add record with truncated payload" {
     @memcpy(data[1 .. 1 + @sizeOf(usize)], &std.mem.toBytes(@as(usize, 8)));
     @memcpy(data[1 + @sizeOf(usize) ..], "xy");
 
-    try expectReplayInvalidFormat(dir, 12, &data, allocator);
+    try expectReplayInvalidFormat(&storage, 12, &data, allocator);
 }
 
 test "WAL replay rejects remove record without sequence number" {
@@ -712,9 +715,10 @@ test "WAL replay rejects remove record without sequence number" {
     const allocator = arena.allocator();
     const dirname = "test_wal_replay_truncated_remove_seq";
 
-    var dir = try openTestDir(dirname);
+    const dir = try openTestDir(dirname);
+    var storage = try Storage.new(dir);
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -725,5 +729,5 @@ test "WAL replay rejects remove record without sequence number" {
     @memcpy(data[1 .. 1 + @sizeOf(usize)], &std.mem.toBytes(@as(usize, 5)));
     @memcpy(data[1 + @sizeOf(usize) ..], "alpha");
 
-    try expectReplayInvalidFormat(dir, 13, &data, allocator);
+    try expectReplayInvalidFormat(&storage, 13, &data, allocator);
 }

@@ -16,6 +16,7 @@ const test_utils = @import("test_utils");
 const SmallVec = @import("adt").SmallVec;
 const PendingWrite = @import("manager.zig").PendingWrite;
 const Slot = @import("storage").memtable.Slot;
+const Storage = @import("storage").storage.Storage;
 
 const SlotArray = SmallVec(Slot, 30);
 
@@ -43,7 +44,7 @@ pub const WalTable = struct {
 
     /// Constructs new WAL+MemTable
     pub fn new(
-        dir: std.Io.Dir,
+        storage: *Storage,
         memtable_opts: MemTableOpts,
         wal_opts: WalOpts,
         seq: FileSeq,
@@ -53,7 +54,7 @@ pub const WalTable = struct {
     ) !WalTable {
         return .{
             .table = try MemTable.new(alloc, io, memtable_opts),
-            .wal = try Wal.new(dir, seq, version, wal_opts, io, alloc),
+            .wal = try Wal.new(storage, seq, version, wal_opts, io, alloc),
             .seq = seq,
             .io = io,
             .state = Value(State).init(.active),
@@ -64,7 +65,7 @@ pub const WalTable = struct {
 
     /// Opens existing WAL
     pub fn open(
-        dir: std.Io.Dir,
+        storage: *Storage,
         memtable_opts: MemTableOpts,
         wal_opts: WalOpts,
         seq: FileSeq,
@@ -73,7 +74,7 @@ pub const WalTable = struct {
     ) !WalTable {
         var self = WalTable{
             .table = try MemTable.new(alloc, io, memtable_opts),
-            .wal = try Wal.open_with_opts(dir, seq, wal_opts, io, alloc),
+            .wal = try Wal.open_with_opts(storage, seq, wal_opts, io, alloc),
             .seq = seq,
             .io = io,
             .state = Value(State).init(.active),
@@ -213,7 +214,9 @@ pub const WalTable = struct {
             self.table.commit_slot(slot) catch @panic("must not panic here");
         }
 
-        return .{ .need_rotate = !full, };
+        return .{
+            .need_rotate = !full,
+        };
     }
 
     /// Retrieves value from the memtable

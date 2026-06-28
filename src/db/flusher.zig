@@ -14,6 +14,7 @@ const GetResult = @import("storage").memtable.GetResult;
 const ei = @import("test_utils").Injections.error_injection;
 const Mutex = @import("sync").mutex.Mutex;
 const Condition = @import("sync").cv.Condition;
+const Storage = @import("storage").storage.Storage;
 
 const MaxNumTables: usize = 5;
 
@@ -34,8 +35,8 @@ pub const Flusher = struct {
     alloc: std.mem.Allocator,
     // Stop flag
     stop: std.atomic.Value(bool),
-    // DB directory
-    dir: std.Io.Dir,
+    // DB storage
+    storage: Storage,
     // IO instance
     io: std.Io,
     // Version manager
@@ -55,7 +56,7 @@ pub const Flusher = struct {
         self.count -= 1;
 
         first.wait_no_users();
-        try self.version.flush_memtable(first, self.io, self.dir, self.alloc);
+        try self.version.flush_memtable(first, self.io, &self.storage, self.alloc);
         first.deinit(self.alloc) catch @panic("Failed to deinit flushed MemTable");
 
         self.version.slab.free(first);
@@ -93,7 +94,7 @@ pub const Flusher = struct {
         }
     }
 
-    pub fn new(alloc: Allocator, version: *Version, dir: std.Io.Dir, io: std.Io) !*Flusher {
+    pub fn new(alloc: Allocator, version: *Version, storage: *Storage, io: std.Io) !*Flusher {
         const flusher = try alloc.create(Flusher);
         errdefer alloc.destroy(flusher);
 
@@ -106,7 +107,7 @@ pub const Flusher = struct {
             .alloc = alloc,
             .stop = std.atomic.Value(bool).init(false),
             .version = version,
-            .dir = dir,
+            .storage = storage.*,
             .io = io,
             .err = null,
             .thread = undefined,

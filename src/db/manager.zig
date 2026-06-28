@@ -13,6 +13,7 @@ const Condition = @import("sync").cv.Condition;
 const KVSeq = @import("storage").memtable.KVSeq;
 const ei = @import("test_utils").Injections.error_injection;
 const CompactionOptions = @import("compaction.zig").CompactionOptions;
+const Storage = @import("storage").storage.Storage;
 
 // Request kind of the write.
 pub const WriteOp = union(enum) {
@@ -106,8 +107,11 @@ pub const ManagerState = enum(u8) {
 
 /// Key value storage options
 pub const KeyValueOptions = struct {
+    /// MemTable options
     memtable: MemTableOpts = .{},
+    /// WAL options
     wal: WalOpts = .{},
+    /// Compaction options
     compaction: CompactionOptions = .{},
 
     pub fn sanitize(self: *const KeyValueOptions) !void {
@@ -116,8 +120,8 @@ pub const KeyValueOptions = struct {
 };
 
 pub const Manager = struct {
-    // Root folder
-    root: Dir,
+    // DB storage
+    storage: Storage,
     // Mutex that protects new table creation
     dblock: Mutex,
     // CV for writers
@@ -145,11 +149,14 @@ pub const Manager = struct {
         io: std.Io,
         opts: KeyValueOptions,
     ) !Self {
+        var storage = try Storage.new(dir);
+        errdefer storage.deinit(io);
+
         const stat = try Statistics.new(alloc);
         errdefer stat.deinit(alloc);
 
         const version = try Version.from_file(
-            dir,
+            &storage,
             "MANIFEST",
             opts,
             stat,
@@ -163,7 +170,7 @@ pub const Manager = struct {
             .writers_count = 0,
             .write_cv = Condition.init,
             .version = version,
-            .root = dir,
+            .storage = storage,
             .dblock = Mutex.init,
             .opts = opts,
             .io = io,
@@ -248,7 +255,7 @@ pub const Manager = struct {
         // Each request is either completed via done or marked with error. In any case
         // caller return pending.err. Failure of this call does not mean that current write
         // has failed. In means that some of writes failed.
-        self.version.commit(transaction, self.root, self.io, alloc) catch {
+        self.version.commit(transaction, &self.storage, self.io, alloc) catch {
             broken = true;
         };
 
@@ -291,12 +298,13 @@ pub const Manager = struct {
         self.dblock.lockUncancelable(self.io);
         defer self.dblock.unlock(self.io);
 
-        return try self.version.get(key, self.root, self.io, alloc);
+        return try self.version.get(key, &self.storage, self.io, alloc);
     }
 
     pub fn deinit(self: *Self, alloc: Allocator) void {
         self.version.deinit(self.io, alloc);
         self.stat.deinit(alloc);
+        self.storage.deinit(self.io);
     }
 };
 
@@ -370,7 +378,7 @@ fn add_test_sstable(
         .value_seq = storage.memtable.KVSeq.init(value_seq),
     };
 
-    var sstable = try SSTable.create(manager.root, meta, &memtable, 0, manager.io, alloc);
+    var sstable = try SSTable.create(&manager.storage, meta, &memtable, 0, manager.io, alloc);
     defer sstable.deinit();
     meta.value_seq = sstable.maximum_seq();
 
@@ -379,7 +387,7 @@ fn add_test_sstable(
 
     try edit.new_files.append(alloc, meta);
 
-    try manager.version.apply(edit, manager.root, manager.io, alloc);
+    try manager.version.apply(edit, &manager.storage, manager.io, alloc);
 }
 
 test "Disk search checks newest SSTable first" {
@@ -539,7 +547,6 @@ test "WAL GC no crash" {
     const dirname = "wal_gc";
     std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
 
-    const dir = try openOrCreateDir(io, dirname);
     defer {
         std.Io.Dir.cwd().deleteTree(io, dirname) catch {
             @panic("failed to delete test db");
@@ -547,6 +554,7 @@ test "WAL GC no crash" {
     }
 
     {
+        const dir = try openOrCreateDir(io, dirname);
         var manager = try Manager.new(dir, allocator, io, .{ .memtable = .{ .memtable_size = 200 } });
         defer manager.deinit(allocator);
 
@@ -555,6 +563,7 @@ test "WAL GC no crash" {
         }
     }
 
+    const dir = try openOrCreateDir(io, dirname);
     var manager = try Manager.new(dir, allocator, io, .{ .memtable = .{ .memtable_size = 200 } });
     defer manager.deinit(allocator);
 
@@ -1184,7 +1193,6 @@ test "Failed WAL sync makes table broken" {
     const dirname = "failed_wal_sync_makes_table_broken";
     std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
 
-    const dir = try openOrCreateDir(io, dirname);
     defer {
         std.Io.Dir.cwd().deleteTree(io, dirname) catch {
             @panic("failed to delete test db");
@@ -1192,6 +1200,7 @@ test "Failed WAL sync makes table broken" {
     }
 
     {
+        const dir = try openOrCreateDir(io, dirname);
         var manager = try Manager.new(dir, allocator, io, .{
             .memtable = .{ .memtable_size = 200 },
             .wal = .{ .sync = true },
@@ -1260,6 +1269,7 @@ test "Failed WAL sync makes table broken" {
         try std.testing.expectError(error.Broken, manager.get(SuccessKey, allocator));
     }
 
+    const dir = try openOrCreateDir(io, dirname);
     var manager = try Manager.new(dir, allocator, io, .{});
     defer manager.deinit(allocator);
 }

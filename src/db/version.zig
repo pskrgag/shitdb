@@ -25,6 +25,7 @@ const OutputFileSource = @import("storage").sstable.OutputFileSource;
 const MaxSupportedLvls = @import("compaction.zig").MaxSupportedLvls;
 const CompactionOptions = @import("compaction.zig").CompactionOptions;
 const KeyValueOptions = @import("manager.zig").KeyValueOptions;
+const Storage = @import("storage").storage.Storage;
 
 pub const Version = struct {
     // File handle
@@ -50,7 +51,7 @@ pub const Version = struct {
 
     const Self = @This();
 
-    pub fn apply(self: *Self, edit: VersionEdit, dir: std.Io.Dir, io: std.Io, alloc: Allocator) !void {
+    pub fn apply(self: *Self, edit: VersionEdit, storage: *Storage, io: std.Io, alloc: Allocator) !void {
         var records = try edit.as_manifest_records(alloc);
         defer records.deinit(alloc);
 
@@ -81,11 +82,9 @@ pub const Version = struct {
             for (self.tables.items, 0..) |f, i| {
                 if (f.file_seq.get() == file.file.get()) {
                     var res = self.tables.swapRemove(i);
+                    try storage.delete_sstable(res, io, alloc);
                     res.deinit(alloc);
 
-                    const fname = try Self.file_name(file.file, alloc);
-                    defer alloc.free(fname);
-                    try dir.deleteFile(io, fname);
                     break;
                 }
             }
@@ -96,11 +95,19 @@ pub const Version = struct {
         }
     }
 
-    pub fn rotate_active(self: *Self, dir: std.Io.Dir, flush: bool, io: std.Io, alloc: Allocator) !void {
+    pub fn rotate_active(self: *Self, storage: *Storage, flush: bool, io: std.Io, alloc: Allocator) !void {
         const next_file = self.new_file_seq();
         const new_table = self.slab.alloc();
 
-        new_table.* = try WalTable.new(dir, self.opts.memtable, self.opts.wal, next_file, self, io, alloc);
+        new_table.* = try WalTable.new(
+            storage,
+            self.opts.memtable,
+            self.opts.wal,
+            next_file,
+            self,
+            io,
+            alloc,
+        );
         try self.flusher.insert(self.active);
         self.active = new_table;
 
@@ -113,7 +120,7 @@ pub const Version = struct {
     pub fn commit(
         self: *Self,
         t: Transaction,
-        dir: std.Io.Dir,
+        storage: *Storage,
         io: std.Io,
         alloc: Allocator,
     ) !void {
@@ -129,9 +136,9 @@ pub const Version = struct {
                 trans.mark_error(e);
             }
 
-            try self.rotate_active(dir, res.wal_failed, io, alloc);
+            try self.rotate_active(storage, res.wal_failed, io, alloc);
             // Try to commit to new table
-            try self.commit(trans, dir, io, alloc);
+            try self.commit(trans, storage, io, alloc);
         }
     }
 
@@ -148,7 +155,7 @@ pub const Version = struct {
     }
 
     pub fn from_file(
-        dir: std.Io.Dir,
+        storage: *Storage,
         path: []const u8,
         opts: KeyValueOptions,
         stat: *Statistics,
@@ -156,10 +163,7 @@ pub const Version = struct {
         io: std.Io,
         alloc: Allocator,
     ) !*Self {
-        const file = dir.openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
-            error.FileNotFound => try dir.createFile(io, path, .{ .read = true }),
-            else => return err,
-        };
+        var file = try storage.openOrCreateManifest(path, io);
         errdefer file.close(io);
 
         const slab = try alloc.create(MemTableSlab);
@@ -173,7 +177,7 @@ pub const Version = struct {
 
         res.* = .{
             .slab = slab,
-            .flusher = try Flusher.new(alloc, res, dir, io),
+            .flusher = try Flusher.new(alloc, res, storage, io),
             .file = file,
             .tables = try std.ArrayList(FileMeta).initCapacity(alloc, 0),
             .next_file = Value(FileSeq).init(FileSeq.init(0)),
@@ -198,19 +202,19 @@ pub const Version = struct {
 
             var rep = try manifest.ManifestRecord.deserialize_from(mmap, alloc);
             defer rep.deinit(alloc);
-            try res.replay(dir, rep, opts.memtable, opts.wal, io, alloc);
+            try res.replay(storage, rep, opts.memtable, opts.wal, io, alloc);
         }
 
         const active = res.slab.alloc();
 
-        active.* = try WalTable.new(dir, opts.memtable, opts.wal, res.new_file_seq(), res, io, alloc);
+        active.* = try WalTable.new(storage, opts.memtable, opts.wal, res.new_file_seq(), res, io, alloc);
         errdefer {
             active.deinit(alloc) catch @panic("Should not happen, since MemTable is empty");
         }
         res.active = active;
 
         if (sanitize)
-            try res.sanitize_disk_state(dir, alloc, io);
+            try res.sanitize_disk_state(storage, alloc, io);
 
         return res;
     }
@@ -241,7 +245,7 @@ pub const Version = struct {
     fn run_compaction_plan(
         self: *Version,
         plan: CompactionPlan,
-        dir: std.Io.Dir,
+        storage: *Storage,
         io: std.Io,
         alloc: Allocator,
     ) !void {
@@ -257,17 +261,17 @@ pub const Version = struct {
         }
 
         for (plan.overlap_files.items) |n| {
-            try opened_tables.append(alloc, try SSTable.open(dir, n.meta, io, alloc));
+            try opened_tables.append(alloc, try SSTable.open(storage, n.meta, io, alloc));
             try edit.deleted_files.append(alloc, .{ .file = n.meta.file_seq, .lvl = n.meta.lvl });
         }
 
         for (plan.input_files.items) |n| {
-            try opened_tables.append(alloc, try SSTable.open(dir, n.meta, io, alloc));
+            try opened_tables.append(alloc, try SSTable.open(storage, n.meta, io, alloc));
             try edit.deleted_files.append(alloc, .{ .file = n.meta.file_seq, .lvl = n.meta.lvl });
         }
 
         var new = try SSTable.merge(
-            dir,
+            storage,
             self.file_seq_source(),
             io,
             opened_tables.items,
@@ -288,12 +292,12 @@ pub const Version = struct {
             return e;
         };
 
-        try self.apply(edit, dir, io, alloc);
+        try self.apply(edit, storage, io, alloc);
     }
 
     fn compact(
         self: *Version,
-        dir: std.Io.Dir,
+        storage: *Storage,
         opts: CompactionOptions,
         io: std.Io,
         alloc: Allocator,
@@ -314,7 +318,7 @@ pub const Version = struct {
                 var plan = pp;
                 defer plan.deinit(alloc);
 
-                try self.run_compaction_plan(plan, dir, io, alloc);
+                try self.run_compaction_plan(plan, storage, io, alloc);
             } else {
                 break;
             }
@@ -326,7 +330,7 @@ pub const Version = struct {
         self: *Version,
         table: *WalTable,
         io: std.Io,
-        dir: std.Io.Dir,
+        storage: *Storage,
         alloc: Allocator,
     ) !void {
         if (table.min() == null)
@@ -349,15 +353,15 @@ pub const Version = struct {
 
         // TODO: maybe make SSTable::create generic over table type? Accessing table.table is ugly
         // af.
-        var sstable = try SSTable.create(dir, meta, &table.table, 0, io, alloc);
+        var sstable = try SSTable.create(storage, meta, &table.table, 0, io, alloc);
         defer sstable.deinit();
 
-        try self.apply(edit, dir, io, alloc);
-        try self.compact(dir, self.opts.compaction, io, alloc);
+        try self.apply(edit, storage, io, alloc);
+        try self.compact(storage, self.opts.compaction, io, alloc);
     }
 
     // Resolves value request.
-    pub fn get(self: *Self, key: []const u8, dir: std.Io.Dir, io: std.Io, alloc: Allocator) !?[]u8 {
+    pub fn get(self: *Self, key: []const u8, storage: *Storage, io: std.Io, alloc: Allocator) !?[]u8 {
         // Resolve from current active table
         const active_find_res = try self.active.get(key, self.current_seq(), alloc);
 
@@ -389,10 +393,10 @@ pub const Version = struct {
         }
 
         // Search sstables on a disk
-        return self.search_disk(key, dir, io, alloc);
+        return self.search_disk(key, storage, io, alloc);
     }
 
-    fn search_disk(self: *Self, key: []const u8, dir: std.Io.Dir, io: std.Io, alloc: Allocator) !?[]u8 {
+    fn search_disk(self: *Self, key: []const u8, storage: *Storage, io: std.Io, alloc: Allocator) !?[]u8 {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
 
@@ -416,7 +420,7 @@ pub const Version = struct {
         std.mem.sort(FileMeta, candidates.items, {}, FileMeta.less_than);
 
         for (candidates.items) |table| {
-            var ss = try SSTable.open(dir, table, io, alloc);
+            var ss = try SSTable.open(storage, table, io, alloc);
             defer ss.deinit();
             const value = try ss.find_value(key, alloc);
 
@@ -432,7 +436,7 @@ pub const Version = struct {
 
     fn replay(
         self: *Version,
-        dir: std.Io.Dir,
+        storage: *Storage,
         edits: std.ArrayList(manifest.ManifestRecord),
         opts: MemTableOpts,
         wal_opts: WalOpts,
@@ -463,7 +467,7 @@ pub const Version = struct {
                             const old_wal = wals.swapRemove(idx);
 
                             // I don't really want to abort initialization in of WAL GC failure.
-                            Wal.unlink(dir, old_wal, io, alloc) catch |e| {
+                            Wal.unlink(storage, old_wal, io, alloc) catch |e| {
                                 std.debug.print("Failed to delete old WAL {}", .{e});
                             };
                             break;
@@ -479,17 +483,13 @@ pub const Version = struct {
                     for (self.tables.items, 0..) |file, idx| {
                         if (file.file_seq.get() == f.get()) {
                             var res = self.tables.swapRemove(idx);
-                            res.deinit(alloc);
-
-                            const name = try manifest.alloc_sstable_name(file.file_seq, alloc);
-                            defer alloc.free(name);
-
-                            dir.deleteFile(io, name) catch |err| {
+                            storage.delete_sstable(res, io, alloc) catch |err| {
                                 switch (err) {
                                     error.FileNotFound => {},
                                     else => return err,
                                 }
                             };
+                            res.deinit(alloc);
 
                             found = true;
                             break;
@@ -506,7 +506,7 @@ pub const Version = struct {
         for (wals.items) |wal| {
             const alive_wal = self.slab.alloc();
 
-            alive_wal.* = try WalTable.open(dir, opts, wal_opts, wal, io, alloc);
+            alive_wal.* = try WalTable.open(storage, opts, wal_opts, wal, io, alloc);
 
             if (alive_wal.max_seq().get() > self.next_sequence.load(.monotonic).get()) {
                 self.next_sequence.store(KVSeq.init(alive_wal.max_seq().get() + 1), .monotonic);
@@ -517,7 +517,7 @@ pub const Version = struct {
         }
     }
 
-    pub fn sanitize_disk_state(self: *Self, dir: std.Io.Dir, alloc: Allocator, io: std.Io) !void {
+    pub fn sanitize_disk_state(self: *Self, storage: *Storage, alloc: Allocator, io: std.Io) !void {
         var sorted = try std.ArrayList(FileMeta).initCapacity(alloc, self.tables.items.len);
 
         defer sorted.deinit(alloc);
@@ -531,7 +531,7 @@ pub const Version = struct {
             const name = try manifest.alloc_sstable_name(table.file_seq, alloc);
             defer alloc.free(name);
 
-            const sstable = SSTable.open(dir, table, io, alloc) catch |e| {
+            const sstable = SSTable.open(storage, table, io, alloc) catch |e| {
                 std.debug.print("Failed to open {s}\n", .{name});
                 return e;
             };
@@ -645,23 +645,24 @@ test "Version serialization" {
     std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
-    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    var storage = try Storage.new(dir);
 
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("gg");
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(&storage, "manifest", testing_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     {
         var edit = try VersionEdit.empty(allocator);
         defer edit.deinit(allocator);
         edit.next_seq = KVSeq.init(1);
-        try version.apply(edit, dir, testing_io, allocator);
+        try version.apply(edit, &storage, testing_io, allocator);
     }
 }
 
@@ -690,7 +691,7 @@ fn test_file_meta(
 }
 
 fn create_test_sstable(
-    dir: std.Io.Dir,
+    storage: *Storage,
     io: std.Io,
     alloc: Allocator,
     name: []const u8,
@@ -719,7 +720,7 @@ fn create_test_sstable(
         .value_seq = KVSeq.init(0),
     };
 
-    var sstable = try SSTable.create(dir, meta, &memtable, lvl, io, alloc);
+    var sstable = try SSTable.create(storage, meta, &memtable, lvl, io, alloc);
     defer sstable.deinit();
 
     meta.value_seq = sstable.maximum_seq();
@@ -843,16 +844,26 @@ test "Version apply persists edits that reopen can replay" {
     std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
-    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    var storage = try Storage.new(dir);
+
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
+        var version = try Version.from_file(
+            &storage,
+            "manifest",
+            testing_opts,
+            &stat,
+            false,
+            testing_io,
+            allocator,
+        );
         defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
@@ -869,11 +880,19 @@ test "Version apply persists edits that reopen can replay" {
             "v9",
         ));
 
-        try version.apply(edit, dir, testing_io, allocator);
+        try version.apply(edit, &storage, testing_io, allocator);
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
+        var reopened = try Version.from_file(
+            &storage,
+            "manifest",
+            testing_opts,
+            &stat,
+            false,
+            testing_io,
+            allocator,
+        );
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 13), reopened.current_seq().get());
@@ -901,15 +920,25 @@ test "lvl0 compaction merges overlapping lvl1 table" {
     std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
-    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    var storage = try Storage.new(dir);
+
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(
+        &storage,
+        "manifest",
+        testing_opts,
+        &stat,
+        false,
+        testing_io,
+        allocator,
+    );
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -919,7 +948,7 @@ test "lvl0 compaction merges overlapping lvl1 table" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable1.sst",
@@ -933,7 +962,7 @@ test "lvl0 compaction merges overlapping lvl1 table" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable2.sst",
@@ -947,7 +976,7 @@ test "lvl0 compaction merges overlapping lvl1 table" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable3.sst",
@@ -959,8 +988,8 @@ test "lvl0 compaction merges overlapping lvl1 table" {
         ),
     );
 
-    try version.apply(edit, dir, testing_io, allocator);
-    try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
+    try version.apply(edit, &storage, testing_io, allocator);
+    try version.compact(&storage, .{ .max_lvl0 = 1 }, testing_io, allocator);
 
     try std.testing.expectEqual(@as(usize, 1), version.tables.items.len);
     try std.testing.expectEqual(@as(usize, 0), table_count_at_lvl(version, 0));
@@ -968,9 +997,9 @@ test "lvl0 compaction merges overlapping lvl1 table" {
     try std.testing.expectEqual(@as(u8, 1), version.tables.items[0].lvl);
     try expect_l1_non_overlapping(version);
 
-    try std.testing.expectEqual(null, try version.get("b", dir, testing_io, allocator));
+    try std.testing.expectEqual(null, try version.get("b", &storage, testing_io, allocator));
 
-    const value = (try version.get("a", dir, testing_io, allocator)).?;
+    const value = (try version.get("a", &storage, testing_io, allocator)).?;
     try std.testing.expectEqualSlices(u8, "fresh", value);
 }
 
@@ -985,15 +1014,17 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
     std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
-    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    var storage = try Storage.new(dir);
+
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(&storage, "manifest", testing_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1003,7 +1034,7 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable1.sst",
@@ -1017,7 +1048,7 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable2.sst",
@@ -1031,7 +1062,7 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable3.sst",
@@ -1043,21 +1074,21 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
         ),
     );
 
-    try version.apply(edit, dir, testing_io, allocator);
-    try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
+    try version.apply(edit, &storage, testing_io, allocator);
+    try version.compact(&storage, .{ .max_lvl0 = 1 }, testing_io, allocator);
 
     try std.testing.expectEqual(@as(usize, 2), version.tables.items.len);
     try std.testing.expectEqual(@as(usize, 0), table_count_at_lvl(version, 0));
     try std.testing.expectEqual(@as(usize, 2), table_count_at_lvl(version, 1));
     try expect_l1_non_overlapping(version);
 
-    const old = (try version.get("z", dir, testing_io, allocator)).?;
+    const old = (try version.get("z", &storage, testing_io, allocator)).?;
     try std.testing.expectEqualSlices(u8, "old", old);
 
-    const fresh_a = (try version.get("a", dir, testing_io, allocator)).?;
+    const fresh_a = (try version.get("a", &storage, testing_io, allocator)).?;
     try std.testing.expectEqualSlices(u8, "fresh-a", fresh_a);
 
-    const fresh_b = (try version.get("b", dir, testing_io, allocator)).?;
+    const fresh_b = (try version.get("b", &storage, testing_io, allocator)).?;
     try std.testing.expectEqualSlices(u8, "fresh-b", fresh_b);
 }
 
@@ -1072,15 +1103,25 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
     std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
-    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    var storage = try Storage.new(dir);
+
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(
+        &storage,
+        "manifest",
+        testing_opts,
+        &stat,
+        false,
+        testing_io,
+        allocator,
+    );
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1090,7 +1131,7 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable1.sst",
@@ -1104,7 +1145,7 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable2.sst",
@@ -1119,7 +1160,7 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable3.sst",
@@ -1131,20 +1172,20 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
         ),
     );
 
-    try version.apply(edit, dir, testing_io, allocator);
-    try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
+    try version.apply(edit, &storage, testing_io, allocator);
+    try version.compact(&storage, .{ .max_lvl0 = 1 }, testing_io, allocator);
 
     try std.testing.expectEqual(@as(usize, 1), version.tables.items.len);
     try std.testing.expectEqual(@as(usize, 0), table_count_at_lvl(version, 0));
     try std.testing.expectEqual(@as(usize, 1), table_count_at_lvl(version, 1));
     try expect_l1_non_overlapping(version);
 
-    try std.testing.expectEqual(null, try version.get("b", dir, testing_io, allocator));
+    try std.testing.expectEqual(null, try version.get("b", &storage, testing_io, allocator));
 
-    const fresh_a = (try version.get("a", dir, testing_io, allocator)).?;
+    const fresh_a = (try version.get("a", &storage, testing_io, allocator)).?;
     try std.testing.expectEqualSlices(u8, "fresh-a", fresh_a);
 
-    const fresh_c = (try version.get("c", dir, testing_io, allocator)).?;
+    const fresh_c = (try version.get("c", &storage, testing_io, allocator)).?;
     try std.testing.expectEqualSlices(u8, "fresh-c", fresh_c);
 }
 
@@ -1159,15 +1200,17 @@ test "lvl0 compaction physically deletes obsolete input files" {
     std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
-    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    var storage = try Storage.new(dir);
+
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(&storage, "manifest", testing_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1177,7 +1220,7 @@ test "lvl0 compaction physically deletes obsolete input files" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable1.sst",
@@ -1191,7 +1234,7 @@ test "lvl0 compaction physically deletes obsolete input files" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable2.sst",
@@ -1205,7 +1248,7 @@ test "lvl0 compaction physically deletes obsolete input files" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable3.sst",
@@ -1217,12 +1260,12 @@ test "lvl0 compaction physically deletes obsolete input files" {
         ),
     );
 
-    try version.apply(edit, dir, testing_io, allocator);
+    try version.apply(edit, &storage, testing_io, allocator);
     try expect_file_exists(dir, testing_io, "memtable1.sst");
     try expect_file_exists(dir, testing_io, "memtable2.sst");
     try expect_file_exists(dir, testing_io, "memtable3.sst");
 
-    try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
+    try version.compact(&storage, .{ .max_lvl0 = 1 }, testing_io, allocator);
 
     try expect_file_deleted(dir, testing_io, "memtable1.sst");
     try expect_file_deleted(dir, testing_io, "memtable2.sst");
@@ -1246,15 +1289,25 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
     std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
-    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    var storage = try Storage.new(dir);
+
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
     }
 
-    var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(
+        &storage,
+        "manifest",
+        testing_opts,
+        &stat,
+        false,
+        testing_io,
+        allocator,
+    );
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1264,7 +1317,7 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable1.sst",
@@ -1278,7 +1331,7 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable2.sst",
@@ -1292,7 +1345,7 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
     try edit.new_files.append(
         allocator,
         try create_test_sstable(
-            dir,
+            &storage,
             testing_io,
             allocator,
             "memtable3.sst",
@@ -1304,8 +1357,8 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
         ),
     );
 
-    try version.apply(edit, dir, testing_io, allocator);
-    try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
+    try version.apply(edit, &storage, testing_io, allocator);
+    try version.compact(&storage, .{ .max_lvl0 = 1 }, testing_io, allocator);
 
     try expect_file_exists(dir, testing_io, "memtable1.sst");
     try expect_file_deleted(dir, testing_io, "memtable2.sst");
@@ -1329,16 +1382,26 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
     std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
-    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    var storage = try Storage.new(dir);
+
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
+        var version = try Version.from_file(
+            &storage,
+            "manifest",
+            testing_opts,
+            &stat,
+            false,
+            testing_io,
+            allocator,
+        );
         defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
@@ -1348,7 +1411,7 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
         try edit.new_files.append(
             allocator,
             try create_test_sstable(
-                dir,
+                &storage,
                 testing_io,
                 allocator,
                 "memtable1.sst",
@@ -1362,7 +1425,7 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
         try edit.new_files.append(
             allocator,
             try create_test_sstable(
-                dir,
+                &storage,
                 testing_io,
                 allocator,
                 "memtable2.sst",
@@ -1376,7 +1439,7 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
         try edit.new_files.append(
             allocator,
             try create_test_sstable(
-                dir,
+                &storage,
                 testing_io,
                 allocator,
                 "memtable3.sst",
@@ -1388,12 +1451,12 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
             ),
         );
 
-        try version.apply(edit, dir, testing_io, allocator);
-        try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
+        try version.apply(edit, &storage, testing_io, allocator);
+        try version.compact(&storage, .{ .max_lvl0 = 1 }, testing_io, allocator);
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
+        var reopened = try Version.from_file(&storage, "manifest", testing_opts, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 1), reopened.tables.items.len);
@@ -1402,9 +1465,9 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
         try std.testing.expectEqual(@as(u8, 1), reopened.tables.items[0].lvl);
         try expect_l1_non_overlapping(reopened);
 
-        try std.testing.expectEqual(null, try reopened.get("b", dir, testing_io, allocator));
+        try std.testing.expectEqual(null, try reopened.get("b", &storage, testing_io, allocator));
 
-        const value = (try reopened.get("a", dir, testing_io, allocator)).?;
+        const value = (try reopened.get("a", &storage, testing_io, allocator)).?;
         try std.testing.expectEqualSlices(u8, "fresh", value);
     }
 }
@@ -1420,16 +1483,26 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
     std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
-    var dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+    var storage = try Storage.new(dir);
+
     defer {
-        dir.close(testing_io);
+        storage.deinit(testing_io);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
     }
 
     {
-        var version = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
+        var version = try Version.from_file(
+            &storage,
+            "manifest",
+            testing_opts,
+            &stat,
+            false,
+            testing_io,
+            allocator,
+        );
         defer version.deinit(testing_io, allocator);
 
         var edit = try VersionEdit.empty(allocator);
@@ -1439,7 +1512,7 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
         try edit.new_files.append(
             allocator,
             try create_test_sstable(
-                dir,
+                &storage,
                 testing_io,
                 allocator,
                 "memtable1.sst",
@@ -1453,7 +1526,7 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
         try edit.new_files.append(
             allocator,
             try create_test_sstable(
-                dir,
+                &storage,
                 testing_io,
                 allocator,
                 "memtable2.sst",
@@ -1467,7 +1540,7 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
         try edit.new_files.append(
             allocator,
             try create_test_sstable(
-                dir,
+                &storage,
                 testing_io,
                 allocator,
                 "memtable3.sst",
@@ -1479,12 +1552,12 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
             ),
         );
 
-        try version.apply(edit, dir, testing_io, allocator);
-        try version.compact(dir, .{ .max_lvl0 = 1 }, testing_io, allocator);
+        try version.apply(edit, &storage, testing_io, allocator);
+        try version.compact(&storage, .{ .max_lvl0 = 1 }, testing_io, allocator);
     }
 
     {
-        var reopened = try Version.from_file(dir, "manifest", testing_opts, &stat, false, testing_io, allocator);
+        var reopened = try Version.from_file(&storage, "manifest", testing_opts, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 2), reopened.tables.items.len);
@@ -1492,13 +1565,13 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
         try std.testing.expectEqual(@as(usize, 2), table_count_at_lvl(reopened, 1));
         try expect_l1_non_overlapping(reopened);
 
-        const old = (try reopened.get("z", dir, testing_io, allocator)).?;
+        const old = (try reopened.get("z", &storage, testing_io, allocator)).?;
         try std.testing.expectEqualSlices(u8, "old", old);
 
-        const fresh_a = (try reopened.get("a", dir, testing_io, allocator)).?;
+        const fresh_a = (try reopened.get("a", &storage, testing_io, allocator)).?;
         try std.testing.expectEqualSlices(u8, "fresh-a", fresh_a);
 
-        const fresh_b = (try reopened.get("b", dir, testing_io, allocator)).?;
+        const fresh_b = (try reopened.get("b", &storage, testing_io, allocator)).?;
         try std.testing.expectEqualSlices(u8, "fresh-b", fresh_b);
     }
 }

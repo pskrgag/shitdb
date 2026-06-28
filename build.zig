@@ -81,7 +81,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const storage = b.addModule("storage", .{
-        .root_source_file = b.path("src/storage/memtable.zig"),
+        .root_source_file = b.path("src/storage/root.zig"),
         .target = target,
         .sanitize_thread = tsan,
         .imports = &.{
