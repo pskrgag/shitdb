@@ -95,10 +95,10 @@ pub const Storage = struct {
         const name = try manifest.alloc_sstable_name(fmeta.file_seq, alloc);
         defer alloc.free(name);
 
-        const stat = try self.dir.statFile(io, name, .{ .follow_symlinks = false });
-
-        self.stat.sstables.items[fmeta.lvl] -= stat.size;
         try self.dir.deleteFile(io, name);
+
+        const stat = try self.dir.statFile(io, name, .{ .follow_symlinks = false });
+        self.stat.sstables.items[fmeta.lvl] -= stat.size;
     }
 
     pub fn open_wal(self: *Storage, seq: FileSeq, io: std.Io, alloc: Allocator) !std.Io.File {
@@ -122,16 +122,21 @@ pub const Storage = struct {
         try self.dir.deleteFile(io, name);
     }
 
-    pub fn delete_sstable(self: *Storage, fmeta: FileMeta, io: std.Io, alloc: Allocator) !void {
-        const name = try manifest.alloc_sstable_name(fmeta.file_seq, alloc);
-        defer alloc.free(name);
-
-        try self.dir.deleteFile(io, name);
-    }
-
     pub fn deinit(self: *Self, io: std.Io, alloc: Allocator) void {
         self.stat.deinit(alloc);
         self.dir.close(io);
+    }
+
+    fn sstable_size(self: *Storage, fmeta: FileMeta, io: std.Io, alloc: Allocator) !usize {
+        const name = try manifest.alloc_sstable_name(fmeta.file_seq, alloc);
+        defer alloc.free(name);
+
+        const stat = try self.dir.statFile(io, name, .{ .follow_symlinks = false });
+        return stat.size;
+    }
+
+    pub fn record_sstable(self: *Self, fmeta: FileMeta, io: std.Io, alloc: Allocator) !void {
+        self.stat.sstables.items[fmeta.lvl] += try self.sstable_size(fmeta, io, alloc);
     }
 
     pub fn stats(self: *const Self) *const Stats {
@@ -180,7 +185,7 @@ fn create_test_sstable(
     };
     defer meta.deinit(alloc);
 
-    var sstable = try SSTable.create(storage, meta, &memtable, lvl, io, alloc);
+    var sstable = try SSTable.create(storage, meta, &memtable, io, alloc);
     defer sstable.deinit(io);
 
     const stat = try sstable.file.file.stat(testing_io);

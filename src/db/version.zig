@@ -44,8 +44,11 @@ pub const Version = struct {
     stat: *Statistics,
     // Slab for freeing memtables
     slab: *MemTableSlab,
-    // Active MemTable
-    active: *WalTable,
+    // Active MemTable.
+    //
+    // TODO: this must not be null, but it helps for error handling during Version creation. There
+    // is weird thing that Wal actually want version pointer... This should be fixed one day.
+    active: ?*WalTable,
     // Options
     opts: KeyValueOptions,
 
@@ -82,7 +85,7 @@ pub const Version = struct {
             for (self.tables.items, 0..) |f, i| {
                 if (f.file_seq.get() == file.file.get()) {
                     var res = self.tables.swapRemove(i);
-                    try storage.delete_sstable(res, io, alloc);
+                    try storage.unlink_sstable(res, io, alloc);
                     res.deinit(alloc);
 
                     break;
@@ -108,7 +111,7 @@ pub const Version = struct {
             io,
             alloc,
         );
-        try self.flusher.insert(self.active);
+        try self.flusher.insert(self.active.?);
         self.active = new_table;
 
         if (flush)
@@ -125,7 +128,7 @@ pub const Version = struct {
         alloc: Allocator,
     ) !void {
         var trans = t;
-        const res = self.active.commit(&trans, alloc);
+        const res = self.active.?.commit(&trans, alloc);
         if (res.need_rotate or res.wal_failed) {
             errdefer |e| {
                 // There was an error while processing transaction. We need to mark all pending
@@ -185,7 +188,7 @@ pub const Version = struct {
             .mutex = Mutex.init,
             .stat = stat,
             .opts = opts,
-            .active = undefined,
+            .active = null,
         };
         errdefer res.deinit(io, alloc);
 
@@ -207,7 +210,15 @@ pub const Version = struct {
 
         const active = res.slab.alloc();
 
-        active.* = try WalTable.new(storage, opts.memtable, opts.wal, res.new_file_seq(), res, io, alloc);
+        active.* = try WalTable.new(
+            storage,
+            opts.memtable,
+            opts.wal,
+            res.new_file_seq(),
+            res,
+            io,
+            alloc,
+        );
         errdefer {
             active.deinit(alloc) catch @panic("Should not happen, since MemTable is empty");
         }
@@ -353,7 +364,7 @@ pub const Version = struct {
 
         // TODO: maybe make SSTable::create generic over table type? Accessing table.table is ugly
         // af.
-        var sstable = try SSTable.create(storage, meta, &table.table, 0, io, alloc);
+        var sstable = try SSTable.create(storage, meta, &table.table, io, alloc);
         defer sstable.deinit(io);
 
         try self.apply(edit, storage, io, alloc);
@@ -363,7 +374,7 @@ pub const Version = struct {
     // Resolves value request.
     pub fn get(self: *Self, key: []const u8, storage: *Storage, io: std.Io, alloc: Allocator) !?[]u8 {
         // Resolve from current active table
-        const active_find_res = try self.active.get(key, self.current_seq(), alloc);
+        const active_find_res = try self.active.?.get(key, self.current_seq(), alloc);
 
         switch (active_find_res) {
             .Found => |val| {
@@ -473,6 +484,11 @@ pub const Version = struct {
                             break;
                         }
                     }
+
+                    storage.record_sstable(f, io, alloc) catch |e| {
+                        if (e != error.FileNotFound)
+                            return e;
+                    };
                 },
                 .AddWal => |wal| {
                     try wals.append(alloc, wal);
@@ -483,7 +499,7 @@ pub const Version = struct {
                     for (self.tables.items, 0..) |file, idx| {
                         if (file.file_seq.get() == f.get()) {
                             var res = self.tables.swapRemove(idx);
-                            storage.delete_sstable(res, io, alloc) catch |err| {
+                            storage.unlink_sstable(res, io, alloc) catch |err| {
                                 switch (err) {
                                     error.FileNotFound => {},
                                     else => return err,
@@ -545,11 +561,14 @@ pub const Version = struct {
 
     // De-initializes version
     pub fn deinit(self: *Version, io: std.Io, alloc: Allocator) void {
-        self.flusher.insert(self.active) catch {
-            std.debug.print("Failed to insert data into flusher\n", .{});
-            self.active.deinit(alloc) catch @panic("todo");
-        };
-        self.active = undefined;
+        if (self.active) |active| {
+            self.flusher.insert(active) catch {
+                std.debug.print("Failed to insert data into flusher\n", .{});
+                active.deinit(alloc) catch @panic("todo");
+            };
+
+            self.active = undefined;
+        }
 
         // It's required to destroy flusher first, since it may want to apply some changes to version.
         self.flusher.deinit(alloc);
@@ -667,6 +686,7 @@ test "Version serialization" {
 }
 
 fn test_file_meta(
+    storage: ?*Storage,
     alloc: Allocator,
     lvl: u8,
     seq: usize,
@@ -677,17 +697,25 @@ fn test_file_meta(
 ) !FileMeta {
     var memtable = try MemTable.new(alloc, std.testing.io, .{});
     defer memtable.deinit(alloc);
+    const testing_io = std.testing.io;
 
     try memtable.put(min_key, min_value, KVSeq.init(seq));
     try memtable.put(max_key, max_value, KVSeq.init(seq + 1));
 
-    return .{
+    const meta = FileMeta{
         .lvl = lvl,
         .file_seq = FileSeq.init(seq),
         .min = try KeyOwned.from_kv(memtable.min().?, alloc),
         .max = try KeyOwned.from_kv(memtable.max().?, alloc),
         .value_seq = KVSeq.init(seq + 1),
     };
+
+    if (storage) |st| {
+        var table = try SSTable.create(st, meta, &memtable, testing_io, alloc);
+        table.deinit(testing_io);
+    }
+
+    return meta;
 }
 
 fn create_test_sstable(
@@ -717,7 +745,7 @@ fn create_test_sstable(
         .value_seq = KVSeq.init(0),
     };
 
-    var sstable = try SSTable.create(storage, meta, &memtable, lvl, io, alloc);
+    var sstable = try SSTable.create(storage, meta, &memtable, io, alloc);
     defer sstable.deinit(io);
 
     meta.value_seq = sstable.maximum_seq();
@@ -769,6 +797,7 @@ test "FileMeta key range overlap includes shared boundary keys" {
     const allocator = arena.allocator();
 
     const meta = try test_file_meta(
+        null,
         allocator,
         1,
         1,
@@ -794,6 +823,7 @@ test "VersionEdit serializes manifest records in replay order" {
     edit.next_seq = KVSeq.init(17);
     edit.next_file = FileSeq.init(42);
     try edit.new_files.append(allocator, try test_file_meta(
+        null,
         allocator,
         0,
         42,
@@ -868,6 +898,7 @@ test "Version apply persists edits that reopen can replay" {
         edit.next_seq = KVSeq.init(9);
         edit.next_file = FileSeq.init(11);
         try edit.new_files.append(allocator, try test_file_meta(
+            &storage,
             allocator,
             0,
             11,
@@ -1532,6 +1563,9 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
         try version.compact(&storage, .{ .max_lvl0 = 1 }, testing_io, allocator);
     }
 
+    try std.testing.expectEqual(storage.stats().sstable_size(0), 0);
+    try std.testing.expect(storage.stats().sstable_size(1) > 0);
+
     {
         var reopened = try Version.from_file(&storage, "manifest", testing_opts, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
@@ -1549,5 +1583,120 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
 
         const fresh_b = (try reopened.get("b", &storage, testing_io, allocator)).?;
         try std.testing.expectEqualSlices(u8, "fresh-b", fresh_b);
+    }
+}
+
+test "Version updates storage stats on boot" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+    const testing_io = std.testing.io;
+    var stat = std.mem.zeroes(Statistics);
+
+    const dirname = "test_version_updates_storage_stats_on_boot";
+    std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {};
+    try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
+
+    defer {
+        std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    var expected_lvl0: usize = 0;
+    var expected_lvl1: usize = 0;
+
+    {
+        const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+        var storage = try Storage.new(dir, 100, allocator);
+        defer storage.deinit(testing_io, allocator);
+
+        var version = try Version.from_file(
+            &storage,
+            "manifest",
+            testing_opts,
+            &stat,
+            false,
+            testing_io,
+            allocator,
+        );
+        defer version.deinit(testing_io, allocator);
+
+        var edit = try VersionEdit.empty(allocator);
+        defer edit.deinit(allocator);
+        edit.next_file = FileSeq.init(4);
+
+        try edit.new_files.append(
+            allocator,
+            try create_test_sstable(
+                &storage,
+                testing_io,
+                allocator,
+                1,
+                1,
+                &[_]TestSSTableKV{
+                    .{ .key = "z", .value = "old", .seq = 1 },
+                },
+            ),
+        );
+        try edit.new_files.append(
+            allocator,
+            try create_test_sstable(
+                &storage,
+                testing_io,
+                allocator,
+                0,
+                2,
+                &[_]TestSSTableKV{
+                    .{ .key = "a", .value = "fresh-a", .seq = 2 },
+                },
+            ),
+        );
+        try edit.new_files.append(
+            allocator,
+            try create_test_sstable(
+                &storage,
+                testing_io,
+                allocator,
+                0,
+                3,
+                &[_]TestSSTableKV{
+                    .{ .key = "b", .value = "fresh-b", .seq = 3 },
+                },
+            ),
+        );
+
+        try version.apply(edit, &storage, testing_io, allocator);
+
+        expected_lvl0 = storage.stats().sstable_size(0);
+        expected_lvl1 = storage.stats().sstable_size(1);
+        try std.testing.expect(expected_lvl0 > 0);
+        try std.testing.expect(expected_lvl1 > 0);
+    }
+
+    {
+        const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
+        var storage = try Storage.new(dir, 100, allocator);
+        defer storage.deinit(testing_io, allocator);
+
+        try std.testing.expectEqual(@as(usize, 0), storage.stats().sstable_size(0));
+        try std.testing.expectEqual(@as(usize, 0), storage.stats().sstable_size(1));
+
+        var version = try Version.from_file(
+            &storage,
+            "manifest",
+            testing_opts,
+            &stat,
+            false,
+            testing_io,
+            allocator,
+        );
+        defer version.deinit(testing_io, allocator);
+
+        try std.testing.expectEqual(expected_lvl0, storage.stats().sstable_size(0));
+        try std.testing.expectEqual(expected_lvl1, storage.stats().sstable_size(1));
+        try std.testing.expectEqual(@as(usize, 0), storage.stats().sstable_size(2));
     }
 }

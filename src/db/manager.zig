@@ -378,7 +378,7 @@ fn add_test_sstable(
         .value_seq = storage.memtable.KVSeq.init(value_seq),
     };
 
-    var sstable = try SSTable.create(&manager.storage, meta, &memtable, 0, manager.io, alloc);
+    var sstable = try SSTable.create(&manager.storage, meta, &memtable, manager.io, alloc);
     defer sstable.deinit(manager.io);
     meta.value_seq = sstable.maximum_seq();
 

@@ -159,6 +159,22 @@ pub fn build(b: *std.Build) void {
     });
     const run_memtable_tests = b.addRunArtifact(memtable_tests);
 
+    const storage_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/storage/storage.zig"),
+            .target = target,
+            .sanitize_thread = tsan,
+            .imports = &.{
+                .{ .name = "skiplist", .module = skiplist },
+                .{ .name = "test_utils", .module = test_utils },
+                .{ .name = "merging_iterator", .module = merging_iterator },
+            },
+        }),
+        .filters = test_filters,
+        .use_llvm = tsan,
+    });
+    const run_storage_tests = b.addRunArtifact(storage_tests);
+
     const db_tests = b.addTest(.{
         .root_module = db,
         .filters = test_filters,
@@ -188,6 +204,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_memtable_tests.step);
     test_step.dependOn(&run_db_tests.step);
     test_step.dependOn(&run_iter_tests.step);
+    test_step.dependOn(&run_storage_tests.step);
 
     const wal_test_step = b.step("test-wal", "Run only WAL tests");
     wal_test_step.dependOn(&run_wal_tests.step);

@@ -504,11 +504,10 @@ pub const SSTable = struct {
         storage: *Storage,
         fmeta: FileMeta,
         tbl: *const MemTable,
-        lvl: u8,
         io: std.Io,
         alloc: Allocator,
     ) !Self {
-        var file = try storage.create_sstable(fmeta.file_seq, lvl, io, alloc);
+        var file = try storage.create_sstable(fmeta.file_seq, fmeta.lvl, io, alloc);
 
         errdefer {
             file.close(io);
@@ -523,7 +522,7 @@ pub const SSTable = struct {
         errdefer mmap.deinit();
 
         const iter = try Self.write_values(tbl, mmap.data.ptr, alloc);
-        const real_size = try Self.finalize_table(iter, &file, mmap.data, lvl, io, alloc);
+        const real_size = try Self.finalize_table(iter, &file, mmap.data, fmeta.lvl, io, alloc);
 
         std.debug.assert(real_size == mmap.data.len);
         std.debug.assert(iter.min.?.cmp(&tbl.min().?) == .eq);
@@ -532,7 +531,7 @@ pub const SSTable = struct {
         return .{
             .mmap = mmap,
             .file = file,
-            .lvl = @intCast(lvl),
+            .lvl = @intCast(fmeta.lvl),
             .min_key = iter.min.?.as_key(),
             .max_key = iter.max.?.as_key(),
             .max_seq = iter.max_seq,
@@ -755,7 +754,7 @@ test "Simple find and create" {
     var meta = try test_file_meta(allocator, 0, &tb);
     defer meta.deinit(allocator);
 
-    var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
+    var table = try SSTable.create(&storage, meta, &tb, testing_io, allocator);
     defer table.deinit(testing_io);
     const to_find = [_][]const u8{ "a" ** 1, "a" ** 20, "a" ** 51, "a" ** 100, "a" ** 150, "a" ** 132 };
 
@@ -815,7 +814,7 @@ test "SSTable persists min and max keys" {
     var meta = try test_file_meta(allocator, 0, &tb);
     defer meta.deinit(allocator);
     {
-        var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
+        var table = try SSTable.create(&storage, meta, &tb, testing_io, allocator);
         defer table.deinit(testing_io);
 
         try std.testing.expectEqualSlices(u8, "a", table.min());
@@ -861,7 +860,7 @@ test "SSTable min and max keys include tombstones" {
     var meta = try test_file_meta(allocator, 0, &tb);
     defer meta.deinit(allocator);
     {
-        var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
+        var table = try SSTable.create(&storage, meta, &tb,testing_io, allocator);
         defer table.deinit(testing_io);
 
         try std.testing.expectEqualSlices(u8, "a", table.min());
@@ -905,7 +904,7 @@ test "Remove" {
     var meta = try test_file_meta(allocator, 0, &tb);
     defer meta.deinit(allocator);
 
-    var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
+    var table = try SSTable.create(&storage, meta, &tb, testing_io, allocator);
     defer table.deinit(testing_io);
 
     const val = try table.find_value("b" ** 10, allocator);
@@ -948,7 +947,7 @@ test "Remove more than one block" {
     {
         var meta = try test_file_meta(allocator, 0, &tb);
         defer meta.deinit(allocator);
-        var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
+        var table = try SSTable.create(&storage, meta, &tb, testing_io, allocator);
         defer table.deinit(testing_io);
 
         const val = try table.find_value("b" ** (BlockSize / 4), allocator);
@@ -960,7 +959,7 @@ test "Remove more than one block" {
 
         var meta = try test_file_meta(allocator, 0, &tb);
         defer meta.deinit(allocator);
-        var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
+        var table = try SSTable.create(&storage, meta, &tb, testing_io, allocator);
         defer table.deinit(testing_io);
 
         const val = try table.find_value("b" ** (BlockSize / 4), allocator);
@@ -997,7 +996,7 @@ test "Merge" {
 
     var meta = try test_file_meta(allocator, 0, &tb);
     defer meta.deinit(allocator);
-    var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
+    var table = try SSTable.create(&storage, meta, &tb, testing_io, allocator);
     defer table.deinit(testing_io);
 
     var tb1 = try MemTable.new(allocator, testing_io, .{});
@@ -1009,7 +1008,7 @@ test "Merge" {
 
     var meta1 = try test_file_meta(allocator, 0, &tb1);
     defer meta1.deinit(allocator);
-    var table1 = try SSTable.create(&storage, meta1, &tb1, 0, testing_io, allocator);
+    var table1 = try SSTable.create(&storage, meta1, &tb1, testing_io, allocator);
     defer table1.deinit(testing_io);
 
     var merged_seq = FileSeq.init(@atomicRmw(u64, &Lvl0Count, .Add, 1, .monotonic));
@@ -1069,11 +1068,11 @@ test "Merged SSTable persists min and max keys" {
     var merged_seq = FileSeq.init(@atomicRmw(u64, &Lvl0Count, .Add, 1, .monotonic));
     var meta = try test_file_meta(allocator, 0, &tb);
     defer meta.deinit(allocator);
-    var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
+    var table = try SSTable.create(&storage, meta, &tb, testing_io, allocator);
     defer table.deinit(testing_io);
     var meta1 = try test_file_meta(allocator, 0, &tb1);
     defer meta1.deinit(allocator);
-    var table1 = try SSTable.create(&storage, meta1, &tb1, 0, testing_io, allocator);
+    var table1 = try SSTable.create(&storage, meta1, &tb1, testing_io, allocator);
     defer table1.deinit(testing_io);
 
     var merge_res = try SSTable.merge(&storage, test_output_file_source(&merged_seq), testing_io, &[_]SSTable{
@@ -1168,11 +1167,11 @@ test "Merge with remove and overlapping regions" {
 
     var meta = try test_file_meta(allocator, 0, &tb);
     defer meta.deinit(allocator);
-    var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
+    var table = try SSTable.create(&storage, meta, &tb, testing_io, allocator);
     defer table.deinit(testing_io);
     var meta1 = try test_file_meta(allocator, 0, &tb1);
     defer meta1.deinit(allocator);
-    var table1 = try SSTable.create(&storage, meta1, &tb1, 0, testing_io, allocator);
+    var table1 = try SSTable.create(&storage, meta1, &tb1, testing_io, allocator);
     defer table1.deinit(testing_io);
 
     var merge_res = try SSTable.merge(&storage, test_output_file_source(&merged_seq), testing_io, &[_]SSTable{ table, table1 }, 1, allocator);
