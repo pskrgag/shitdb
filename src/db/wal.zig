@@ -372,9 +372,9 @@ test "WAL serializes add record" {
     const dirname = "test_wal_add_record";
 
     const dir = try openTestDir(dirname);
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -421,9 +421,9 @@ test "WAL serializes remove record" {
     const dirname = "test_wal_remove_record";
 
     const dir = try openTestDir(dirname);
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -466,9 +466,9 @@ test "WAL serializes records in append order" {
     const dirname = "test_wal_multiple_records";
 
     const dir = try openTestDir(dirname);
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -530,9 +530,9 @@ test "WAL replay restores add record into target table" {
     const dirname = "test_wal_replay_add";
 
     const dir = try openTestDir(dirname);
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -569,9 +569,9 @@ test "WAL replay restores remove record into target table" {
     const dirname = "test_wal_replay_remove";
 
     const dir = try openTestDir(dirname);
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -602,9 +602,9 @@ test "WAL replay applies later remove over earlier add" {
     const dirname = "test_wal_replay_add_remove";
 
     const dir = try openTestDir(dirname);
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -646,9 +646,9 @@ test "WAL replay rejects unknown record magic" {
     const dirname = "test_wal_replay_bad_magic";
 
     const dir = try openTestDir(dirname);
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -670,9 +670,9 @@ test "WAL replay rejects truncated record size" {
     const dirname = "test_wal_replay_truncated_size";
 
     const dir = try openTestDir(dirname);
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -691,9 +691,9 @@ test "WAL replay rejects add record with truncated payload" {
     const dirname = "test_wal_replay_truncated_add";
 
     const dir = try openTestDir(dirname);
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };
@@ -716,9 +716,9 @@ test "WAL replay rejects remove record without sequence number" {
     const dirname = "test_wal_replay_truncated_remove_seq";
 
     const dir = try openTestDir(dirname);
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test wal dir");
         };

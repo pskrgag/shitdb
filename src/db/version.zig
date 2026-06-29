@@ -254,8 +254,8 @@ pub const Version = struct {
 
         var opened_tables = try std.ArrayList(SSTable).initCapacity(alloc, 0);
         defer {
-            for (opened_tables.items) |sstable|
-                sstable.deinit();
+            for (opened_tables.items) |*sstable|
+                sstable.deinit(io);
 
             opened_tables.deinit(alloc);
         }
@@ -354,7 +354,7 @@ pub const Version = struct {
         // TODO: maybe make SSTable::create generic over table type? Accessing table.table is ugly
         // af.
         var sstable = try SSTable.create(storage, meta, &table.table, 0, io, alloc);
-        defer sstable.deinit();
+        defer sstable.deinit(io);
 
         try self.apply(edit, storage, io, alloc);
         try self.compact(storage, self.opts.compaction, io, alloc);
@@ -421,7 +421,7 @@ pub const Version = struct {
 
         for (candidates.items) |table| {
             var ss = try SSTable.open(storage, table, io, alloc);
-            defer ss.deinit();
+            defer ss.deinit(io);
             const value = try ss.find_value(key, alloc);
 
             switch (value) {
@@ -646,10 +646,10 @@ test "Version serialization" {
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
     const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
 
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("gg");
         };
@@ -721,7 +721,7 @@ fn create_test_sstable(
     };
 
     var sstable = try SSTable.create(storage, meta, &memtable, lvl, io, alloc);
-    defer sstable.deinit();
+    defer sstable.deinit(io);
 
     meta.value_seq = sstable.maximum_seq();
     return meta;
@@ -845,10 +845,10 @@ test "Version apply persists edits that reopen can replay" {
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
     const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
 
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
@@ -921,10 +921,10 @@ test "lvl0 compaction merges overlapping lvl1 table" {
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
     const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
 
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
@@ -1015,10 +1015,10 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
     const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
 
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
@@ -1104,10 +1104,10 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
     const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
 
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
@@ -1201,10 +1201,10 @@ test "lvl0 compaction physically deletes obsolete input files" {
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
     const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
 
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
@@ -1290,10 +1290,10 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
     const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
 
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
@@ -1383,10 +1383,10 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
     const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
 
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };
@@ -1484,10 +1484,10 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
     try std.Io.Dir.cwd().createDir(testing_io, dirname, .default_dir);
 
     const dir = try std.Io.Dir.cwd().openDir(testing_io, dirname, .{});
-    var storage = try Storage.new(dir);
+    var storage = try Storage.new(dir, 100, allocator);
 
     defer {
-        storage.deinit(testing_io);
+        storage.deinit(testing_io, allocator);
         std.Io.Dir.cwd().deleteTree(testing_io, dirname) catch {
             @panic("failed to delete test db");
         };

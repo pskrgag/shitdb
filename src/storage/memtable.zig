@@ -6,9 +6,7 @@ const Node = std.DoublyLinkedList.Node;
 const HashTableTest = @import("test_utils").HashTableTest;
 const Value = std.atomic.Value;
 const SkiplistNode = skiplist.Node;
-
-pub const sstable = @import("sstable.zig");
-pub const manifest = @import("manifest.zig");
+const sstable = @import("sstable.zig");
 
 const Type = enum(u1) {
     Delete = 0,

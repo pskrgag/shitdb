@@ -149,8 +149,8 @@ pub const Manager = struct {
         io: std.Io,
         opts: KeyValueOptions,
     ) !Self {
-        var storage = try Storage.new(dir);
-        errdefer storage.deinit(io);
+        var storage = try Storage.new(dir, opts.compaction.max_lvl, alloc);
+        errdefer storage.deinit(io, alloc);
 
         const stat = try Statistics.new(alloc);
         errdefer stat.deinit(alloc);
@@ -304,7 +304,7 @@ pub const Manager = struct {
     pub fn deinit(self: *Self, alloc: Allocator) void {
         self.version.deinit(self.io, alloc);
         self.stat.deinit(alloc);
-        self.storage.deinit(self.io);
+        self.storage.deinit(self.io, alloc);
     }
 };
 
@@ -379,7 +379,7 @@ fn add_test_sstable(
     };
 
     var sstable = try SSTable.create(&manager.storage, meta, &memtable, 0, manager.io, alloc);
-    defer sstable.deinit();
+    defer sstable.deinit(manager.io);
     meta.value_seq = sstable.maximum_seq();
 
     var edit = try VersionEdit.empty(alloc);
