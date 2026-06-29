@@ -7,7 +7,6 @@ const Io = std.Io;
 const WalTable = @import("wal_table.zig").WalTable;
 const Version = @import("version.zig").Version;
 const VersionEdit = @import("version.zig").VersionEdit;
-const Crc32 = std.hash.Crc32;
 const KVSeq = @import("storage").memtable.KVSeq;
 const FileSeq = @import("storage").manifest.FileSeq;
 const KeyValue = @import("storage").memtable.KeyValue;
@@ -50,7 +49,7 @@ fn full_size(self: *const WriteOp) usize {
 }
 
 fn checksum(self: *const WriteOp) u32 {
-    var hash = Crc32.init();
+    var hash = std.hash.Fnv1a_32.init();
 
     switch (self.*) {
         .Put => |add| {
