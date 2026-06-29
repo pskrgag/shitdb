@@ -163,7 +163,7 @@ pub const Version = struct {
         io: std.Io,
         alloc: Allocator,
     ) !*Self {
-        var file = try storage.openOrCreateManifest(path, io);
+        var file = try storage.open_or_create_manifest(path, io);
         errdefer file.close(io);
 
         const slab = try alloc.create(MemTableSlab);
@@ -694,13 +694,10 @@ fn create_test_sstable(
     storage: *Storage,
     io: std.Io,
     alloc: Allocator,
-    name: []const u8,
     lvl: u8,
     file_seq: usize,
     keys: []const TestSSTableKV,
 ) !FileMeta {
-    _ = name;
-
     var memtable = try MemTable.new(alloc, io, .{});
     defer memtable.deinit(alloc);
 
@@ -951,7 +948,6 @@ test "lvl0 compaction merges overlapping lvl1 table" {
             &storage,
             testing_io,
             allocator,
-            "memtable1.sst",
             1,
             1,
             &[_]TestSSTableKV{
@@ -965,7 +961,6 @@ test "lvl0 compaction merges overlapping lvl1 table" {
             &storage,
             testing_io,
             allocator,
-            "memtable2.sst",
             0,
             2,
             &[_]TestSSTableKV{
@@ -979,7 +974,6 @@ test "lvl0 compaction merges overlapping lvl1 table" {
             &storage,
             testing_io,
             allocator,
-            "memtable3.sst",
             0,
             3,
             &[_]TestSSTableKV{
@@ -1037,7 +1031,6 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
             &storage,
             testing_io,
             allocator,
-            "memtable1.sst",
             1,
             1,
             &[_]TestSSTableKV{
@@ -1051,7 +1044,6 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
             &storage,
             testing_io,
             allocator,
-            "memtable2.sst",
             0,
             2,
             &[_]TestSSTableKV{
@@ -1065,7 +1057,6 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
             &storage,
             testing_io,
             allocator,
-            "memtable3.sst",
             0,
             3,
             &[_]TestSSTableKV{
@@ -1134,7 +1125,6 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
             &storage,
             testing_io,
             allocator,
-            "memtable1.sst",
             1,
             1,
             &[_]TestSSTableKV{
@@ -1148,7 +1138,6 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
             &storage,
             testing_io,
             allocator,
-            "memtable2.sst",
             0,
             2,
             &[_]TestSSTableKV{
@@ -1163,7 +1152,6 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
             &storage,
             testing_io,
             allocator,
-            "memtable3.sst",
             0,
             3,
             &[_]TestSSTableKV{
@@ -1223,7 +1211,6 @@ test "lvl0 compaction physically deletes obsolete input files" {
             &storage,
             testing_io,
             allocator,
-            "memtable1.sst",
             1,
             1,
             &[_]TestSSTableKV{
@@ -1237,7 +1224,6 @@ test "lvl0 compaction physically deletes obsolete input files" {
             &storage,
             testing_io,
             allocator,
-            "memtable2.sst",
             0,
             2,
             &[_]TestSSTableKV{
@@ -1251,7 +1237,6 @@ test "lvl0 compaction physically deletes obsolete input files" {
             &storage,
             testing_io,
             allocator,
-            "memtable3.sst",
             0,
             3,
             &[_]TestSSTableKV{
@@ -1320,7 +1305,6 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
             &storage,
             testing_io,
             allocator,
-            "memtable1.sst",
             1,
             1,
             &[_]TestSSTableKV{
@@ -1334,7 +1318,6 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
             &storage,
             testing_io,
             allocator,
-            "memtable2.sst",
             0,
             2,
             &[_]TestSSTableKV{
@@ -1348,7 +1331,6 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
             &storage,
             testing_io,
             allocator,
-            "memtable3.sst",
             0,
             3,
             &[_]TestSSTableKV{
@@ -1414,7 +1396,6 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
                 &storage,
                 testing_io,
                 allocator,
-                "memtable1.sst",
                 1,
                 1,
                 &[_]TestSSTableKV{
@@ -1428,7 +1409,6 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
                 &storage,
                 testing_io,
                 allocator,
-                "memtable2.sst",
                 0,
                 2,
                 &[_]TestSSTableKV{
@@ -1442,7 +1422,6 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
                 &storage,
                 testing_io,
                 allocator,
-                "memtable3.sst",
                 0,
                 3,
                 &[_]TestSSTableKV{
@@ -1515,7 +1494,6 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
                 &storage,
                 testing_io,
                 allocator,
-                "memtable1.sst",
                 1,
                 1,
                 &[_]TestSSTableKV{
@@ -1529,7 +1507,6 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
                 &storage,
                 testing_io,
                 allocator,
-                "memtable2.sst",
                 0,
                 2,
                 &[_]TestSSTableKV{
@@ -1543,7 +1520,6 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
                 &storage,
                 testing_io,
                 allocator,
-                "memtable3.sst",
                 0,
                 3,
                 &[_]TestSSTableKV{

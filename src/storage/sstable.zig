@@ -742,8 +742,8 @@ test "Simple find and create" {
     }
 
     const dir = try cwd.openDir(testing_io, "test_db", .{});
-    var storage = try Storage.new(dir);
-    defer storage.deinit(testing_io);
+    var storage = try Storage.new(dir, 100, allocator);
+    defer storage.deinit(testing_io, allocator);
 
     var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
@@ -756,7 +756,7 @@ test "Simple find and create" {
     defer meta.deinit(allocator);
 
     var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
-    defer table.deinit();
+    defer table.deinit(testing_io);
     const to_find = [_][]const u8{ "a" ** 1, "a" ** 20, "a" ** 51, "a" ** 100, "a" ** 150, "a" ** 132 };
 
     for (to_find) |i| {
@@ -802,8 +802,8 @@ test "SSTable persists min and max keys" {
     }
 
     const dir = try cwd.openDir(testing_io, "test_sstable_min_max", .{});
-    var storage = try Storage.new(dir);
-    defer storage.deinit(testing_io);
+    var storage = try Storage.new(dir, 100, allocator);
+    defer storage.deinit(testing_io, allocator);
 
     var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
@@ -816,7 +816,7 @@ test "SSTable persists min and max keys" {
     defer meta.deinit(allocator);
     {
         var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
-        defer table.deinit();
+        defer table.deinit(testing_io);
 
         try std.testing.expectEqualSlices(u8, "a", table.min());
         try std.testing.expectEqualSlices(u8, "z", table.max());
@@ -824,7 +824,7 @@ test "SSTable persists min and max keys" {
 
     {
         var table = try SSTable.open(&storage, meta, testing_io, allocator);
-        defer table.deinit();
+        defer table.deinit(testing_io);
 
         try std.testing.expectEqualSlices(u8, "a", table.min());
         try std.testing.expectEqualSlices(u8, "z", table.max());
@@ -848,8 +848,8 @@ test "SSTable min and max keys include tombstones" {
     }
 
     const dir = try cwd.openDir(testing_io, "test_sstable_min_max_tombstones", .{});
-    var storage = try Storage.new(dir);
-    defer storage.deinit(testing_io);
+    var storage = try Storage.new(dir, 100, allocator);
+    defer storage.deinit(testing_io, allocator);
 
     var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
@@ -862,7 +862,7 @@ test "SSTable min and max keys include tombstones" {
     defer meta.deinit(allocator);
     {
         var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
-        defer table.deinit();
+        defer table.deinit(testing_io);
 
         try std.testing.expectEqualSlices(u8, "a", table.min());
         try std.testing.expectEqualSlices(u8, "z", table.max());
@@ -870,7 +870,7 @@ test "SSTable min and max keys include tombstones" {
 
     {
         var table = try SSTable.open(&storage, meta, testing_io, allocator);
-        defer table.deinit();
+        defer table.deinit(testing_io);
 
         try std.testing.expectEqualSlices(u8, "a", table.min());
         try std.testing.expectEqualSlices(u8, "z", table.max());
@@ -893,8 +893,8 @@ test "Remove" {
         };
     }
     const dir = try cwd.openDir(testing_io, "test_db", .{});
-    var storage = try Storage.new(dir);
-    defer storage.deinit(testing_io);
+    var storage = try Storage.new(dir, 100, allocator);
+    defer storage.deinit(testing_io, allocator);
 
     var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
@@ -906,7 +906,7 @@ test "Remove" {
     defer meta.deinit(allocator);
 
     var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
-    defer table.deinit();
+    defer table.deinit(testing_io);
 
     const val = try table.find_value("b" ** 10, allocator);
     switch (val) {
@@ -934,8 +934,8 @@ test "Remove more than one block" {
         };
     }
     const dir = try cwd.openDir(testing_io, "test_db", .{});
-    var storage = try Storage.new(dir);
-    defer storage.deinit(testing_io);
+    var storage = try Storage.new(dir, 100, allocator);
+    defer storage.deinit(testing_io, allocator);
 
     var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
@@ -949,7 +949,7 @@ test "Remove more than one block" {
         var meta = try test_file_meta(allocator, 0, &tb);
         defer meta.deinit(allocator);
         var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
-        defer table.deinit();
+        defer table.deinit(testing_io);
 
         const val = try table.find_value("b" ** (BlockSize / 4), allocator);
         try expect_founded_value(val, "d" ** (BlockSize / 4), allocator);
@@ -961,7 +961,7 @@ test "Remove more than one block" {
         var meta = try test_file_meta(allocator, 0, &tb);
         defer meta.deinit(allocator);
         var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
-        defer table.deinit();
+        defer table.deinit(testing_io);
 
         const val = try table.find_value("b" ** (BlockSize / 4), allocator);
         try expect_deleted(val);
@@ -986,8 +986,8 @@ test "Merge" {
     }
 
     const dir = try cwd.openDir(testing_io, "test_db", .{});
-    var storage = try Storage.new(dir);
-    defer storage.deinit(testing_io);
+    var storage = try Storage.new(dir, 100, allocator);
+    defer storage.deinit(testing_io, allocator);
 
     var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
@@ -998,7 +998,7 @@ test "Merge" {
     var meta = try test_file_meta(allocator, 0, &tb);
     defer meta.deinit(allocator);
     var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
-    defer table.deinit();
+    defer table.deinit(testing_io);
 
     var tb1 = try MemTable.new(allocator, testing_io, .{});
     defer tb1.deinit(allocator);
@@ -1010,7 +1010,7 @@ test "Merge" {
     var meta1 = try test_file_meta(allocator, 0, &tb1);
     defer meta1.deinit(allocator);
     var table1 = try SSTable.create(&storage, meta1, &tb1, 0, testing_io, allocator);
-    defer table1.deinit();
+    defer table1.deinit(testing_io);
 
     var merged_seq = FileSeq.init(@atomicRmw(u64, &Lvl0Count, .Add, 1, .monotonic));
     var merge_res = try SSTable.merge(
@@ -1026,7 +1026,7 @@ test "Merge" {
     try std.testing.expectEqual(@as(usize, 1), merge_res.items.len);
 
     var merged = try SSTable.open(&storage, merge_res.items[0], testing_io, allocator);
-    defer merged.deinit();
+    defer merged.deinit(testing_io);
 
     {
         inline for (1..Repeats) |i| {
@@ -1053,8 +1053,8 @@ test "Merged SSTable persists min and max keys" {
     }
 
     const dir = try cwd.openDir(testing_io, "test_sstable_merge_min_max", .{});
-    var storage = try Storage.new(dir);
-    defer storage.deinit(testing_io);
+    var storage = try Storage.new(dir, 100, allocator);
+    defer storage.deinit(testing_io, allocator);
 
     var tb = try MemTable.new(allocator, testing_io, .{});
     defer tb.deinit(allocator);
@@ -1070,11 +1070,11 @@ test "Merged SSTable persists min and max keys" {
     var meta = try test_file_meta(allocator, 0, &tb);
     defer meta.deinit(allocator);
     var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
-    defer table.deinit();
+    defer table.deinit(testing_io);
     var meta1 = try test_file_meta(allocator, 0, &tb1);
     defer meta1.deinit(allocator);
     var table1 = try SSTable.create(&storage, meta1, &tb1, 0, testing_io, allocator);
-    defer table1.deinit();
+    defer table1.deinit(testing_io);
 
     var merge_res = try SSTable.merge(&storage, test_output_file_source(&merged_seq), testing_io, &[_]SSTable{
         table,
@@ -1090,7 +1090,7 @@ test "Merged SSTable persists min and max keys" {
 
     {
         var merged = try SSTable.open(&storage, merge_res.items[0], testing_io, allocator);
-        defer merged.deinit();
+        defer merged.deinit(testing_io);
 
         try std.testing.expectEqualSlices(u8, "a", merged.min());
         try std.testing.expectEqualSlices(u8, "z", merged.max());
@@ -1147,8 +1147,8 @@ test "Merge with remove and overlapping regions" {
     }
 
     const dir = try cwd.openDir(testing_io, "test_db", .{});
-    var storage = try Storage.new(dir);
-    defer storage.deinit(testing_io);
+    var storage = try Storage.new(dir, 100, allocator);
+    defer storage.deinit(testing_io, allocator);
 
     var tb = try MemTable.new(allocator, testing_io, .{});
     var tb1 = try MemTable.new(allocator, testing_io, .{});
@@ -1169,11 +1169,11 @@ test "Merge with remove and overlapping regions" {
     var meta = try test_file_meta(allocator, 0, &tb);
     defer meta.deinit(allocator);
     var table = try SSTable.create(&storage, meta, &tb, 0, testing_io, allocator);
-    defer table.deinit();
+    defer table.deinit(testing_io);
     var meta1 = try test_file_meta(allocator, 0, &tb1);
     defer meta1.deinit(allocator);
     var table1 = try SSTable.create(&storage, meta1, &tb1, 0, testing_io, allocator);
-    defer table1.deinit();
+    defer table1.deinit(testing_io);
 
     var merge_res = try SSTable.merge(&storage, test_output_file_source(&merged_seq), testing_io, &[_]SSTable{ table, table1 }, 1, allocator);
     defer test_deinit_merge_result(&merge_res, allocator);
@@ -1181,7 +1181,7 @@ test "Merge with remove and overlapping regions" {
     try std.testing.expectEqual(@as(usize, 1), merge_res.items.len);
 
     var merged = try SSTable.open(&storage, merge_res.items[0], testing_io, allocator);
-    defer merged.deinit();
+    defer merged.deinit(testing_io);
 
     try expect_founded_value(try merged.find_value("b", allocator), "b", allocator);
     try expect_deleted(try merged.find_value("a", allocator));
