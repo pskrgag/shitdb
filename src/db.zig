@@ -4,9 +4,10 @@ const MemTable = @import("storage").MemTable;
 const MemTableOpts = @import("storage").MemTableOpts;
 const Manager = @import("db/manager.zig").Manager;
 const HashTableTest = @import("test_utils").HashTableTest;
-const KeyValueOptions = @import("db/manager.zig").KeyValueOptions;
 const Dir = std.Io.Dir;
 const test_utils = @import("test_utils");
+
+pub const KeyValueOptions = @import("db/manager.zig").KeyValueOptions;
 
 fn openOrCreateDir(io: std.Io, path: []const u8) !Dir {
     const cwd = Dir.cwd();

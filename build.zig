@@ -209,6 +209,9 @@ pub fn build(b: *std.Build) void {
     const wal_test_step = b.step("test-wal", "Run only WAL tests");
     wal_test_step.dependOn(&run_wal_tests.step);
 
+    const storage_test_step = b.step("test-storage", "Run only storage tests");
+    storage_test_step .dependOn(&run_storage_tests.step);
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

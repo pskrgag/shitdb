@@ -48,7 +48,7 @@ pub const Flusher = struct {
     //
     // - Inserted values should be either in memtable or on the disk. If we drop the lock there,
     //   the first table would be unreachable from the user.
-    fn flush_one(self: *Flusher) !void {
+    fn flush_one(self: *Flusher, compact: bool) !void {
         const first = self.list[0].?;
 
         @memmove(self.list[0 .. MaxNumTables - 1], self.list[1..MaxNumTables]);
@@ -56,7 +56,7 @@ pub const Flusher = struct {
         self.count -= 1;
 
         first.wait_no_users();
-        try self.version.flush_memtable(first, self.io, &self.storage, self.alloc);
+        try self.version.flush_memtable(first, compact, self.io, &self.storage, self.alloc);
         first.deinit(self.alloc) catch @panic("Failed to deinit flushed MemTable");
 
         self.version.slab.free(first);
@@ -75,7 +75,7 @@ pub const Flusher = struct {
                 return;
             }
 
-            ei.maybe_error(.memtable_flush, self.flush_one()) catch |e| {
+            ei.maybe_error(.memtable_flush, self.flush_one(true)) catch |e| {
                 self.err = e;
 
                 self.mutex.unlock(self.io);
@@ -183,7 +183,10 @@ pub const Flusher = struct {
         self.thread.join();
 
         while (self.count > 0) {
-            self.flush_one() catch @panic("Failed to flush MemTable during deinit");
+            self.flush_one(false) catch |e| {
+                std.debug.print("Error {any}\n", .{e});
+                @panic("Failed to flush MemTable during deinit");
+            };
         }
 
         alloc.destroy(self);

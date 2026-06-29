@@ -212,7 +212,7 @@ pub fn main(init: std.process.Init) !void {
     });
     defer bench.deinit();
 
-    try skiplist.add_benches(&bench);
+    // try skiplist.add_benches(&bench);
     try db.add_benches(&bench);
 
     try run(bench, config, allocator);

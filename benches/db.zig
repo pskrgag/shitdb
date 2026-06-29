@@ -12,6 +12,9 @@ const ReadCount = 5_000;
 const KeySize = 24;
 const ValueSize = 128;
 
+const KeySizeBig = 1 << 10;
+const ValueSizeBig = KeySizeBig * 2;
+
 var Allocator = std.heap.DebugAllocator(.{}){};
 var DbInstance: Db = undefined;
 var DbActive = false;
@@ -27,18 +30,18 @@ fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
 
-fn make_key(idx: usize) [KeySize]u8 {
-    var key: [KeySize]u8 = undefined;
+fn make_key(comptime size: usize, idx: usize) []u8 {
+    var key = allocator().alloc(u8, size) catch @panic("failed to allocate");
 
-    @memset(&key, 'k');
-    std.mem.writeInt(u64, key[KeySize - @sizeOf(u64) ..][0..@sizeOf(u64)], idx, .little);
+    @memset(key, 'k');
+    std.mem.writeInt(u64, key[size - @sizeOf(u64) ..][0..@sizeOf(u64)], idx, .little);
     return key;
 }
 
-fn make_value(idx: usize) [ValueSize]u8 {
-    var value: [ValueSize]u8 = undefined;
+fn make_value(comptime size: usize, idx: usize) []u8 {
+    var value = allocator().alloc(u8, size) catch @panic("failed to allocate");
 
-    @memset(&value, 'v');
+    @memset(value, 'v');
     std.mem.writeInt(u64, value[0..@sizeOf(u64)], idx, .little);
     return value;
 }
@@ -100,10 +103,10 @@ fn setup_small_memtable() void {
 
 fn seed_db(count: usize) void {
     for (0..count) |idx| {
-        const key = make_key(idx);
-        const value = make_value(idx);
+        const key = make_key(KeySize, idx);
+        const value = make_value(ValueSize, idx);
 
-        DbInstance.put(&key, &value, allocator()) catch {
+        DbInstance.put(key, value, allocator()) catch {
             @panic("failed to seed benchmark db");
         };
     }
@@ -140,9 +143,23 @@ fn put_sequential(bench_alloc: std.mem.Allocator) void {
     _ = bench_alloc;
 
     for (0..InsertCount) |idx| {
-        const key = make_key(idx);
-        const value = make_value(idx);
-        DbInstance.put(&key, &value, allocator()) catch {
+        const key = make_key(KeySize, idx);
+        const value = make_value(ValueSize, idx);
+
+        DbInstance.put(key, value, allocator()) catch {
+            @panic("db put failed");
+        };
+    }
+}
+
+fn put_sequential_big(bench_alloc: std.mem.Allocator) void {
+    _ = bench_alloc;
+
+    for (0..InsertCount) |idx| {
+        const key = make_key(KeySizeBig, idx);
+        const value = make_value(ValueSizeBig, idx);
+
+        DbInstance.put(key, value, allocator()) catch {
             @panic("db put failed");
         };
     }
@@ -152,8 +169,8 @@ fn get_existing(bench_alloc: std.mem.Allocator) void {
     _ = bench_alloc;
 
     for (0..ReadCount) |idx| {
-        const key = make_key(idx % InsertCount);
-        const value = DbInstance.get(&key, allocator()) catch {
+        const key = make_key(KeySize, idx % InsertCount);
+        const value = DbInstance.get(key, allocator()) catch {
             @panic("db get failed");
         };
 
@@ -169,8 +186,8 @@ fn get_missing(bench_alloc: std.mem.Allocator) void {
     _ = bench_alloc;
 
     for (0..ReadCount) |idx| {
-        const key = make_key(InsertCount + idx);
-        const value = DbInstance.get(&key, allocator()) catch {
+        const key = make_key(KeySize, InsertCount + idx);
+        const value = DbInstance.get(key, allocator()) catch {
             @panic("db get failed");
         };
 
@@ -181,38 +198,58 @@ fn get_missing(bench_alloc: std.mem.Allocator) void {
     }
 }
 
-fn create_name_insert(prefix: []const u8) []const u8 {
+fn create_name_insert(prefix: []const u8, key_size: usize, value_size: usize) []const u8 {
     return std.fmt.allocPrint(Allocator.allocator(), "{s}. Count {d}, key size {d} value size {d}", .{
         prefix,
         InsertCount,
-        KeySize,
-        ValueSize,
+        key_size,
+        value_size,
     }) catch {
         @panic("Failed to allocate name");
     };
 }
 
-fn create_find_insert(prefix: []const u8) []const u8 {
+fn create_find_insert(prefix: []const u8, key_size: usize, value_size: usize) []const u8 {
     return std.fmt.allocPrint(Allocator.allocator(), "{s}. Count {d}, key size {d} value size {d}", .{
         prefix,
         ReadCount,
-        KeySize,
-        ValueSize,
+        key_size,
+        value_size,
     }) catch {
         @panic("Failed to allocate name");
     };
 }
 
 pub fn add_benches(bench: *zbench.Benchmark) !void {
-    try bench.add(create_name_insert("DB put sequential large memtable"), put_sequential, .{
+    try bench.add(create_name_insert(
+        "DB put sequential large memtable",
+        KeySize,
+        ValueSize,
+    ), put_sequential, .{
         .hooks = .{
             .before_each = setup_large_memtable,
             .after_each = teardown_db,
         },
-        .iterations = 3,
+        .iterations = 100,
     });
 
-    try bench.add(create_name_insert("DB put sequential large memtable+sync"), put_sequential, .{
+    try bench.add(create_name_insert(
+        "DB put sequential large memtable",
+        KeySizeBig,
+        ValueSizeBig,
+    ), put_sequential_big, .{
+        .hooks = .{
+            .before_each = setup_large_memtable,
+            .after_each = teardown_db,
+        },
+        .iterations = 100,
+    });
+
+    try bench.add(create_name_insert(
+        "DB put sequential large memtable+sync",
+        KeySize,
+        ValueSize,
+    ), put_sequential, .{
         .hooks = .{
             .before_each = setup_large_memtable_sync,
             .after_each = teardown_db,
@@ -220,35 +257,51 @@ pub fn add_benches(bench: *zbench.Benchmark) !void {
         .iterations = 3,
     });
 
-    try bench.add(create_name_insert("DB put sequential small memtable"), put_sequential, .{
+    try bench.add(create_name_insert(
+        "DB put sequential small memtable",
+        KeySize,
+        ValueSize,
+    ), put_sequential, .{
         .hooks = .{
             .before_each = setup_small_memtable,
             .after_each = teardown_db,
         },
-        .iterations = 3,
+        .iterations = 100,
     });
 
-    try bench.add(create_find_insert("DB get active memtable hit"), get_existing, .{
+    try bench.add(create_find_insert(
+        "DB get active memtable hit",
+        KeySize,
+        ValueSize,
+    ), get_existing, .{
         .hooks = .{
             .before_each = setup_active_gets,
             .after_each = teardown_db,
         },
-        .iterations = 5,
+        .iterations = 100,
     });
 
-    try bench.add(create_find_insert("DB get SSTable hit"), get_existing, .{
+    try bench.add(create_find_insert(
+        "DB get SSTable hit",
+        KeySize,
+        ValueSize,
+    ), get_existing, .{
         .hooks = .{
             .before_each = setup_sstable,
             .after_each = teardown_db,
         },
-        .iterations = 5,
+        .iterations = 100,
     });
 
-    try bench.add(create_find_insert("DB get missing"), get_missing, .{
+    try bench.add(create_find_insert(
+        "DB get missing",
+        KeySize,
+        ValueSize,
+    ), get_missing, .{
         .hooks = .{
             .before_each = setup_sstable,
             .after_each = teardown_db,
         },
-        .iterations = 5,
+        .iterations = 100,
     });
 }

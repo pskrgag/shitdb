@@ -340,6 +340,7 @@ pub const Version = struct {
     pub fn flush_memtable(
         self: *Version,
         table: *WalTable,
+        do_compact: bool,
         io: std.Io,
         storage: *Storage,
         alloc: Allocator,
@@ -368,7 +369,8 @@ pub const Version = struct {
         defer sstable.deinit(io);
 
         try self.apply(edit, storage, io, alloc);
-        try self.compact(storage, self.opts.compaction, io, alloc);
+        if (do_compact)
+            try self.compact(storage, self.opts.compaction, io, alloc);
     }
 
     // Resolves value request.

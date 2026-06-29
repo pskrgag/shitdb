@@ -95,9 +95,9 @@ pub const Storage = struct {
         const name = try manifest.alloc_sstable_name(fmeta.file_seq, alloc);
         defer alloc.free(name);
 
+        const stat = try self.dir.statFile(io, name, .{ .follow_symlinks = false });
         try self.dir.deleteFile(io, name);
 
-        const stat = try self.dir.statFile(io, name, .{ .follow_symlinks = false });
         self.stat.sstables.items[fmeta.lvl] -= stat.size;
     }
 

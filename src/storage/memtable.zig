@@ -47,8 +47,8 @@ pub const KeyValueOwned = struct {
 
 /// Key and Value packed together.
 ///
-///    8b      key len bytes      8b          value len bytes     8b
-/// [key len] [     key     ] [value len] [      value       ] [type + seq-number]
+///    8b      key len bytes        8b                8b        value len bytes
+/// [key len] [     key     ] [type + seq-number] [value len] [      value       ]
 pub const KeyValue = struct {
     data: [*]const u8,
 
@@ -90,6 +90,13 @@ pub const KeyValue = struct {
             iter = iter[key_size..];
         }
 
+        // Parse seq+value
+        if (iter.len < 8) {
+            return null;
+        }
+
+        iter = iter[IntSize..];
+
         // Parse value
         {
             if (iter.len < @sizeOf(u64)) {
@@ -105,16 +112,11 @@ pub const KeyValue = struct {
             iter = iter[value_size..];
         }
 
-        // Parse other
-        if (iter.len != 8) {
-            return null;
-        }
-
         return .{ .data = data.ptr };
     }
 
     fn value_len(self: *const KeyValue) usize {
-        return read_u64(self.data, IntSize + self.key_len());
+        return read_u64(self.data, IntSize + self.key_len() + IntSize);
     }
 
     pub fn full_size(self: *const KeyValue) usize {
@@ -123,7 +125,7 @@ pub const KeyValue = struct {
 
     pub fn as_value(self: *const KeyValue) ?[]const u8 {
         if (self.as_type() == .Add) {
-            const value_offset = IntSize + self.key_len() + IntSize;
+            const value_offset = IntSize + self.key_len() + IntSize + IntSize;
             return (self.data + value_offset)[0..self.value_len()];
         } else {
             return null;
@@ -135,16 +137,17 @@ pub const KeyValue = struct {
     }
 
     pub fn as_type(self: *const KeyValue) Type {
-        const size = self.full_size();
+        const offset = IntSize + self.key_len();
+        const seqtype = read_u64(self.data, offset);
 
-        return @enumFromInt((self.data[size - 1] & (1 << 7)) >> 7);
+        return @enumFromInt(seqtype >> 63);
     }
 
     pub fn as_seq(self: *const KeyValue) KVSeq {
-        const size = self.full_size();
-        const last_u64 = read_u64(self.data, size - IntSize);
+        const offset = IntSize + self.key_len();
+        const seqtype = read_u64(self.data, offset);
 
-        return KVSeq.init(last_u64 & ((1 << 63) - 1));
+        return KVSeq.init(seqtype & ((1 << 63) - 1));
     }
 
     fn is_tombstone(self: *const KeyValue) bool {
@@ -163,14 +166,13 @@ pub const KeyValue = struct {
 
         @memmove(ptr.ptr + 0, @as(*const [8]u8, @ptrCast(&key.len)));
         @memmove(ptr.ptr + IntSize, key);
-
-        @memmove(ptr.ptr + IntSize + key.len, @as(*const [8]u8, @ptrCast(&val_len)));
+        @memmove(ptr.ptr + IntSize + key.len, @as(*const [8]u8, @ptrCast(&seq_type)));
+        @memmove(ptr.ptr + IntSize + key.len + IntSize, @as(*const [8]u8, @ptrCast(&val_len)));
 
         // Optional value means tombstone
         if (value) |val|
-            @memmove(ptr.ptr + IntSize + key.len + IntSize, val);
+            @memmove(ptr.ptr + IntSize + key.len + IntSize + IntSize, val);
 
-        @memmove(ptr.ptr + IntSize + key.len + IntSize + val_len, @as(*const [8]u8, @ptrCast(&seq_type)));
         return .{ .data = ptr.ptr };
     }
 

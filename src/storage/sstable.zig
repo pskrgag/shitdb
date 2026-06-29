@@ -860,7 +860,7 @@ test "SSTable min and max keys include tombstones" {
     var meta = try test_file_meta(allocator, 0, &tb);
     defer meta.deinit(allocator);
     {
-        var table = try SSTable.create(&storage, meta, &tb,testing_io, allocator);
+        var table = try SSTable.create(&storage, meta, &tb, testing_io, allocator);
         defer table.deinit(testing_io);
 
         try std.testing.expectEqualSlices(u8, "a", table.min());
