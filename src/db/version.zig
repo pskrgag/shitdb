@@ -287,6 +287,7 @@ pub const Version = struct {
             io,
             opened_tables.items,
             plan.dst_lvl,
+            self.opts.compaction.sstable_target_size,
             alloc,
         );
 

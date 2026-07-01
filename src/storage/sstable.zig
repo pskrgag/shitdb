@@ -148,15 +148,17 @@ pub const SSTable = struct {
         last: []const u8,
         block_written: usize,
         data_size: usize,
+        target_size: ?usize = null,
         min: ?KeyValue,
         max: ?KeyValue,
         max_seq: ?KVSeq,
 
-        fn init(file: [*]u8, alloc: Allocator) !WriteKVIter {
+        fn init(file: [*]u8, target_size: ?usize, alloc: Allocator) !WriteKVIter {
             return .{
                 .file = file,
                 .last = undefined,
                 .block_written = 0,
+                .target_size = target_size,
                 .data_size = 0,
                 .blocks = try std.ArrayList(BlockMeta).initCapacity(alloc, 0),
                 .min = null,
@@ -165,8 +167,17 @@ pub const SSTable = struct {
             };
         }
 
-        fn write_one(self: *WriteKVIter, key: *const KeyValue, alloc: Allocator) !void {
+        fn written(self: *const WriteKVIter) usize {
+            return self.data_size;
+        }
+
+        fn write_one(self: *WriteKVIter, key: *const KeyValue, force: bool, alloc: Allocator) !bool {
             const key_value_size = key.full_size();
+
+            if (self.target_size) |ts| {
+                if (!force and self.data_size + key_value_size > ts)
+                    return false;
+            }
 
             if (self.max_seq == null) {
                 self.max_seq = key.as_seq();
@@ -196,14 +207,22 @@ pub const SSTable = struct {
             self.block_written += key_value_size;
 
             if (self.block_written > BlockSize) {
-                try self.blocks.append(alloc, BlockMeta{ .last_key = self.last, .size = self.block_written });
+                try self.blocks.append(
+                    alloc,
+                    BlockMeta{ .last_key = self.last, .size = self.block_written },
+                );
                 self.block_written = 0;
             }
+
+            return true;
         }
 
         fn finalize(self: *WriteKVIter, alloc: Allocator) !ValuesMeta {
             if (self.block_written != 0) {
-                try self.blocks.append(alloc, BlockMeta{ .last_key = self.last, .size = self.block_written });
+                try self.blocks.append(
+                    alloc,
+                    BlockMeta{ .last_key = self.last, .size = self.block_written },
+                );
             }
 
             return .{ .data_size = self.data_size, .blocks = self.blocks };
@@ -229,14 +248,12 @@ pub const SSTable = struct {
     fn calculate_file_size(tbl: *const MemTable) usize {
         var iter = tbl.table.iterator();
         var total_size: usize = 0;
-        var data_size: usize = 0;
         var current_block: usize = 0;
         var last: *KeyValue = undefined;
 
         while (iter.next()) |key| {
             total_size += key.full_size();
             current_block += key.full_size();
-            data_size += key.full_size();
 
             if (current_block > BlockSize) {
                 total_size += BlockIndex.total_size(key.as_key().len);
@@ -255,10 +272,11 @@ pub const SSTable = struct {
 
     fn write_values(tbl: *const MemTable, file: [*]u8, alloc: Allocator) !WriteKVIter {
         var iter = tbl.table.iterator();
-        var write_iter = try WriteKVIter.init(file, alloc);
+        var write_iter = try WriteKVIter.init(file, null, alloc);
 
         while (iter.next()) |key| {
-            try write_iter.write_one(key, alloc);
+            const can_more = try write_iter.write_one(key, true, alloc);
+            std.debug.assert(can_more);
         }
 
         return write_iter;
@@ -326,7 +344,11 @@ pub const SSTable = struct {
         var file = file_;
 
         for (value_meta.blocks.items) |mt| {
-            const block_idx = BlockIndex{ .size = mt.size, .offset = offset, .key_size = mt.last_key.len };
+            const block_idx = BlockIndex{
+                .size = mt.size,
+                .offset = offset,
+                .key_size = mt.last_key.len,
+            };
             const block_idx_ptr = std.mem.asBytes(&block_idx);
 
             @memcpy(file[0..@sizeOf(BlockIndex)], block_idx_ptr);
@@ -380,8 +402,10 @@ pub const SSTable = struct {
                         }
 
                         const next_block_data = iter[@sizeOf(BlockIndex) + block.key_size ..];
-                        const next_block: *align(1) const BlockIndex = @ptrCast(@alignCast(next_block_data.ptr));
-                        const next_key = next_block_data[@sizeOf(BlockIndex) .. @sizeOf(BlockIndex) + next_block.key_size];
+                        const next_block: *align(1) const BlockIndex =
+                            @ptrCast(@alignCast(next_block_data.ptr));
+                        const next_key =
+                            next_block_data[@sizeOf(BlockIndex) .. @sizeOf(BlockIndex) + next_block.key_size];
 
                         if (std.mem.order(u8, next_key, key) == .eq) {
                             // Definitely not in the current block
@@ -562,6 +586,7 @@ pub const SSTable = struct {
         io: std.Io,
         tables: []const SSTable,
         merged_lvl: u8,
+        target_size: usize,
         alloc: Allocator,
     ) !MergeResult {
         var iters = try std.ArrayList(merging_iterator.IteratorWrapper(KeyValue)).initCapacity(
@@ -581,76 +606,91 @@ pub const SSTable = struct {
             iter_wrappers.append(alloc, i.iterator()) catch unreachable;
 
             // This is safe, since iter_wrappers has pre-allocated capacity.
-            try iters.append(
+            iters.append(
                 alloc,
                 merging_iterator.IteratorWrapper(KeyValue).init(&iter_wrappers.items[iter_wrappers.items.len - 1]),
-            );
+            ) catch unreachable;
 
             total_size += i.file.size;
         }
 
         var iter = merging_iterator.MergeIterator(KeyValue).new(iters.items);
-        const file_seq = try next_file.nextFile(next_file.ctx);
-        var file = try storage.create_sstable(file_seq, merged_lvl, io, alloc);
-        defer file.close(io);
-
-        try file.set_length(io, total_size);
-
-        var mmap = try Mmap.init(file, .rw);
-        defer mmap.deinit();
-
-        var write_iter = try WriteKVIter.init(mmap.data.ptr, alloc);
         var prev: ?KeyValue = null;
 
-        while (iter.next()) |key| {
-            if (prev) |p| {
-                // Case 1: key == prev_key. Need to keep the newest value (with bigger seq)
-                // Case 2: key != prev_key. Since iterator produces sorted values we won't see this key.
-                if (std.mem.eql(u8, p.as_key(), key.as_key())) {
-                    if (key.as_seq().get() > p.as_seq().get()) {
-                        prev = key;
+        while (iter.peek() != null or prev != null) {
+            const file_seq = try next_file.nextFile(next_file.ctx);
+            var file = try storage.create_sstable(file_seq, merged_lvl, io, alloc);
+            defer file.close(io);
+
+            // TODO: this is not great hack, but let's leave it for now.
+            try file.set_length(io, target_size * 2);
+
+            var mmap = try Mmap.init(file, .rw);
+            defer mmap.deinit();
+            var write_iter = try WriteKVIter.init(mmap.data.ptr, target_size, alloc);
+
+            while (iter.peek()) |key| {
+                if (prev) |p| {
+                    // Case 1: key == prev_key. Need to keep the newest value (with bigger seq)
+                    // Case 2: key != prev_key. Since iterator produces sorted values we won't see this key.
+                    if (std.mem.eql(u8, p.as_key(), key.as_key())) {
+                        if (key.as_seq().get() > p.as_seq().get()) {
+                            prev = key;
+                        }
+
+                        _ = iter.next();
+                    } else {
+                        // Dump value to the new SSTable.
+                        const full = try write_iter.write_one(&p, false, alloc) == false;
+
+                        if (full) {
+                            break;
+                        }
+
+                        prev = iter.next();
                     }
                 } else {
-                    // Dump value to the new SSTable.
-                    try write_iter.write_one(&p, alloc);
-                    prev = key;
+                    prev = iter.next();
                 }
-            } else {
-                prev = key;
             }
+
+            if (prev) |p| {
+                if (iter.peek() == null) {
+                    const can_more = try write_iter.write_one(&p, true, alloc);
+                    std.debug.assert(can_more);
+                    prev = null;
+                }
+            }
+
+            // This might happen with empty tables, but don't care for now
+            std.debug.assert(write_iter.max_seq != null);
+            std.debug.assert(write_iter.max != null);
+            std.debug.assert(write_iter.min != null);
+
+            _ = try Self.finalize_table(
+                write_iter,
+                &file,
+                mmap.data,
+                merged_lvl,
+                io,
+                alloc,
+            );
+            // std.debug.assert(real_size <= total_size);
+
+            var min_kv = try KeyOwned.from_kv(write_iter.min.?, alloc);
+            errdefer min_kv.deinit(alloc);
+
+            var max_kv = try KeyOwned.from_kv(write_iter.max.?, alloc);
+            errdefer max_kv.deinit(alloc);
+
+            try res.append(alloc, FileMeta{
+                .file_seq = file_seq,
+                .min = min_kv,
+                .max = max_kv,
+                .lvl = merged_lvl,
+                .value_seq = write_iter.max_seq.?,
+            });
         }
-
-        if (prev) |p|
-            try write_iter.write_one(&p, alloc);
-
-        // This might happen with empty tables, but don't care for now
-        std.debug.assert(write_iter.max_seq != null);
-        std.debug.assert(write_iter.max != null);
-        std.debug.assert(write_iter.min != null);
-
-        const real_size = try Self.finalize_table(
-            write_iter,
-            &file,
-            mmap.data,
-            merged_lvl,
-            io,
-            alloc,
-        );
-        std.debug.assert(real_size <= total_size);
-
-        var min_kv = try KeyOwned.from_kv(write_iter.min.?, alloc);
-        errdefer min_kv.deinit(alloc);
-
-        var max_kv = try KeyOwned.from_kv(write_iter.max.?, alloc);
-        errdefer max_kv.deinit(alloc);
-
-        try res.append(alloc, FileMeta{
-            .file_seq = file_seq,
-            .min = min_kv,
-            .max = max_kv,
-            .lvl = merged_lvl,
-            .value_seq = write_iter.max_seq.?,
-        });
 
         return res;
     }
@@ -1018,6 +1058,7 @@ test "Merge" {
         testing_io,
         &[2]SSTable{ table, table1 },
         1,
+        1 << 30,
         allocator,
     );
     defer test_deinit_merge_result(&merge_res, allocator);
@@ -1075,10 +1116,18 @@ test "Merged SSTable persists min and max keys" {
     var table1 = try SSTable.create(&storage, meta1, &tb1, testing_io, allocator);
     defer table1.deinit(testing_io);
 
-    var merge_res = try SSTable.merge(&storage, test_output_file_source(&merged_seq), testing_io, &[_]SSTable{
-        table,
-        table1,
-    }, 1, allocator);
+    var merge_res = try SSTable.merge(
+        &storage,
+        test_output_file_source(&merged_seq),
+        testing_io,
+        &[_]SSTable{
+            table,
+            table1,
+        },
+        1,
+        1 << 30,
+        allocator,
+    );
     defer test_deinit_merge_result(&merge_res, allocator);
 
     {
@@ -1174,7 +1223,15 @@ test "Merge with remove and overlapping regions" {
     var table1 = try SSTable.create(&storage, meta1, &tb1, testing_io, allocator);
     defer table1.deinit(testing_io);
 
-    var merge_res = try SSTable.merge(&storage, test_output_file_source(&merged_seq), testing_io, &[_]SSTable{ table, table1 }, 1, allocator);
+    var merge_res = try SSTable.merge(
+        &storage,
+        test_output_file_source(&merged_seq),
+        testing_io,
+        &[_]SSTable{ table, table1 },
+        1,
+        1 << 30,
+        allocator,
+    );
     defer test_deinit_merge_result(&merge_res, allocator);
 
     try std.testing.expectEqual(@as(usize, 1), merge_res.items.len);
@@ -1188,4 +1245,186 @@ test "Merge with remove and overlapping regions" {
     try expect_founded_value(try merged.find_value("c", allocator), "cc", allocator);
     try expect_notfound(try merged.find_value("aaa", allocator));
     try expect_notfound(try merged.find_value("bb", allocator));
+}
+
+test "Merge produces more than one file" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const cwd = std.Io.Dir.cwd();
+    const dir_name = "merge_produces_more_than_1_file";
+
+    cwd.deleteTree(testing_io, dir_name) catch {};
+    try cwd.createDirPath(testing_io, dir_name);
+    defer {
+        std.Io.Dir.cwd().deleteTree(testing_io, dir_name) catch {
+            @panic("gg");
+        };
+    }
+
+    const dir = try cwd.openDir(testing_io, dir_name, .{});
+    var storage = try Storage.new(dir, 100, allocator);
+    defer storage.deinit(testing_io, allocator);
+
+    var tb = try MemTable.new(allocator, testing_io, .{});
+    defer tb.deinit(allocator);
+
+    var full_size: usize = 0;
+    const kv_size: usize = 1000;
+
+    inline for (97..100) |i| {
+        const ch: u8 = @intCast(i);
+        const s = [_]u8{ch} ** kv_size;
+
+        full_size += kv_size * 2;
+        try tb.put(&s, &s, KVSeq.init(i));
+    }
+
+    var tb1 = try MemTable.new(allocator, testing_io, .{});
+    defer tb1.deinit(allocator);
+
+    inline for (101..103) |i| {
+        const ch: u8 = @intCast(i);
+        const s = [_]u8{ch} ** kv_size;
+
+        full_size += kv_size * 2;
+        try tb1.put(&s, &s, KVSeq.init(i));
+    }
+
+    var meta1 = try test_file_meta(allocator, 0, &tb);
+    defer meta1.deinit(allocator);
+    var meta2 = try test_file_meta(allocator, 0, &tb1);
+    defer meta2.deinit(allocator);
+
+    var table1 = try SSTable.create(
+        &storage,
+        meta1,
+        &tb,
+        testing_io,
+        allocator,
+    );
+    defer table1.deinit(testing_io);
+
+    var table2 = try SSTable.create(
+        &storage,
+        meta2,
+        &tb1,
+        testing_io,
+        allocator,
+    );
+    defer table2.deinit(testing_io);
+
+    var merged_seq = FileSeq.init(@atomicRmw(u64, &Lvl0Count, .Add, 2, .monotonic));
+    var merged = try SSTable.merge(
+        &storage,
+        test_output_file_source(&merged_seq),
+        testing_io,
+        &[_]SSTable{ table1, table2 },
+        1,
+        full_size / 4,
+        allocator,
+    );
+
+    defer {
+        for (merged.items) |*i| {
+            i.deinit(allocator);
+        }
+        merged.deinit(allocator);
+    }
+
+    try std.testing.expect(merged.items.len >= 3);
+}
+
+test "Merge does not hand on same keys" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const cwd = std.Io.Dir.cwd();
+    const dir_name = "merge_not_hungs_on_same_keys";
+
+    cwd.deleteTree(testing_io, dir_name) catch {};
+    try cwd.createDirPath(testing_io, dir_name);
+    defer {
+        std.Io.Dir.cwd().deleteTree(testing_io, dir_name) catch {
+            @panic("gg");
+        };
+    }
+
+    const dir = try cwd.openDir(testing_io, dir_name, .{});
+    var storage = try Storage.new(dir, 100, allocator);
+    defer storage.deinit(testing_io, allocator);
+
+    var tb = try MemTable.new(allocator, testing_io, .{});
+    defer tb.deinit(allocator);
+
+    var full_size: usize = 0;
+    const kv_size: usize = 1000;
+
+    inline for (97..100) |i| {
+        const ch: u8 = @intCast(i);
+        const s = [_]u8{ch} ** kv_size;
+
+        full_size += kv_size * 2;
+        try tb.put(&s, &s, KVSeq.init(i));
+    }
+
+    var tb1 = try MemTable.new(allocator, testing_io, .{});
+    defer tb1.deinit(allocator);
+
+    inline for (97..100) |i| {
+        const ch: u8 = @intCast(i);
+        const s = [_]u8{ch} ** kv_size;
+
+        full_size += kv_size * 2;
+        try tb1.put(&s, &s, KVSeq.init(i * 2));
+    }
+
+    var meta1 = try test_file_meta(allocator, 0, &tb);
+    defer meta1.deinit(allocator);
+    var meta2 = try test_file_meta(allocator, 0, &tb1);
+    defer meta2.deinit(allocator);
+
+    var table1 = try SSTable.create(
+        &storage,
+        meta1,
+        &tb,
+        testing_io,
+        allocator,
+    );
+    defer table1.deinit(testing_io);
+
+    var table2 = try SSTable.create(
+        &storage,
+        meta2,
+        &tb1,
+        testing_io,
+        allocator,
+    );
+    defer table2.deinit(testing_io);
+
+    var merged_seq = FileSeq.init(@atomicRmw(u64, &Lvl0Count, .Add, 2, .monotonic));
+    var merged = try SSTable.merge(
+        &storage,
+        test_output_file_source(&merged_seq),
+        testing_io,
+        &[_]SSTable{ table1, table2 },
+        1,
+        full_size / 4,
+        allocator,
+    );
+
+    defer {
+        for (merged.items) |*i| {
+            i.deinit(allocator);
+        }
+        merged.deinit(allocator);
+    }
+
+    try std.testing.expect(merged.items.len == 2);
 }

@@ -231,7 +231,6 @@ pub const MemTable = struct {
     opts: MemTableOpts,
     arena: Arena,
     max_seq: Value(KVSeq),
-    size: Value(usize),
 
     const Self = @This();
 
@@ -244,7 +243,6 @@ pub const MemTable = struct {
             .arena = arena,
             .table = table,
             .max_seq = Value(KVSeq).init(KVSeq.init(0)),
-            .size = Value(usize).init(opts.memtable_size),
         };
     }
 

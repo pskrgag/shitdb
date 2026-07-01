@@ -47,7 +47,7 @@ pub fn MergeIterator(comptime T: type) type {
             return .{ .iterators = iters };
         }
 
-        pub fn next(self: *Self) ?T {
+        fn next_iter(self: *Self) ?*IteratorWrapper(T) {
             var val: ?T = null;
             var iter: ?*IteratorWrapper(T) = null;
 
@@ -67,7 +67,23 @@ pub fn MergeIterator(comptime T: type) type {
 
             if (val != null) {
                 std.debug.assert(iter != null);
-                return iter.?.next();
+                return iter.?;
+            } else {
+                return null;
+            }
+        }
+
+        pub fn next(self: *Self) ?T {
+            if (self.next_iter()) |i| {
+                return i.next();
+            } else {
+                return null;
+            }
+        }
+
+        pub fn peek(self: *Self) ?T {
+            if (self.next_iter()) |i| {
+                return i.peek();
             } else {
                 return null;
             }
