@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const FileMeta = @import("storage").manifest.FileMeta;
+const Storage = @import("storage").storage.Storage;
 
 pub const MaxSupportedLvls: usize = 5;
 
@@ -47,7 +48,7 @@ pub const CompactionPlan = struct {
         idx: usize,
     };
 
-    fn find_cadidates_lvl0(files: []FileMeta, alloc: Allocator, lvl: u8) !std.ArrayList(FoundFile) {
+    fn find_cadidates(files: []FileMeta, alloc: Allocator, lvl: u8) !std.ArrayList(FoundFile) {
         var res = try std.ArrayList(FoundFile).initCapacity(alloc, 2);
         var found: usize = 0;
 
@@ -65,14 +66,6 @@ pub const CompactionPlan = struct {
         return res;
     }
 
-    fn find_cadidates(files: []FileMeta, alloc: Allocator, lvl: u8) !std.ArrayList(FoundFile) {
-        if (lvl == 0) {
-            return CompactionPlan.find_cadidates_lvl0(files, alloc, lvl);
-        } else {
-            @panic("todo");
-        }
-    }
-
     fn should_compact_lvl0(files: []FileMeta, opts: CompactionOptions) bool {
         var count: usize = 0;
 
@@ -85,16 +78,27 @@ pub const CompactionPlan = struct {
         return count > opts.max_lvl0;
     }
 
-    fn should_compact(files: []FileMeta, opts: CompactionOptions) ?u8 {
+    fn should_compact(storage: *Storage, files: []FileMeta, opts: CompactionOptions) ?u8 {
         if (CompactionPlan.should_compact_lvl0(files, opts)) {
             return 0;
+        }
+
+        for (1..opts.max_lvl) |lvl| {
+            if (storage.stats().sstable_size(@intCast(lvl)) > opts.lvl1_byte_threshold * opts.fanout * lvl) {
+                return @intCast(lvl);
+            }
         }
 
         return null;
     }
 
-    pub fn new(files: []FileMeta, opts: CompactionOptions, alloc: Allocator) !?CompactionPlan {
-        if (CompactionPlan.should_compact(files, opts)) |lvl| {
+    pub fn new(
+        storage: *Storage,
+        files: []FileMeta,
+        opts: CompactionOptions,
+        alloc: Allocator,
+    ) !?CompactionPlan {
+        if (CompactionPlan.should_compact(storage, files, opts)) |lvl| {
             var candidates = try CompactionPlan.find_cadidates(files, alloc, lvl);
             errdefer candidates.deinit(alloc);
 

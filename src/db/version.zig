@@ -321,7 +321,7 @@ pub const Version = struct {
                 self.mutex.lockUncancelable(io);
                 defer self.mutex.unlock(io);
 
-                break :blk try CompactionPlan.new(self.tables.items, opts, alloc);
+                break :blk try CompactionPlan.new(storage, self.tables.items, opts, alloc);
             };
 
             if (p) |pp| {

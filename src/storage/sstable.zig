@@ -1207,6 +1207,30 @@ fn find_in_merged(
     return .NotFound;
 }
 
+fn expect_merged_lvl(
+    storage: *Storage,
+    merged: *const MergeResult,
+    lvl: u8,
+    allocator: Allocator,
+) !void {
+    for (merged.items) |meta| {
+        try std.testing.expectEqual(lvl, meta.lvl);
+
+        var table = try SSTable.open(storage, meta, testing_io, allocator);
+        defer table.deinit(testing_io);
+
+        try std.testing.expectEqual(lvl, table.lvl);
+    }
+}
+
+fn expect_merged_non_overlapping(merged: *const MergeResult) !void {
+    for (merged.items, 0..) |lhs, lhs_idx| {
+        for (merged.items[lhs_idx + 1 ..]) |rhs| {
+            try std.testing.expect(!lhs.key_range_overlap(rhs.min.data, rhs.max.data));
+        }
+    }
+}
+
 test "Merge with remove and overlapping regions" {
     var arena = std.heap.DebugAllocator(.{}){};
     defer {
@@ -1571,6 +1595,166 @@ test "Merge with key bigger than target size" {
     }
 
     inline for (100..103) |i| {
+        const ch: u8 = @intCast(i);
+        const s = [_]u8{ch} ** kv_size;
+        try expect_founded_value(try find_in_merged(&storage, &merged, &s, allocator), &s, allocator);
+    }
+}
+
+test "Merge lvl1 tables persists lvl2 output" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const cwd = std.Io.Dir.cwd();
+    const dir_name = "merge_lvl1_to_lvl2";
+
+    cwd.deleteTree(testing_io, dir_name) catch {};
+    try cwd.createDirPath(testing_io, dir_name);
+    defer {
+        std.Io.Dir.cwd().deleteTree(testing_io, dir_name) catch {
+            @panic("gg");
+        };
+    }
+
+    const dir = try cwd.openDir(testing_io, dir_name, .{});
+    var storage = try Storage.new(dir, 100, allocator);
+    defer storage.deinit(testing_io, allocator);
+
+    var tb = try MemTable.new(allocator, testing_io, .{});
+    defer tb.deinit(allocator);
+    try tb.put("a", "aa", KVSeq.init(1));
+    try tb.put("c", "cc", KVSeq.init(3));
+
+    var tb1 = try MemTable.new(allocator, testing_io, .{});
+    defer tb1.deinit(allocator);
+    try tb1.put("b", "bb", KVSeq.init(2));
+    try tb1.put("d", "dd", KVSeq.init(4));
+
+    var meta = try test_file_meta(allocator, 1, &tb);
+    defer meta.deinit(allocator);
+    var meta1 = try test_file_meta(allocator, 1, &tb1);
+    defer meta1.deinit(allocator);
+
+    var table = try SSTable.create(&storage, meta, &tb, testing_io, allocator);
+    defer table.deinit(testing_io);
+    var table1 = try SSTable.create(&storage, meta1, &tb1, testing_io, allocator);
+    defer table1.deinit(testing_io);
+
+    var merged_seq = FileSeq.init(@atomicRmw(u64, &Lvl0Count, .Add, 2, .monotonic));
+    var merged = try SSTable.merge(
+        &storage,
+        test_output_file_source(&merged_seq),
+        testing_io,
+        &[_]SSTable{ table, table1 },
+        2,
+        1 << 30,
+        allocator,
+    );
+
+    defer {
+        for (merged.items) |*i| {
+            i.deinit(allocator);
+        }
+        merged.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), merged.items.len);
+    try expect_merged_lvl(&storage, &merged, 2, allocator);
+    try expect_founded_value(try find_in_merged(&storage, &merged, "a", allocator), "aa", allocator);
+    try expect_founded_value(try find_in_merged(&storage, &merged, "b", allocator), "bb", allocator);
+    try expect_founded_value(try find_in_merged(&storage, &merged, "c", allocator), "cc", allocator);
+    try expect_founded_value(try find_in_merged(&storage, &merged, "d", allocator), "dd", allocator);
+}
+
+test "Merge lvl1 tables split into lvl3 outputs" {
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const cwd = std.Io.Dir.cwd();
+    const dir_name = "merge_lvl1_split_to_lvl3";
+
+    cwd.deleteTree(testing_io, dir_name) catch {};
+    try cwd.createDirPath(testing_io, dir_name);
+    defer {
+        std.Io.Dir.cwd().deleteTree(testing_io, dir_name) catch {
+            @panic("gg");
+        };
+    }
+
+    const dir = try cwd.openDir(testing_io, dir_name, .{});
+    var storage = try Storage.new(dir, 100, allocator);
+    defer storage.deinit(testing_io, allocator);
+
+    var tb = try MemTable.new(allocator, testing_io, .{});
+    defer tb.deinit(allocator);
+
+    var full_size: usize = 0;
+    const kv_size: usize = 1000;
+
+    inline for (97..100) |i| {
+        const ch: u8 = @intCast(i);
+        const s = [_]u8{ch} ** kv_size;
+
+        full_size += kv_size * 2;
+        try tb.put(&s, &s, KVSeq.init(i));
+    }
+
+    var tb1 = try MemTable.new(allocator, testing_io, .{});
+    defer tb1.deinit(allocator);
+
+    inline for (101..104) |i| {
+        const ch: u8 = @intCast(i);
+        const s = [_]u8{ch} ** kv_size;
+
+        full_size += kv_size * 2;
+        try tb1.put(&s, &s, KVSeq.init(i));
+    }
+
+    var meta = try test_file_meta(allocator, 1, &tb);
+    defer meta.deinit(allocator);
+    var meta1 = try test_file_meta(allocator, 1, &tb1);
+    defer meta1.deinit(allocator);
+
+    var table = try SSTable.create(&storage, meta, &tb, testing_io, allocator);
+    defer table.deinit(testing_io);
+    var table1 = try SSTable.create(&storage, meta1, &tb1, testing_io, allocator);
+    defer table1.deinit(testing_io);
+
+    var merged_seq = FileSeq.init(@atomicRmw(u64, &Lvl0Count, .Add, 2, .monotonic));
+    var merged = try SSTable.merge(
+        &storage,
+        test_output_file_source(&merged_seq),
+        testing_io,
+        &[_]SSTable{ table, table1 },
+        3,
+        full_size / 4,
+        allocator,
+    );
+
+    defer {
+        for (merged.items) |*i| {
+            i.deinit(allocator);
+        }
+        merged.deinit(allocator);
+    }
+
+    try std.testing.expect(merged.items.len > 1);
+    try expect_merged_lvl(&storage, &merged, 3, allocator);
+    try expect_merged_non_overlapping(&merged);
+
+    inline for (97..100) |i| {
+        const ch: u8 = @intCast(i);
+        const s = [_]u8{ch} ** kv_size;
+        try expect_founded_value(try find_in_merged(&storage, &merged, &s, allocator), &s, allocator);
+    }
+
+    inline for (101..104) |i| {
         const ch: u8 = @intCast(i);
         const s = [_]u8{ch} ** kv_size;
         try expect_founded_value(try find_in_merged(&storage, &merged, &s, allocator), &s, allocator);
