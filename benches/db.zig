@@ -174,9 +174,7 @@ fn get_existing(bench_alloc: std.mem.Allocator) void {
             @panic("db get failed");
         };
 
-        if (value) |v| {
-            allocator().free(v);
-        } else {
+        if (value == null) {
             @panic("db get missed existing key");
         }
     }
@@ -278,7 +276,7 @@ pub fn add_benches(bench: *zbench.Benchmark) !void {
             .before_each = setup_active_gets,
             .after_each = teardown_db,
         },
-        .iterations = 100,
+        .iterations = 300,
     });
 
     try bench.add(create_find_insert(

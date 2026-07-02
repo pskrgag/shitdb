@@ -58,7 +58,6 @@ fn openOrCreateDir(io: std.Io, path: []const u8) !Dir {
 fn diff_two_vals(T: type, new: T, old: T) f64 {
     const dff: i128 = @as(i128, @intCast(new)) - @as(i128, @intCast(old));
 
-    // std.debug.print("DIFF = {} NEW = {}, OLD = {} \n", .{ dff, new, old });
     return (@as(f64, @floatFromInt(dff)) / @as(f64, @floatFromInt(old))) * 100;
 }
 
