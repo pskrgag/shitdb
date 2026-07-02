@@ -158,9 +158,6 @@ pub const KeyValue = struct {
         const val_len = if (value) |val| val.len else 0;
         const size = IntSize + key.len + IntSize + val_len + IntSize;
 
-        if (size > sstable.BlockSize)
-            return error.TooBig;
-
         const ptr = try alloc.alignedAlloc(u8, std.mem.Alignment.@"8", size);
         const seq_type = (seq.get() & ~(@as(u64, 1) << 63)) | (@as(u64, @intFromEnum(tp)) << 63);
 

@@ -116,10 +116,10 @@ pub const GrowableMmap = struct {
     }
 
     pub fn finalize(self: *GrowableMmap, io: std.Io) !void {
-        // Set real size of the file
-        try self.file.set_length(io, self.offset);
         // Sync data
         try std.posix.msync(@alignCast(self.data), std.posix.MSF.SYNC);
+        // Set real size of the file
+        try self.file.set_length(io, self.offset);
         // Sync file metadata as well
         try self.file.sync(io);
     }
