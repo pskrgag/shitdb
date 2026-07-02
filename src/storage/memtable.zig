@@ -158,7 +158,8 @@ pub const KeyValue = struct {
         const val_len = if (value) |val| val.len else 0;
         const size = IntSize + key.len + IntSize + val_len + IntSize;
 
-        const ptr = try alloc.alignedAlloc(u8, std.mem.Alignment.@"8", size);
+        // NOTE: don't care about alignment, since we read unaligned data
+        const ptr = try alloc.alloc(u8, size);
         const seq_type = (seq.get() & ~(@as(u64, 1) << 63)) | (@as(u64, @intFromEnum(tp)) << 63);
 
         @memmove(ptr.ptr + 0, @as(*const [8]u8, @ptrCast(&key.len)));
@@ -468,4 +469,28 @@ test "HashTable equivalence" {
 
     const tb = try MemTable.new(allocator, std.testing.io, .{});
     try HashTableTest.test_hash_table_equavalance(tb, false, 1000);
+}
+
+test "Respects memtable size" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var full_size: usize = 0;
+
+    for (0..4) |i| {
+        const ch: u8 = @intCast(97 + i);
+        const s = [_]u8{ch} ** 42;
+
+        full_size += KeyValue.calculate_size(&s, &s);
+    }
+
+    var tb = try MemTable.new(allocator, std.testing.io, .{ .memtable_size = full_size });
+    defer tb.deinit(allocator);
+
+    for (0..4) |i| {
+        const ch: u8 = @intCast(97 + i);
+        const s = [_]u8{ch} ** 42;
+
+        try tb.put(&s, &s, KVSeq.init(i));
+    }
 }

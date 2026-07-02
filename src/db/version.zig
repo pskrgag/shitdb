@@ -331,6 +331,7 @@ pub const Version = struct {
                 defer plan.deinit(alloc);
 
                 try self.run_compaction_plan(plan, storage, io, alloc);
+                self.stat.inc(.compaction);
             } else {
                 break;
             }

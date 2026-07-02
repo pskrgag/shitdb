@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 
 pub const StatKind = enum(usize) {
     memtable_flush,
+    compaction,
 };
 
 // TODO: make it per-thread to reduce contention.

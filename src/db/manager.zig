@@ -1273,3 +1273,101 @@ test "Failed WAL sync makes table broken" {
     var manager = try Manager.new(dir, allocator, io, .{});
     defer manager.deinit(allocator);
 }
+
+var CurrentChar: u8 = 'a';
+
+fn produce_sstables(manager: *Manager, count: usize, alloc: Allocator) !void {
+    const memtable_size = manager.opts.memtable.memtable_size;
+    const key_size = (memtable_size - 24) / 2;
+    const io = std.testing.io;
+
+    for (0..count) |_| {
+        const key = try alloc.alloc(u8, key_size);
+        defer alloc.free(key);
+        const value = try alloc.alloc(u8, key_size);
+        defer alloc.free(value);
+
+        @memset(key, CurrentChar);
+        @memset(value, CurrentChar);
+
+        try manager.put(key, value, alloc);
+        CurrentChar += 1;
+    }
+
+    // Rotate current table
+    try manager.version.rotate_active(&manager.storage, false, io, alloc);
+
+    // Flush everything
+    try manager.version.flusher.flush_all();
+}
+
+fn expect_repeated_value(manager: *Manager, ch: u8, size: usize, alloc: Allocator) !void {
+    const key = try alloc.alloc(u8, size);
+    defer alloc.free(key);
+    @memset(key, ch);
+
+    const value = (try manager.get(key, alloc)).?;
+    defer alloc.free(value);
+
+    try std.testing.expectEqual(size, value.len);
+    for (value) |byte| {
+        try std.testing.expectEqual(ch, byte);
+    }
+}
+
+test "SSTable merging actually happens" {
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "sstable_merging";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    const lvl1_threshold = 2000;
+
+    const dir = try openOrCreateDir(io, dirname);
+    var manager = try Manager.new(
+        dir,
+        allocator,
+        io,
+        .{ .memtable = .{ .memtable_size = 200 }, .wal = .{ .sync = true }, .compaction = .{
+            .max_lvl = 3,
+            .max_lvl0 = 1,
+            .sstable_target_size = 1000,
+            .fanout = 10,
+            .lvl1_byte_threshold = lvl1_threshold ,
+        } },
+    );
+    defer manager.deinit(allocator);
+
+    const key_size = (manager.opts.memtable.memtable_size - 24) / 2;
+
+    try produce_sstables(&manager, 2, allocator);
+    try std.testing.expectEqual(manager.stat.read(.memtable_flush), 2);
+    try std.testing.expectEqual(manager.stat.read(.compaction), 1);
+
+    try produce_sstables(&manager, 2, allocator);
+    try std.testing.expectEqual(manager.stat.read(.memtable_flush), 4);
+    try std.testing.expectEqual(manager.stat.read(.compaction), 2);
+    try std.testing.expect(manager.storage.stats().sstable_size(1) <= lvl1_threshold);
+
+    try produce_sstables(&manager, 3, allocator);
+    try std.testing.expectEqual(manager.stat.read(.memtable_flush), 7);
+    try std.testing.expectEqual(manager.stat.read(.compaction), 4);
+    try std.testing.expect(manager.storage.stats().sstable_size(1) <= manager.opts.compaction.lvl1_byte_threshold);
+    try std.testing.expect(manager.storage.stats().sstable_size(2) >= 0);
+
+    var ch: u8 = 'a';
+    while (ch < CurrentChar) : (ch += 1) {
+        try expect_repeated_value(&manager, ch, key_size, allocator);
+    }
+}

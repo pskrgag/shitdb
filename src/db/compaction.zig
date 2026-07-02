@@ -10,7 +10,7 @@ pub const MaxSupportedLvls: usize = 5;
 /// For now only leveling is supported.
 pub const CompactionOptions = struct {
     // Maximum level of sstables
-    max_lvl: usize = 2,
+    max_lvl: usize = 5,
     // Maximum number of lvl0 sstables.
     max_lvl0: usize = 5,
     // Target size for one sstable.
@@ -83,8 +83,13 @@ pub const CompactionPlan = struct {
             return 0;
         }
 
-        for (1..opts.max_lvl) |lvl| {
-            if (storage.stats().sstable_size(@intCast(lvl)) > opts.lvl1_byte_threshold * opts.fanout * lvl) {
+        // NOTE: Extra -1, since we cannot merge last level
+        for (1..opts.max_lvl - 1) |lvl| {
+            if (storage.stats().sstable_size(@intCast(lvl)) > opts.lvl1_byte_threshold * std.math.pow(
+                usize,
+                opts.fanout,
+                lvl - 1,
+            )) {
                 return @intCast(lvl);
             }
         }
