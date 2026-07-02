@@ -13,6 +13,7 @@ const KeyOwned = manifest.KeyOwned;
 const Storage = @import("storage.zig").Storage;
 const SSTableFile = @import("ssfile.zig").SSTableFile;
 const Mmap = @import("mmap_wrapper.zig").Mmap;
+const GrowableMmap = @import("mmap_wrapper.zig").GrowableMmap;
 
 pub const BlockSize = 4 << 10;
 const Magic: usize = 0xdeadbeefdeadbaba;
@@ -144,16 +145,16 @@ pub const SSTable = struct {
 
     const WriteKVIter = struct {
         blocks: std.ArrayList(BlockMeta),
-        file: [*]u8,
+        file: *GrowableMmap,
         last: []const u8,
         block_written: usize,
         data_size: usize,
         target_size: ?usize = null,
-        min: ?KeyValue,
-        max: ?KeyValue,
+        min: ?usize,
+        max: ?usize,
         max_seq: ?KVSeq,
 
-        fn init(file: [*]u8, target_size: ?usize, alloc: Allocator) !WriteKVIter {
+        fn init(file: *GrowableMmap, target_size: ?usize, alloc: Allocator) !WriteKVIter {
             return .{
                 .file = file,
                 .last = undefined,
@@ -171,7 +172,13 @@ pub const SSTable = struct {
             return self.data_size;
         }
 
-        fn write_one(self: *WriteKVIter, key: *const KeyValue, force: bool, alloc: Allocator) !bool {
+        fn write_one(
+            self: *WriteKVIter,
+            key: *const KeyValue,
+            force: bool,
+            io: std.Io,
+            alloc: Allocator,
+        ) !bool {
             const key_value_size = key.full_size();
 
             if (self.target_size) |ts| {
@@ -189,18 +196,17 @@ pub const SSTable = struct {
             if (self.min == null) {
                 std.debug.assert(self.max == null);
 
-                self.min = KeyValue{ .data = self.file };
+                self.min = self.file.current_offset();
                 self.max = self.min;
             } else {
-                if (self.min.?.cmp(key) == .gt) {
-                    self.min = KeyValue{ .data = self.file };
-                } else if (self.max.?.cmp(key) == .lt) {
-                    self.max = KeyValue{ .data = self.file };
+                if (self.min_kv().cmp(key) == .gt) {
+                    self.min = self.file.current_offset();
+                } else if (self.max_kv().cmp(key) == .lt) {
+                    self.max = self.file.current_offset();
                 }
             }
 
-            @memcpy(self.file[0..key_value_size], key.data[0..key_value_size]);
-            self.file = self.file[key_value_size..];
+            try self.file.push(key.data[0..key_value_size], io);
 
             self.last = key.as_key();
             self.data_size += key_value_size;
@@ -215,6 +221,14 @@ pub const SSTable = struct {
             }
 
             return true;
+        }
+
+        fn min_kv(self: *const WriteKVIter) KeyValue {
+            return KeyValue{ .data = self.file.offset_ptr(self.min.?) };
+        }
+
+        fn max_kv(self: *const WriteKVIter) KeyValue {
+            return KeyValue{ .data = self.file.offset_ptr(self.max.?) };
         }
 
         fn finalize(self: *WriteKVIter, alloc: Allocator) !ValuesMeta {
@@ -270,12 +284,12 @@ pub const SSTable = struct {
         return total_size + @sizeOf(MetaBlock) + tbl.max().?.as_key().len + tbl.min().?.as_key().len;
     }
 
-    fn write_values(tbl: *const MemTable, file: [*]u8, alloc: Allocator) !WriteKVIter {
+    fn write_values(tbl: *const MemTable, file: *GrowableMmap, io: std.Io, alloc: Allocator) !WriteKVIter {
         var iter = tbl.table.iterator();
         var write_iter = try WriteKVIter.init(file, null, alloc);
 
         while (iter.next()) |key| {
-            const can_more = try write_iter.write_one(key, true, alloc);
+            const can_more = try write_iter.write_one(key, true, io, alloc);
             std.debug.assert(can_more);
         }
 
@@ -294,54 +308,42 @@ pub const SSTable = struct {
         return file[file.len - @sizeOf(MetaBlock) - mt.max_size .. file.len - @sizeOf(MetaBlock)];
     }
 
-    fn write_min_max(iter: WriteKVIter, file: [*]u8) usize {
-        const min_len = iter.min.?.as_key().len;
-        const max_len = iter.max.?.as_key().len;
-
-        @memcpy(file, iter.min.?.as_key());
-        @memcpy(file + min_len, iter.max.?.as_key());
-
-        return min_len + max_len;
+    fn write_min_max(iter: WriteKVIter, file: *GrowableMmap, io: std.Io) !void {
+        try file.push(iter.min_kv().as_key(), io);
+        try file.push(iter.max_kv().as_key(), io);
     }
 
     fn finalize_table(
         iter: WriteKVIter,
-        file: *SSTableFile,
-        file_data: []u8,
+        file: *GrowableMmap,
         lvl: u8,
         io: std.Io,
         alloc: Allocator,
-    ) !usize {
+    ) !void {
         var i = iter;
         var values_meta = try i.finalize(alloc);
-        const index_size = write_index(values_meta, file_data.ptr + iter.data_size);
-        const min_max_size = write_min_max(iter, file_data.ptr + iter.data_size + index_size);
+        errdefer values_meta.blocks.deinit(alloc);
 
-        try Self.write_meta(file_data.ptr + iter.data_size + index_size + min_max_size, MetaBlock{
+        const index_size = try write_index(values_meta, file, io);
+
+        try write_min_max(iter, file, io);
+
+        try Self.write_meta(file, MetaBlock{
             .index_offset = values_meta.data_size,
             .index_size = index_size,
-            .min_size = iter.min.?.as_key().len,
-            .max_size = iter.max.?.as_key().len,
+            .min_size = iter.min_kv().as_key().len,
+            .max_size = iter.max_kv().as_key().len,
             .magic = Magic,
             .lvl = lvl,
-        });
+        }, io);
 
-        const file_size = iter.data_size + index_size + min_max_size + @sizeOf(MetaBlock);
-        // Set real size of the file
-        try file.set_length(io, file_size);
-        // Sync data
-        try std.posix.msync(@alignCast(file_data), std.posix.MSF.SYNC);
-        // Sync file metadata as well
-        try file.sync(io);
-
+        try file.finalize(io);
         values_meta.blocks.deinit(alloc);
-        return file_size;
     }
 
-    fn write_index(value_meta: ValuesMeta, file_: [*]u8) usize {
+    fn write_index(value_meta: ValuesMeta, file: *GrowableMmap, io: std.Io) !usize {
         var index_size: usize = 0;
         var offset: usize = 0;
-        var file = file_;
 
         for (value_meta.blocks.items) |mt| {
             const block_idx = BlockIndex{
@@ -351,11 +353,8 @@ pub const SSTable = struct {
             };
             const block_idx_ptr = std.mem.asBytes(&block_idx);
 
-            @memcpy(file[0..@sizeOf(BlockIndex)], block_idx_ptr);
-            file = file[@sizeOf(BlockIndex)..];
-
-            @memcpy(file[0..mt.last_key.len], mt.last_key);
-            file = file[mt.last_key.len..];
+            try file.push(block_idx_ptr, io);
+            try file.push(mt.last_key, io);
 
             offset += mt.size;
 
@@ -366,8 +365,8 @@ pub const SSTable = struct {
         return index_size;
     }
 
-    fn write_meta(file: [*]u8, m: MetaBlock) !void {
-        @memcpy(file[0..@sizeOf(MetaBlock)], std.mem.asBytes(&m));
+    fn write_meta(file: *GrowableMmap, m: MetaBlock, io: std.Io) !void {
+        try file.push(std.mem.asBytes(&m), io);
     }
 
     fn read_block_first_key(block: []const u8) []const u8 {
@@ -540,24 +539,22 @@ pub const SSTable = struct {
 
         // Resize file to reduce I/O and use mmap
         const total_size = Self.calculate_file_size(tbl);
-        try file.set_length(io, total_size);
-
-        var mmap = try Mmap.init(file, .rw);
+        var mmap = try GrowableMmap.init(&file, total_size, .rw, io);
         errdefer mmap.deinit();
 
-        const iter = try Self.write_values(tbl, mmap.data.ptr, alloc);
-        const real_size = try Self.finalize_table(iter, &file, mmap.data, fmeta.lvl, io, alloc);
+        const iter = try Self.write_values(tbl, &mmap, io, alloc);
 
-        std.debug.assert(real_size == mmap.data.len);
-        std.debug.assert(iter.min.?.cmp(&tbl.min().?) == .eq);
-        std.debug.assert(iter.max.?.cmp(&tbl.max().?) == .eq);
+        try Self.finalize_table(iter, &mmap, fmeta.lvl, io, alloc);
+
+        std.debug.assert(iter.min_kv().cmp(&tbl.min().?) == .eq);
+        std.debug.assert(iter.max_kv().cmp(&tbl.max().?) == .eq);
 
         return .{
-            .mmap = mmap,
+            .mmap = mmap.into_mmap(),
             .file = file,
             .lvl = @intCast(fmeta.lvl),
-            .min_key = iter.min.?.as_key(),
-            .max_key = iter.max.?.as_key(),
+            .min_key = iter.min_kv().as_key(),
+            .max_key = iter.max_kv().as_key(),
             .max_seq = iter.max_seq,
         };
     }
@@ -595,7 +592,14 @@ pub const SSTable = struct {
         );
         defer iters.deinit(alloc);
         var res = try MergeResult.initCapacity(alloc, 0);
-        errdefer res.deinit(alloc);
+
+        errdefer {
+            for (res.items) |*i| {
+                i.deinit(alloc);
+            }
+
+            res.deinit(alloc);
+        }
 
         var iter_wrappers = try std.ArrayList(Iterator).initCapacity(alloc, tables.len);
         var total_size: usize = 0;
@@ -622,12 +626,9 @@ pub const SSTable = struct {
             var file = try storage.create_sstable(file_seq, merged_lvl, io, alloc);
             defer file.close(io);
 
-            // TODO: this is not great hack, but let's leave it for now.
-            try file.set_length(io, target_size * 2);
-
-            var mmap = try Mmap.init(file, .rw);
+            var mmap = try GrowableMmap.init(&file, target_size, .rw, io);
             defer mmap.deinit();
-            var write_iter = try WriteKVIter.init(mmap.data.ptr, target_size, alloc);
+            var write_iter = try WriteKVIter.init(&mmap, target_size, alloc);
 
             while (iter.peek()) |key| {
                 if (prev) |p| {
@@ -641,7 +642,7 @@ pub const SSTable = struct {
                         _ = iter.next();
                     } else {
                         // Dump value to the new SSTable.
-                        const full = try write_iter.write_one(&p, false, alloc) == false;
+                        const full = try write_iter.write_one(&p, false, io, alloc) == false;
 
                         if (full) {
                             break;
@@ -656,7 +657,7 @@ pub const SSTable = struct {
 
             if (prev) |p| {
                 if (iter.peek() == null) {
-                    const can_more = try write_iter.write_one(&p, true, alloc);
+                    const can_more = try write_iter.write_one(&p, true, io, alloc);
                     std.debug.assert(can_more);
                     prev = null;
                 }
@@ -667,20 +668,19 @@ pub const SSTable = struct {
             std.debug.assert(write_iter.max != null);
             std.debug.assert(write_iter.min != null);
 
-            _ = try Self.finalize_table(
+            try Self.finalize_table(
                 write_iter,
-                &file,
-                mmap.data,
+                &mmap,
                 merged_lvl,
                 io,
                 alloc,
             );
             // std.debug.assert(real_size <= total_size);
 
-            var min_kv = try KeyOwned.from_kv(write_iter.min.?, alloc);
+            var min_kv = try KeyOwned.from_kv(write_iter.min_kv(), alloc);
             errdefer min_kv.deinit(alloc);
 
-            var max_kv = try KeyOwned.from_kv(write_iter.max.?, alloc);
+            var max_kv = try KeyOwned.from_kv(write_iter.max_kv(), alloc);
             errdefer max_kv.deinit(alloc);
 
             try res.append(alloc, FileMeta{
