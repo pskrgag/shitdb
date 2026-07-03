@@ -10,7 +10,6 @@ const KVSeq = @import("storage").memtable.KVSeq;
 const FileSeq = @import("storage").manifest.FileSeq;
 const Version = @import("version.zig").Version;
 const Value = std.atomic.Value;
-const SleepingCounter = @import("sleeping_count.zig").SleepingCounter;
 const Transaction = @import("manager.zig").Transaction;
 const test_utils = @import("test_utils");
 const SmallVec = @import("adt").SmallVec;
@@ -40,7 +39,6 @@ pub const WalTable = struct {
     io: std.Io,
     state: Value(State),
     count: Value(usize),
-    in_progress: SleepingCounter,
 
     /// Constructs new WAL+MemTable
     pub fn new(
@@ -58,7 +56,6 @@ pub const WalTable = struct {
             .seq = seq,
             .io = io,
             .state = Value(State).init(.active),
-            .in_progress = SleepingCounter.init(),
             .count = Value(usize).init(0),
         };
     }
@@ -78,7 +75,6 @@ pub const WalTable = struct {
             .seq = seq,
             .io = io,
             .state = Value(State).init(.active),
-            .in_progress = SleepingCounter.init(),
             .count = Value(usize).init(0),
         };
 
@@ -117,10 +113,6 @@ pub const WalTable = struct {
         _ = self.count.fetchAdd(1, .monotonic);
         self.assert_active();
         try self.table.remove(key, seq);
-    }
-
-    pub fn wait_no_users(self: *WalTable) void {
-        self.in_progress.wait_zero();
     }
 
     const Action = enum {

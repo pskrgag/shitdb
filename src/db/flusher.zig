@@ -15,12 +15,13 @@ const ei = @import("test_utils").Injections.error_injection;
 const Mutex = @import("sync").mutex.Mutex;
 const Condition = @import("sync").cv.Condition;
 const Storage = @import("storage").storage.Storage;
+const ActiveTable = @import("version.zig").ActiveTable;
 
 const MaxNumTables: usize = 5;
 
 pub const Flusher = struct {
     // List of full memtables
-    list: [MaxNumTables]?*WalTable,
+    list: [MaxNumTables]?ActiveTable,
     // Number of tables
     count: usize,
     // Flusher thread
@@ -49,17 +50,29 @@ pub const Flusher = struct {
     // - Inserted values should be either in memtable or on the disk. If we drop the lock there,
     //   the first table would be unreachable from the user.
     fn flush_one(self: *Flusher, compact: bool) !void {
-        const first = self.list[0].?;
+        var first = self.list[0].?;
+
+        // We can release the mutex here, since table is still in the list.
+        self.mutex.unlock(self.io);
+        first.wait_one();
+        self.mutex.lockUncancelable(self.io);
 
         @memmove(self.list[0 .. MaxNumTables - 1], self.list[1..MaxNumTables]);
         self.list[MaxNumTables - 1] = null;
         self.count -= 1;
 
-        first.wait_no_users();
-        try self.version.flush_memtable(first, compact, self.io, &self.storage, self.alloc);
-        first.deinit(self.alloc) catch @panic("Failed to deinit flushed MemTable");
+        var table = first.into_inner();
 
-        self.version.slab.free(first);
+        try self.version.flush_memtable(
+            table,
+            compact,
+            self.io,
+            &self.storage,
+            self.alloc,
+        );
+        table.deinit(self.alloc) catch @panic("Failed to deinit flushed MemTable");
+
+        first.deinit(self.alloc);
         self.version.stat.inc(.memtable_flush);
     }
 
@@ -119,7 +132,7 @@ pub const Flusher = struct {
         return flusher;
     }
 
-    pub fn insert(self: *Flusher, table: *WalTable) !void {
+    pub fn insert(self: *Flusher, table: ActiveTable) !void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
@@ -158,8 +171,11 @@ pub const Flusher = struct {
         try self.is_healthy();
 
         for (0..self.count) |i| {
-            const table: *WalTable = self.list[self.count - 1 - i].?;
-            const val = try table.get(key, seq, alloc);
+            var table = self.list[self.count - 1 - i].?;
+
+            // NOTE: it's dirty hack to access it w/o acquiring a reference, but it's fine,
+            // since thread holds mutex and self.list holds a reference
+            const val = try table.block.value.get(key, seq, alloc);
 
             switch (val) {
                 .Found, .Removed => return val,
@@ -183,6 +199,9 @@ pub const Flusher = struct {
         self.thread.join();
 
         while (self.count > 0) {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+
             self.flush_one(false) catch |e| {
                 std.debug.print("Error {any}\n", .{e});
                 @panic("Failed to flush MemTable during deinit");

@@ -26,6 +26,10 @@ const MaxSupportedLvls = @import("compaction.zig").MaxSupportedLvls;
 const CompactionOptions = @import("compaction.zig").CompactionOptions;
 const KeyValueOptions = @import("manager.zig").KeyValueOptions;
 const Storage = @import("storage").storage.Storage;
+const RefCounted = @import("sync").refcount.RefCounted;
+const Referenced = @import("sync").refcount.Referenced;
+
+pub const ActiveTable = RefCounted(WalTable);
 
 pub const Version = struct {
     // File handle
@@ -37,22 +41,29 @@ pub const Version = struct {
     // Alive SSTables
     tables: std.ArrayList(FileMeta),
     // Protects concurrent edit applies
-    mutex: Mutex,
+    apply_mutex: Mutex,
+    // Protects active memtable
+    active_mutex: Mutex,
     // Flusher that periodically flushes immutable tables
     flusher: *Flusher,
     // Stats
     stat: *Statistics,
-    // Slab for freeing memtables
-    slab: *MemTableSlab,
     // Active MemTable.
     //
     // TODO: this must not be null, but it helps for error handling during Version creation. There
     // is weird thing that Wal actually want version pointer... This should be fixed one day.
-    active: ?*WalTable,
+    active: ?ActiveTable,
     // Options
     opts: KeyValueOptions,
 
     const Self = @This();
+
+    fn acquire_active_table(self: *Self, io: std.Io) Referenced(WalTable) {
+        self.active_mutex.lockUncancelable(io);
+        defer self.active_mutex.unlock(io);
+
+        return self.active.?.ref();
+    }
 
     pub fn apply(self: *Self, edit: VersionEdit, storage: *Storage, io: std.Io, alloc: Allocator) !void {
         var records = try edit.as_manifest_records(alloc);
@@ -65,8 +76,8 @@ pub const Version = struct {
             try rec.serialize_to(&serialized_records, alloc);
         }
 
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
 
         const offset = try self.file.length(io);
 
@@ -98,21 +109,39 @@ pub const Version = struct {
         }
     }
 
-    pub fn rotate_active(self: *Self, storage: *Storage, flush: bool, io: std.Io, alloc: Allocator) !void {
-        const next_file = self.new_file_seq();
-        const new_table = self.slab.alloc();
+    pub fn rotate_active(
+        self: *Self,
+        storage: *Storage,
+        flush: bool,
+        io: std.Io,
+        alloc: Allocator,
+    ) !void {
+        {
+            const next_file = self.new_file_seq();
+            var new_table = try WalTable.new(
+                storage,
+                self.opts.memtable,
+                self.opts.wal,
+                next_file,
+                self,
+                io,
+                alloc,
+            );
+            errdefer {
+                new_table.deinit(alloc) catch @panic("oopsi");
+            }
 
-        new_table.* = try WalTable.new(
-            storage,
-            self.opts.memtable,
-            self.opts.wal,
-            next_file,
-            self,
-            io,
-            alloc,
-        );
-        try self.flusher.insert(self.active.?);
-        self.active = new_table;
+            var new_wal_table = try ActiveTable.init(new_table, alloc);
+
+            {
+                self.active_mutex.lockUncancelable(io);
+                defer self.active_mutex.unlock(io);
+
+                std.mem.swap(ActiveTable, &new_wal_table, &self.active.?);
+            }
+
+            try self.flusher.insert(new_wal_table);
+        }
 
         if (flush)
             try self.flusher.flush_all();
@@ -120,6 +149,8 @@ pub const Version = struct {
 
     // Tries to commits transaction into DB. In case of any failure it must mark failed requests
     // with an error.
+    //
+    // NOTE: this expected to run single-threaded.
     pub fn commit(
         self: *Self,
         t: Transaction,
@@ -128,7 +159,9 @@ pub const Version = struct {
         alloc: Allocator,
     ) !void {
         var trans = t;
-        const res = self.active.?.commit(&trans, alloc);
+        var table = self.active.?.ref();
+
+        const res = table.get().commit(&trans, alloc);
         if (res.need_rotate or res.wal_failed) {
             errdefer |e| {
                 // There was an error while processing transaction. We need to mark all pending
@@ -139,9 +172,15 @@ pub const Version = struct {
                 trans.mark_error(e);
             }
 
+            // NOTE: drop the reference, since rotate_active will insert it into flusher and may
+            // wait until current table dies.
+            table.deinit();
+
             try self.rotate_active(storage, res.wal_failed, io, alloc);
             // Try to commit to new table
             try self.commit(trans, storage, io, alloc);
+        } else {
+            table.deinit();
         }
     }
 
@@ -169,23 +208,18 @@ pub const Version = struct {
         var file = try storage.open_or_create_manifest(path, io);
         errdefer file.close(io);
 
-        const slab = try alloc.create(MemTableSlab);
-        errdefer alloc.destroy(slab);
-        slab.* = try MemTableSlab.init(alloc, io);
-        errdefer slab.deinit(alloc);
-
         const file_stat = try file.stat(io);
         const size = file_stat.size;
         const res = try alloc.create(Self);
 
         res.* = .{
-            .slab = slab,
             .flusher = try Flusher.new(alloc, res, storage, io),
             .file = file,
             .tables = try std.ArrayList(FileMeta).initCapacity(alloc, 0),
             .next_file = Value(FileSeq).init(FileSeq.init(0)),
             .next_sequence = Value(KVSeq).init(KVSeq.init(0)),
-            .mutex = Mutex.init,
+            .apply_mutex = Mutex.init,
+            .active_mutex = Mutex.init,
             .stat = stat,
             .opts = opts,
             .active = null,
@@ -208,9 +242,7 @@ pub const Version = struct {
             try res.replay(storage, rep, opts.memtable, opts.wal, io, alloc);
         }
 
-        const active = res.slab.alloc();
-
-        active.* = try WalTable.new(
+        var active = try WalTable.new(
             storage,
             opts.memtable,
             opts.wal,
@@ -222,17 +254,12 @@ pub const Version = struct {
         errdefer {
             active.deinit(alloc) catch @panic("Should not happen, since MemTable is empty");
         }
-        res.active = active;
+        res.active = try ActiveTable.init(active, alloc);
 
         if (sanitize)
             try res.sanitize_disk_state(storage, alloc, io);
 
         return res;
-    }
-
-    // Inserts new immutable memtable
-    pub fn insert(self: *Version, table: *WalTable) !void {
-        try self.flusher.insert(table);
     }
 
     fn file_name(seq: FileSeq, alloc: Allocator) ![]const u8 {
@@ -318,8 +345,8 @@ pub const Version = struct {
             // Plans borrow FileMeta key slices. This is safe because compaction is single-threaded
             // in the flusher, and only compaction removes table metadata.
             const p = blk: {
-                self.mutex.lockUncancelable(io);
-                defer self.mutex.unlock(io);
+                self.apply_mutex.lockUncancelable(io);
+                defer self.apply_mutex.unlock(io);
 
                 break :blk try CompactionPlan.new(storage, self.tables.items, opts, alloc);
             };
@@ -377,8 +404,11 @@ pub const Version = struct {
 
     // Resolves value request.
     pub fn get(self: *Self, key: []const u8, storage: *Storage, io: std.Io, alloc: Allocator) !?[]u8 {
+        var table = self.acquire_active_table(io);
+        defer table.deinit();
+
         // Resolve from current active table
-        const active_find_res = try self.active.?.get(key, self.current_seq(), alloc);
+        const active_find_res = try table.get().get(key, self.current_seq(), alloc);
 
         switch (active_find_res) {
             .Found => |val| {
@@ -412,8 +442,8 @@ pub const Version = struct {
     }
 
     fn search_disk(self: *Self, key: []const u8, storage: *Storage, io: std.Io, alloc: Allocator) !?[]u8 {
-        self.mutex.lockUncancelable(io);
-        defer self.mutex.unlock(io);
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
 
         var candidates = try std.ArrayList(FileMeta).initCapacity(alloc, self.tables.items.len);
         defer candidates.deinit(alloc);
@@ -524,16 +554,17 @@ pub const Version = struct {
 
         // Replay from active WALs
         for (wals.items) |wal| {
-            const alive_wal = self.slab.alloc();
-
-            alive_wal.* = try WalTable.open(storage, opts, wal_opts, wal, io, alloc);
+            var alive_wal = try WalTable.open(storage, opts, wal_opts, wal, io, alloc);
+            errdefer {
+                alive_wal.deinit(alloc) catch @panic("oops");
+            }
 
             if (alive_wal.max_seq().get() > self.next_sequence.load(.monotonic).get()) {
                 self.next_sequence.store(KVSeq.init(alive_wal.max_seq().get() + 1), .monotonic);
             }
 
             alive_wal.make_immune();
-            try self.insert(alive_wal);
+            try self.flusher.insert(try ActiveTable.init(alive_wal, alloc));
         }
     }
 
@@ -565,10 +596,11 @@ pub const Version = struct {
 
     // De-initializes version
     pub fn deinit(self: *Version, io: std.Io, alloc: Allocator) void {
-        if (self.active) |active| {
-            self.flusher.insert(active) catch {
+        if (self.active) |*active| {
+            self.flusher.insert(active.*) catch {
                 std.debug.print("Failed to insert data into flusher\n", .{});
-                active.deinit(alloc) catch @panic("todo");
+                active.into_inner().deinit(alloc) catch @panic("todo");
+                active.deinit(alloc);
             };
 
             self.active = undefined;
@@ -576,8 +608,6 @@ pub const Version = struct {
 
         // It's required to destroy flusher first, since it may want to apply some changes to version.
         self.flusher.deinit(alloc);
-        self.slab.deinit(alloc);
-        alloc.destroy(self.slab);
 
         for (self.tables.items) |*table| {
             table.deinit(alloc);

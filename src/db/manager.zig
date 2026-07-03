@@ -295,9 +295,6 @@ pub const Manager = struct {
     pub fn get(self: *Self, key: []const u8, alloc: Allocator) !?[]u8 {
         try self.is_healty();
 
-        self.dblock.lockUncancelable(self.io);
-        defer self.dblock.unlock(self.io);
-
         return try self.version.get(key, &self.storage, self.io, alloc);
     }
 
