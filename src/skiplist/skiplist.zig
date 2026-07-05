@@ -223,8 +223,8 @@ pub fn SkipList(T: type) type {
                     return error.AlreadyExists;
 
                 for (linked_lvl..lvl) |h| {
-                    // NOTE: initialize next before publishing. Otherwise there is a chance that list would be split
-                    // into 2 parts on 0th lvl.
+                    // NOTE: initialize next before publishing. Otherwise there is a chance that
+                    // list would be split into 2 parts on 0th lvl.
                     node.change_next_at_lvl_unsafe(h, succ[h]);
 
                     // If this fails, just retry the search. Even if h != 0, it's fine, since node can

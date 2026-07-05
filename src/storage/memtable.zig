@@ -310,8 +310,8 @@ pub const MemTable = struct {
     }
 
     /// Puts kv previously constructed by MemTable::create_kv
-    pub fn commit_slot(self: *Self, slot: Slot) !void {
-        try self.table.insert_node(slot.node);
+    pub fn commit_slot(self: *Self, slot: Slot) void {
+        self.table.insert_node(slot.node) catch @panic("Elements must not be equal");
         self.update_max_seq(slot.node.key.as_seq());
     }
 

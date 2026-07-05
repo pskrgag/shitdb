@@ -193,7 +193,7 @@ pub const WalTable = struct {
             // If WAL commit failed, we can try to commit into MemTable and then flush it. This we
             // can overcome WAL failures.
             for (slots.items()) |slot| {
-                self.table.commit_slot(slot) catch @panic("must not panic here");
+                self.table.commit_slot(slot);
             }
 
             return .{ .need_rotate = !full, .wal_failed = true };
@@ -203,7 +203,7 @@ pub const WalTable = struct {
 
         // And then commit to active table. It must not fail, since memory was reserved.
         for (slots.items()) |slot| {
-            self.table.commit_slot(slot) catch @panic("must not panic here");
+            self.table.commit_slot(slot);
         }
 
         return .{
