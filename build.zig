@@ -189,6 +189,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_wal_tests = b.addRunArtifact(wal_tests);
 
+    const slab_tests = b.addTest(.{
+        .root_module = slab,
+        .filters = test_filters,
+        .use_llvm = tsan,
+    });
+    const run_slab_tests = b.addRunArtifact(slab_tests);
+
+    const test_utils_tests = b.addTest(.{
+        .root_module = test_utils,
+        .filters = test_filters,
+        .use_llvm = tsan,
+    });
+    const run_test_utils_tests = b.addRunArtifact(test_utils_tests);
+
     const iter_tests = b.addTest(.{
         .root_module = merging_iterator,
         .filters = test_filters,
@@ -205,6 +219,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_db_tests.step);
     test_step.dependOn(&run_iter_tests.step);
     test_step.dependOn(&run_storage_tests.step);
+    test_step.dependOn(&run_wal_tests.step);
+    test_step.dependOn(&run_slab_tests.step);
+    test_step.dependOn(&run_test_utils_tests.step);
 
     const wal_test_step = b.step("test-wal", "Run only WAL tests");
     wal_test_step.dependOn(&run_wal_tests.step);

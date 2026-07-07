@@ -16,6 +16,7 @@ const Mutex = @import("sync").mutex.Mutex;
 const Condition = @import("sync").cv.Condition;
 const Storage = @import("storage").storage.Storage;
 const ActiveTable = @import("version.zig").ActiveTable;
+const Scheduler = @import("test_utils").Scheduler;
 
 const MaxNumTables: usize = 5;
 
@@ -25,7 +26,7 @@ pub const Flusher = struct {
     // Number of tables
     count: usize,
     // Flusher thread
-    thread: std.Thread,
+    thread: Scheduler.FiberHandle,
     // Protects concurrent access to list
     mutex: Mutex,
     // CV for empty state
@@ -127,8 +128,13 @@ pub const Flusher = struct {
         };
 
         // Spawning a thread is a release operation, so all writes should be reversed.
-        flusher.thread = try Thread.spawn(.{}, Flusher.flusher_thread, .{flusher});
-
+        flusher.thread = try Scheduler.spawn_ex(
+            Flusher.flusher_thread,
+            .{flusher},
+            "flusher",
+            .Background,
+            alloc,
+        );
         return flusher;
     }
 

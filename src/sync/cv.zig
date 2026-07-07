@@ -13,10 +13,9 @@ pub const Condition = struct {
         const epoch = self.cond.epoch.load(.monotonic);
 
         mutex.unlock(io);
-        Scheduler.yield(.ConditionWait);
 
-        if (epoch != self.cond.epoch.load(.monotonic)) {
-            @panic("Condition was not signaled. Scheduler deadlock");
+        while (epoch == self.cond.epoch.load(.monotonic)) {
+            Scheduler.yield(.ConditionWait);
         }
 
         mutex.lockUncancelable(io);
@@ -61,10 +60,18 @@ pub const Condition = struct {
     }
 
     pub fn signal(self: *Condition, io: std.Io) void {
-        self.cond.signal(io);
+        if (Scheduler.is_running()) {
+            _ = self.cond.epoch.fetchAdd(1, .monotonic);
+        } else {
+            self.cond.signal(io);
+        }
     }
 
     pub fn broadcast(self: *Condition, io: std.Io) void {
-        self.cond.broadcast(io);
+        if (Scheduler.is_running()) {
+            _ = self.cond.epoch.fetchAdd(1, .monotonic);
+        } else {
+            self.cond.broadcast(io);
+        }
     }
 };

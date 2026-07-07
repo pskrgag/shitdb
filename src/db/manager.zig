@@ -721,18 +721,21 @@ fn transaction_commit_crash(dirname: []const u8, allocator: Allocator) !void {
     const leader = try Scheduler.spawn(
         success_put,
         .{ &manager, allocator },
+        "Leader",
         allocator,
     );
 
     const t1 = try Scheduler.spawn(
         success_put1,
         .{ &manager, allocator },
+        "t1",
         allocator,
     );
 
     const t2 = try Scheduler.spawn(
         success_put_2,
         .{ &manager, allocator },
+        "t2",
         allocator,
     );
 
@@ -790,7 +793,12 @@ test "Transaction commit crash" {
         };
     }
 
-    try Scheduler.run_with_scheduler(transaction_commit_crash, .{ dirname, allocator }, allocator);
+    try Scheduler.run_with_scheduler(
+        transaction_commit_crash,
+        .{ dirname, allocator },
+        false,
+        allocator,
+    );
     try sanitize_manager_after_run(dirname, io, allocator);
 
     // They should be found on disk.
@@ -832,18 +840,21 @@ fn wal_sync_fail(dirname: []const u8, allocator: Allocator) !void {
     const leader = try Scheduler.spawn(
         success_put,
         .{ &manager, allocator },
+        "leader",
         allocator,
     );
 
     const t1 = try Scheduler.spawn(
         success_put1,
         .{ &manager, allocator },
+        "t1",
         allocator,
     );
 
     const t2 = try Scheduler.spawn(
         success_put_2,
         .{ &manager, allocator },
+        "t2",
         allocator,
     );
 
@@ -902,7 +913,7 @@ test "WAL sync failure fails the whole transaction" {
         };
     }
 
-    try Scheduler.run_with_scheduler(wal_sync_fail, .{ dirname, allocator }, allocator);
+    try Scheduler.run_with_scheduler(wal_sync_fail, .{ dirname, allocator }, false, allocator);
 
     var manager = try Manager.new(
         dir,
@@ -940,18 +951,21 @@ fn inval_arg_group(dirname: []const u8, allocator: Allocator) !void {
         const leader = try Scheduler.spawn(
             success_put,
             .{ &manager, allocator },
+            "leader",
             allocator,
         );
 
         const t1 = try Scheduler.spawn(
             too_big,
             .{ &manager, allocator },
+            "t1",
             allocator,
         );
 
         const t2 = try Scheduler.spawn(
             success_put1,
             .{ &manager, allocator },
+            "t2",
             allocator,
         );
 
@@ -1009,7 +1023,7 @@ test "Invalid argument in one request does not affect the whole group" {
         };
     }
 
-    try Scheduler.run_with_scheduler(inval_arg_group, .{ dirname, allocator }, allocator);
+    try Scheduler.run_with_scheduler(inval_arg_group, .{ dirname, allocator }, false, allocator);
     try sanitize_manager_after_run(dirname, io, allocator);
 
     // Check that second success key is also there
@@ -1036,18 +1050,21 @@ fn too_large_second_in_transaction(dirname: []const u8, allocator: Allocator) !v
     const leader = try Scheduler.spawn(
         success_put,
         .{ &manager, allocator },
+        "leader",
         allocator,
     );
 
     const t1 = try Scheduler.spawn(
         success_put1,
         .{ &manager, allocator },
+        "t1",
         allocator,
     );
 
     const t2 = try Scheduler.spawn(
         too_big,
         .{ &manager, allocator },
+        "t2",
         allocator,
     );
 
@@ -1107,6 +1124,7 @@ test "Too large input is second in transaction" {
     try Scheduler.run_with_scheduler(
         too_large_second_in_transaction,
         .{ dirname, allocator },
+        false,
         allocator,
     );
     try sanitize_manager_after_run(dirname, io, allocator);
@@ -1135,12 +1153,14 @@ fn cv_wait_fail_removes_write(dirname: []const u8, allocator: Allocator) !void {
     const leader = try Scheduler.spawn(
         success_put,
         .{ &manager, allocator },
+        "leader",
         allocator,
     );
 
     const t1 = try Scheduler.spawn(
         error_put,
         .{ &manager, allocator },
+        "t1",
         allocator,
     );
 
@@ -1194,7 +1214,12 @@ test "CV wait fail removes write from the queue" {
         };
     }
 
-    try Scheduler.run_with_scheduler(cv_wait_fail_removes_write, .{ dirname, allocator }, allocator);
+    try Scheduler.run_with_scheduler(
+        cv_wait_fail_removes_write,
+        .{ dirname, allocator },
+        false,
+        allocator,
+    );
     try sanitize_manager_after_run(dirname, io, allocator);
 
     // Fail key must not be present
@@ -1257,18 +1282,21 @@ fn failed_wal_sync_makes_table_broken(dirname: []const u8, allocator: Allocator)
     const leader = try Scheduler.spawn(
         success_put,
         .{ &manager, allocator },
+        "leader",
         allocator,
     );
 
     const t1 = try Scheduler.spawn(
         success_put1,
         .{ &manager, allocator },
+        "t1",
         allocator,
     );
 
     const t2 = try Scheduler.spawn(
         success_put_2,
         .{ &manager, allocator },
+        "t2",
         allocator,
     );
 
@@ -1331,7 +1359,12 @@ test "Failed WAL sync makes table broken" {
         };
     }
 
-    try Scheduler.run_with_scheduler(failed_wal_sync_makes_table_broken, .{ dirname, allocator }, allocator);
+    try Scheduler.run_with_scheduler(
+        failed_wal_sync_makes_table_broken,
+        .{ dirname, allocator },
+        false,
+        allocator,
+    );
 
     const dir = try openOrCreateDir(io, dirname);
     var manager = try Manager.new(dir, allocator, io, .{});

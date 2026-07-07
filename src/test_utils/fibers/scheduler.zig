@@ -4,14 +4,28 @@ const SleepPoint = @import("fiber.zig").SleepPoint;
 const ei = @import("../injection/ei.zig");
 const List = std.DoublyLinkedList;
 const Allocator = std.mem.Allocator;
+const FiberKind = @import("fiber.zig").FiberKind;
 
 threadlocal var SchedulerContext: ?*Fiber = null;
 threadlocal var CurrentFiber: ?*Fiber = null;
 var Sched: Scheduler = undefined;
 
 /// Opaque fiber handle
-pub const FiberHandle = struct {
-    ptr: usize,
+pub const FiberHandle = union {
+    fiber: usize,
+    thread: std.Thread,
+
+    pub fn join(self: FiberHandle) void {
+        if (is_running()) {
+            Sched.run_until_done(self);
+        } else {
+            self.thread.join();
+        }
+    }
+
+    fn as_fiber(handle: FiberHandle) *Fiber {
+        return @ptrFromInt(handle.fiber);
+    }
 };
 
 pub const SchedulerPlanEntry = struct {
@@ -44,14 +58,23 @@ pub const SchedulerPlan = struct {
 
 /// Scheduler that runs fibers
 const Scheduler = struct {
-    active: List,
+    foreground: List = .{},
+    background: List = .{},
+    gc: List = .{},
+    debug: bool,
 
-    pub fn new(alloc: Allocator) !Scheduler {
-        SchedulerContext = try Fiber.from_current(alloc);
-        return .{ .active = List{} };
+    pub fn new(debug: bool) !Scheduler {
+        return .{ .debug = debug };
     }
 
-    pub fn spawn(self: *Scheduler, comptime f: anytype, args: anytype, alloc: Allocator) !FiberHandle {
+    pub fn spawn(
+        self: *Scheduler,
+        comptime f: anytype,
+        args: anytype,
+        name: []const u8,
+        kind: FiberKind,
+        alloc: Allocator,
+    ) !FiberHandle {
         const Args = @TypeOf(args);
 
         const CallContext = struct {
@@ -77,26 +100,64 @@ const Scheduler = struct {
         errdefer alloc.destroy(ctx);
         ctx.* = .{ .args = args };
 
-        const fib = try Fiber.new(CallContext.entry, ctx, CallContext.cleanup, SchedulerContext.?, alloc);
+        const fib = try Fiber.new(
+            CallContext.entry,
+            ctx,
+            CallContext.cleanup,
+            SchedulerContext.?,
+            name,
+            kind,
+            alloc,
+        );
 
-        self.active.append(&fib.node);
-        return .{ .ptr = @intFromPtr(fib) };
+        if (kind == .Foregroud) {
+            self.foreground.append(&fib.node);
+        } else {
+            self.background.append(&fib.node);
+        }
+
+        return .{ .fiber = @intFromPtr(fib) };
+    }
+
+    fn ping_background(self: *Scheduler) void {
+        var new_list = List{};
+
+        while (self.background.popFirst()) |task| {
+            const fiber: *Fiber = @fieldParentPtr("node", task);
+
+            // NOTE: this is hacky. It's overcomes the problem when background thread is awaited
+            // by run_until_done(). It must ping background threads sometimes, so fiber may be
+            // in weird state here....
+            if (!fiber.is_done())
+                self.run_one(fiber);
+
+            if (fiber.is_done()) {
+                self.gc.append(&fiber.node);
+            } else {
+                new_list.append(&fiber.node);
+            }
+        }
+
+        self.background = new_list;
     }
 
     fn run_one(self: *Scheduler, fiber: *Fiber) void {
-        _ = self;
         CurrentFiber = fiber;
         defer CurrentFiber = null;
 
-        fiber.switch_from(SchedulerContext.?);
-    }
+        if (self.debug) {
+            std.debug.print("--> {s}\n", .{fiber.name});
+        }
 
-    fn fiber_from_handle(handle: FiberHandle) *Fiber {
-        return @ptrFromInt(handle.ptr);
+        fiber.switch_from(SchedulerContext.?);
+
+        if (self.debug) {
+            std.debug.print("<-- {s} (sleep: {any}) (done: {})\n", .{ fiber.name, fiber.sleep, fiber.is_done() });
+        }
     }
 
     pub fn run_until_sleep(self: *Scheduler, handle: FiberHandle, point: SleepPoint) void {
-        const fiber = fiber_from_handle(handle);
+        const fiber = handle.as_fiber();
 
         while (true) {
             if (fiber.sleep == point)
@@ -111,21 +172,25 @@ const Scheduler = struct {
         }
     }
 
-    pub fn run_until_done(self: *Scheduler, handle: FiberHandle, alloc: Allocator) void {
-        const fiber = fiber_from_handle(handle);
+    pub fn run_until_done(self: *Scheduler, handle: FiberHandle) void {
+        const fiber = handle.as_fiber();
 
         while (!fiber.is_done()) {
             self.run_one(fiber);
+            self.ping_background();
         }
 
-        self.active.remove(&fiber.node);
-        fiber.deinit(alloc);
+        if (fiber.kind == .Foregroud) {
+            self.foreground.remove(&fiber.node);
+            self.gc.append(&fiber.node);
+        }
     }
 
     pub fn run_with_plan(self: *Scheduler, plan: SchedulerPlan, alloc: Allocator) !void {
         for (plan.plan.items) |entry| {
-            // This is insanely unsafe, but let's assume caller is not an asshole
-            const fiber = fiber_from_handle(entry.fiber);
+            const fiber = entry.fiber.as_fiber();
+
+            std.debug.assert(fiber.kind == .Foregroud);
 
             for (entry.inject_error) |err| {
                 try ei.enable(err, 1);
@@ -135,9 +200,10 @@ const Scheduler = struct {
                 .End => {
                     while (!fiber.is_done()) {
                         self.run_one(fiber);
+                        self.ping_background();
                     }
 
-                    self.active.remove(&fiber.node);
+                    self.foreground.remove(&fiber.node);
                     fiber.deinit(alloc);
                 },
                 .Sleep => |p| {
@@ -154,6 +220,7 @@ const Scheduler = struct {
                         }
 
                         self.run_one(fiber);
+                        self.ping_background();
                     }
                 },
             }
@@ -164,7 +231,7 @@ const Scheduler = struct {
     }
 
     pub fn run(self: *Scheduler, alloc: Allocator) !void {
-        while (self.active.popFirst()) |task| {
+        while (self.foreground.popFirst()) |task| {
             const fiber: *Fiber = @fieldParentPtr("node", task);
 
             self.run_one(fiber);
@@ -174,36 +241,64 @@ const Scheduler = struct {
                 fiber.deinit(alloc);
             } else {
                 std.debug.assert(fiber.sleep != null);
-                self.active.append(&fiber.node);
+                self.foreground.append(&fiber.node);
             }
         }
     }
 
-    pub fn deinit(self: *Scheduler, alloc: Allocator) void {
-        while (self.active.popFirst()) |task| {
+    fn deinit_list(list: List, alloc: Allocator) void {
+        var lst = list;
+
+        while (lst.popFirst()) |task| {
             const fiber: *Fiber = @fieldParentPtr("node", task);
 
             fiber.deinit(alloc);
         }
+    }
 
-        SchedulerContext.?.deinit(alloc);
-        SchedulerContext = null;
+    pub fn deinit(self: *Scheduler, alloc: Allocator) void {
+        deinit_list(self.foreground, alloc);
+        deinit_list(self.background, alloc);
+        deinit_list(self.gc, alloc);
     }
 };
 
-pub fn run_with_scheduler(comptime f: anytype, args: anytype, alloc: Allocator) !void {
-    Sched = try Scheduler.new(alloc);
+pub fn run_with_scheduler(comptime f: anytype, args: anytype, debug: bool, alloc: Allocator) !void {
+    Sched = try Scheduler.new(debug);
+    SchedulerContext = try Fiber.from_current(alloc);
 
     defer {
         Sched.deinit(alloc);
         Sched = undefined;
+
+        SchedulerContext.?.deinit(alloc);
+        SchedulerContext = null;
     }
 
     try @call(.auto, f, args);
 }
 
-pub fn spawn(comptime f: anytype, args: anytype, alloc: Allocator) !FiberHandle {
-    return try Sched.spawn(f, args, alloc);
+pub fn spawn_ex(
+    comptime f: anytype,
+    args: anytype,
+    name: []const u8,
+    kind: FiberKind,
+    alloc: Allocator,
+) !FiberHandle {
+    if (is_running()) {
+        return try Sched.spawn(f, args, name, kind, alloc);
+    } else {
+        return .{ .thread = try std.Thread.spawn(.{}, f, args) };
+    }
+}
+
+pub fn spawn(
+    comptime f: anytype,
+    args: anytype,
+    name: []const u8,
+    alloc: Allocator,
+) !FiberHandle {
+    return try spawn_ex(f, args, name, .Foregroud, alloc);
 }
 
 pub fn run_with_plan(plan: SchedulerPlan, alloc: Allocator) !void {
@@ -228,6 +323,15 @@ pub fn yield(point: SleepPoint) void {
 
 var Global: i32 = 0;
 
+fn test_scheduler_context(alloc: Allocator) !void {
+    SchedulerContext = try Fiber.from_current(alloc);
+}
+
+fn deinit_test_scheduler_context(alloc: Allocator) void {
+    SchedulerContext.?.deinit(alloc);
+    SchedulerContext = null;
+}
+
 fn noop() void {
     Global = 1;
 }
@@ -239,10 +343,13 @@ test "Noop fiber" {
     }
 
     const allocator = arena.allocator();
-    var sched = try Scheduler.new(allocator);
+    try test_scheduler_context(allocator);
+    defer deinit_test_scheduler_context(allocator);
+
+    var sched = try Scheduler.new(false);
     defer sched.deinit(allocator);
 
-    _ = try sched.spawn(noop, .{}, allocator);
+    _ = try sched.spawn(noop, .{}, "noop", .Foregroud, allocator);
     try sched.run(allocator);
     try std.testing.expectEqual(Global, 1);
 }
@@ -276,11 +383,14 @@ test "Ping pong" {
     }
 
     const allocator = arena.allocator();
-    var sched = try Scheduler.new(allocator);
+    try test_scheduler_context(allocator);
+    defer deinit_test_scheduler_context(allocator);
+
+    var sched = try Scheduler.new(false);
     defer sched.deinit(allocator);
 
-    _ = try sched.spawn(ping, .{}, allocator);
-    _ = try sched.spawn(pong, .{}, allocator);
+    _ = try sched.spawn(ping, .{}, "ping", .Foregroud, allocator);
+    _ = try sched.spawn(pong, .{}, "pong", .Foregroud, allocator);
     try sched.run(allocator);
     try std.testing.expectEqual(GlobalPong, 4);
 }
@@ -297,10 +407,13 @@ test "Sleep points" {
     }
 
     const allocator = arena.allocator();
-    var sched = try Scheduler.new(allocator);
+    try test_scheduler_context(allocator);
+    defer deinit_test_scheduler_context(allocator);
+
+    var sched = try Scheduler.new(false);
     defer sched.deinit(allocator);
 
-    _ = try sched.spawn(test_sleep, .{}, allocator);
+    _ = try sched.spawn(test_sleep, .{}, "test_sleep", .Foregroud, allocator);
     try sched.run(allocator);
 }
 
@@ -335,12 +448,15 @@ test "Simple plan" {
     }
 
     const allocator = arena.allocator();
-    var sched = try Scheduler.new(allocator);
+    try test_scheduler_context(allocator);
+    defer deinit_test_scheduler_context(allocator);
+
+    var sched = try Scheduler.new(false);
     defer sched.deinit(allocator);
 
-    const f1_handle = try sched.spawn(f1, .{}, allocator);
-    const f2_handle = try sched.spawn(f2, .{}, allocator);
-    const f3_handle = try sched.spawn(f3, .{}, allocator);
+    const f1_handle = try sched.spawn(f1, .{}, "f1", .Foregroud, allocator);
+    const f2_handle = try sched.spawn(f2, .{}, "f2", .Foregroud, allocator);
+    const f3_handle = try sched.spawn(f3, .{}, "f3", .Foregroud, allocator);
 
     var plan = try SchedulerPlan.new(allocator);
     defer plan.deinit(allocator);
@@ -368,11 +484,14 @@ test "Spawn passes args" {
     ArgsGlobal = 0;
 
     const allocator = arena.allocator();
-    var sched = try Scheduler.new(allocator);
+    try test_scheduler_context(allocator);
+    defer deinit_test_scheduler_context(allocator);
+
+    var sched = try Scheduler.new(false);
     defer sched.deinit(allocator);
 
-    _ = try sched.spawn(add_to_global, .{ 2, 3 }, allocator);
-    _ = try sched.spawn(add_to_global, .{ 4, 5 }, allocator);
+    _ = try sched.spawn(add_to_global, .{ 2, 3 }, "add1", .Foregroud, allocator);
+    _ = try sched.spawn(add_to_global, .{ 4, 5 }, "add2", .Foregroud, allocator);
     try sched.run(allocator);
     try std.testing.expectEqual(@as(i32, 26), ArgsGlobal);
 }

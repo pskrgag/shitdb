@@ -15,6 +15,12 @@ pub const SleepPoint = enum {
     Test1,
 };
 
+pub const FiberKind = enum {
+    Foregroud,
+    Background,
+    Scheduler,
+};
+
 pub const Fiber = struct {
     const EntryFn = *const fn (*anyopaque) void;
     const CleanupFn = *const fn (*anyopaque, Allocator) void;
@@ -26,11 +32,14 @@ pub const Fiber = struct {
     node: ListNode,
     done: bool,
     sleep: ?SleepPoint,
+    name: []const u8,
+    kind: FiberKind,
 
     pub fn from_current(alloc: Allocator) !*Fiber {
         const self = try alloc.create(Fiber);
 
         self.* = .{
+            .kind = .Scheduler,
             .ctx = try alloc.create(ArchContext),
             .stack = null,
             .arg = null,
@@ -38,11 +47,20 @@ pub const Fiber = struct {
             .node = ListNode{},
             .done = false,
             .sleep = null,
+            .name = "Scheduler",
         };
         return self;
     }
 
-    pub fn new(f: EntryFn, arg: ?*anyopaque, cleanup: ?CleanupFn, parent: *Fiber, alloc: Allocator) !*Fiber {
+    pub fn new(
+        f: EntryFn,
+        arg: ?*anyopaque,
+        cleanup: ?CleanupFn,
+        parent: *Fiber,
+        name: []const u8,
+        kind: FiberKind,
+        alloc: Allocator,
+    ) !*Fiber {
         const self = try alloc.create(Fiber);
         const stack = try posix.mmap(
             null,
@@ -63,11 +81,13 @@ pub const Fiber = struct {
                 parent.ctx,
                 alloc,
             ),
+            .kind = kind,
             .stack = stack,
             .arg = arg,
             .cleanup = cleanup,
             .done = false,
             .sleep = null,
+            .name = name,
         };
         return self;
     }
