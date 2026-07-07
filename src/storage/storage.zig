@@ -37,6 +37,25 @@ pub const Storage = struct {
         return .{ .dir = dir, .stat = try Stats.new(max_lvl, alloc) };
     }
 
+    pub fn rename(self: *Storage, old_name: []const u8, new_name: []const u8, io: std.Io) !void {
+        try self.dir.rename(old_name, self.dir, new_name, io);
+
+        if (std.os.linux.fsync(self.dir.handle) < 0)
+            return error.FailedToSync;
+    }
+
+    pub fn create_tmp_manifest(
+        self: *Storage,
+        path: []const u8,
+        io: std.Io,
+    ) !std.Io.File {
+        return try self.dir.createFile(io, path, .{ .read = true, .truncate = true });
+    }
+
+    pub fn unlink_file(self: *Storage, path: []const u8, io: std.Io) !void {
+        return try self.dir.deleteFile(io, path);
+    }
+
     pub fn open_or_create_manifest(
         self: *Storage,
         path: []const u8,

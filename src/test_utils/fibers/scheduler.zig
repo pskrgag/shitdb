@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 
 threadlocal var SchedulerContext: ?*Fiber = null;
 threadlocal var CurrentFiber: ?*Fiber = null;
+var Sched: Scheduler = undefined;
 
 /// Opaque fiber handle
 pub const FiberHandle = struct {
@@ -42,7 +43,7 @@ pub const SchedulerPlan = struct {
 };
 
 /// Scheduler that runs fibers
-pub const Scheduler = struct {
+const Scheduler = struct {
     active: List,
 
     pub fn new(alloc: Allocator) !Scheduler {
@@ -189,6 +190,25 @@ pub const Scheduler = struct {
         SchedulerContext = null;
     }
 };
+
+pub fn run_with_scheduler(comptime f: anytype, args: anytype, alloc: Allocator) !void {
+    Sched = try Scheduler.new(alloc);
+
+    defer {
+        Sched.deinit(alloc);
+        Sched = undefined;
+    }
+
+    try @call(.auto, f, args);
+}
+
+pub fn spawn(comptime f: anytype, args: anytype, alloc: Allocator) !FiberHandle {
+    return try Sched.spawn(f, args, alloc);
+}
+
+pub fn run_with_plan(plan: SchedulerPlan, alloc: Allocator) !void {
+    return try Sched.run_with_plan(plan, alloc);
+}
 
 pub fn is_running() bool {
     const builtin = @import("builtin");

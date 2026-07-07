@@ -157,7 +157,6 @@ pub const Manager = struct {
 
         const version = try Version.from_file(
             &storage,
-            "MANIFEST",
             opts,
             stat,
             true,
@@ -629,7 +628,7 @@ test "WAL GC crash" {
         wals += @intFromBool(Wal.is_wal_name(entry.name));
     }
 
-    try std.testing.expectEqual(@as(usize, 1), wals);
+    try std.testing.expectEqual(@as(usize, 2), wals);
 
     const value = (try manager.get("a" ** 10, allocator)).?;
     defer allocator.free(value);
@@ -654,9 +653,12 @@ fn success_put(man: *Manager, alloc: Allocator) !void {
     try man.put(SuccessKey, SuccessValue, alloc);
 }
 
-fn success_put_wal_fail(man: *Manager, alloc: Allocator) !void {
-    // This one must not fail
-    try man.put(SuccessKey, SuccessValue, alloc);
+fn success_put1(man: *Manager, alloc: Allocator) !void {
+    try man.put(Success1Key, Success1Value, alloc);
+}
+
+fn success_put_2(man: *Manager, alloc: Allocator) !void {
+    try man.put(Success2Key, Success2Value, alloc);
 }
 
 fn error_put(man: *Manager, alloc: Allocator) !void {
@@ -666,14 +668,6 @@ fn error_put(man: *Manager, alloc: Allocator) !void {
     };
 
     return error.UnexpectedReturn;
-}
-
-fn wal_write_error_put(man: *Manager, alloc: Allocator) !void {
-    try man.put(Success1Key, Success1Value, alloc);
-}
-
-fn wal_write_error_put1(man: *Manager, alloc: Allocator) !void {
-    try man.put(Success2Key, Success2Value, alloc);
 }
 
 fn wal_sync_error_put(man: *Manager, alloc: Allocator) !void {
@@ -694,7 +688,11 @@ fn too_big(man: *Manager, alloc: Allocator) !void {
     return error.UnexpectedReturn;
 }
 
-fn sanitize_manager_after_run(manager: *Manager, alloc: Allocator) !void {
+fn sanitize_manager_after_run(dirname: []const u8, io: std.Io, alloc: Allocator) !void {
+    const dir = try openOrCreateDir(io, dirname);
+    var manager = try Manager.new(dir, alloc, io, .{ .memtable = .{ .memtable_size = 200 } });
+    defer manager.deinit(alloc);
+
     // try to push smth and verify that it still works
     {
         try manager.put("z", "z", alloc);
@@ -711,9 +709,67 @@ fn sanitize_manager_after_run(manager: *Manager, alloc: Allocator) !void {
     }
 }
 
-test "Transaction commit crash" {
-    const Scheduler = test_utils.Scheduler.Scheduler;
+fn transaction_commit_crash(dirname: []const u8, allocator: Allocator) !void {
     const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
+    const Scheduler = test_utils.Scheduler;
+
+    const io = std.testing.io;
+    const dir = try openOrCreateDir(io, dirname);
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable = .{ .memtable_size = 200 } });
+    defer manager.deinit(allocator);
+
+    const leader = try Scheduler.spawn(
+        success_put,
+        .{ &manager, allocator },
+        allocator,
+    );
+
+    const t1 = try Scheduler.spawn(
+        success_put1,
+        .{ &manager, allocator },
+        allocator,
+    );
+
+    const t2 = try Scheduler.spawn(
+        success_put_2,
+        .{ &manager, allocator },
+        allocator,
+    );
+
+    var plan = try SchedulerPlan.new(allocator);
+    defer plan.deinit(allocator);
+
+    // 1. Build transaction and release the mutex
+    try plan.add(
+        .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
+        allocator,
+    );
+    // 2. Take the mutex and wait for cv
+    try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
+    // 3. Take the mutex and wait for cv (queue length must be 2)
+    try plan.add(.{ .fiber = t2, .run = .{ .Sleep = .ConditionWait } }, allocator);
+    // 4. Commit first transaction
+    try plan.add(.{
+        .fiber = leader,
+        .run = .End,
+    }, allocator);
+    // 4. Run failing transaction
+    try plan.add(.{
+        .fiber = t1,
+        .run = .End,
+        .inject_error = &.{.wal_flush},
+    }, allocator);
+    // 5. Continue follower
+    try plan.add(.{
+        .fiber = t2,
+        .run = .End,
+    }, allocator);
+
+    try Scheduler.run_with_plan(plan, allocator);
+}
+
+test "Transaction commit crash" {
+    const Scheduler = test_utils.Scheduler;
 
     ei.init();
     defer ei.clear();
@@ -728,87 +784,103 @@ test "Transaction commit crash" {
     const dirname = "commit_crash";
     std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
 
-    const dir = try openOrCreateDir(io, dirname);
     defer {
         std.Io.Dir.cwd().deleteTree(io, dirname) catch {
             @panic("failed to delete test db");
         };
     }
 
-    var manager = try Manager.new(dir, allocator, io, .{ .memtable = .{ .memtable_size = 200 } });
-    defer manager.deinit(allocator);
-
-    {
-        var sched = try Scheduler.new(allocator);
-        defer sched.deinit(allocator);
-
-        const leader = try sched.spawn(
-            success_put,
-            .{ &manager, allocator },
-            allocator,
-        );
-
-        const t1 = try sched.spawn(
-            wal_write_error_put,
-            .{ &manager, allocator },
-            allocator,
-        );
-
-        const t2 = try sched.spawn(
-            wal_write_error_put1,
-            .{ &manager, allocator },
-            allocator,
-        );
-
-        var plan = try SchedulerPlan.new(allocator);
-        defer plan.deinit(allocator);
-
-        // 1. Build transaction and release the mutex
-        try plan.add(
-            .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
-            allocator,
-        );
-        // 2. Take the mutex and wait for cv
-        try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
-        // 3. Take the mutex and wait for cv (queue length must be 2)
-        try plan.add(.{ .fiber = t2, .run = .{ .Sleep = .ConditionWait } }, allocator);
-        // 4. Commit first transaction
-        try plan.add(.{
-            .fiber = leader,
-            .run = .End,
-        }, allocator);
-        // 4. Run failing transaction
-        try plan.add(.{
-            .fiber = t1,
-            .run = .End,
-            .inject_error = &.{.wal_flush},
-        }, allocator);
-        // 5. Continue follower
-        try plan.add(.{
-            .fiber = t2,
-            .run = .End,
-        }, allocator);
-
-        try sched.run_with_plan(plan, allocator);
-    }
-    try sanitize_manager_after_run(&manager, allocator);
+    try Scheduler.run_with_scheduler(transaction_commit_crash, .{ dirname, allocator }, allocator);
+    try sanitize_manager_after_run(dirname, io, allocator);
 
     // They should be found on disk.
     {
-        const value = (try manager.get(Success1Key, allocator)).?;
-        defer allocator.free(value);
-        try std.testing.expectEqualSlices(u8, Success1Value, value);
-    }
-    {
-        const value = (try manager.get(Success2Key, allocator)).?;
-        defer allocator.free(value);
-        try std.testing.expectEqualSlices(u8, Success2Value, value);
+        const dir = try openOrCreateDir(io, dirname);
+        var manager = try Manager.new(dir, allocator, io, .{
+            .memtable = .{ .memtable_size = 200 },
+        });
+        defer manager.deinit(allocator);
+
+        {
+            const value = (try manager.get(Success1Key, allocator)).?;
+            defer allocator.free(value);
+            try std.testing.expectEqualSlices(u8, Success1Value, value);
+        }
+
+        {
+            const value = (try manager.get(Success2Key, allocator)).?;
+            defer allocator.free(value);
+            try std.testing.expectEqualSlices(u8, Success2Value, value);
+        }
     }
 }
 
-test "WAL sync failure fails the whole transaction" {
-    const Scheduler = test_utils.Scheduler.Scheduler;
+fn wal_sync_fail(dirname: []const u8, allocator: Allocator) !void {
     const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
+    const Scheduler = test_utils.Scheduler;
+
+    const io = std.testing.io;
+    const dir = try openOrCreateDir(io, dirname);
+    var manager = try Manager.new(
+        dir,
+        allocator,
+        io,
+        .{ .memtable = .{ .memtable_size = 200 }, .wal = .{ .sync = true } },
+    );
+    defer manager.deinit(allocator);
+
+    const leader = try Scheduler.spawn(
+        success_put,
+        .{ &manager, allocator },
+        allocator,
+    );
+
+    const t1 = try Scheduler.spawn(
+        success_put1,
+        .{ &manager, allocator },
+        allocator,
+    );
+
+    const t2 = try Scheduler.spawn(
+        success_put_2,
+        .{ &manager, allocator },
+        allocator,
+    );
+
+    var plan = try SchedulerPlan.new(allocator);
+    defer plan.deinit(allocator);
+
+    // 1. Build transaction and release the mutex
+    try plan.add(
+        .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
+        allocator,
+    );
+    // 2. Take the mutex and wait for cv
+    try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
+    // 3. Take the mutex and wait for cv (queue length must be 2)
+    try plan.add(.{ .fiber = t2, .run = .{ .Sleep = .ConditionWait } }, allocator);
+    // 4. Commit first transaction
+    try plan.add(.{
+        .fiber = leader,
+        .run = .End,
+    }, allocator);
+    // 5. Fail while syncing the grouped transaction
+    try plan.add(.{
+        .fiber = t1,
+        .run = .End,
+        .inject_error = &.{.wal_sync},
+    }, allocator);
+    // 6. Continue follower
+    try plan.add(.{
+        .fiber = t2,
+        .run = .End,
+    }, allocator);
+
+    try Scheduler.run_with_plan(plan, allocator);
+}
+
+test "WAL sync failure fails the whole transaction" {
+    const Scheduler = test_utils.Scheduler;
 
     ei.init();
     defer ei.clear();
@@ -830,67 +902,19 @@ test "WAL sync failure fails the whole transaction" {
         };
     }
 
-    var manager = try Manager.new(dir, allocator, io, .{ .memtable = .{ .memtable_size = 200 }, .wal = .{ .sync = true } });
+    try Scheduler.run_with_scheduler(wal_sync_fail, .{ dirname, allocator }, allocator);
+
+    var manager = try Manager.new(
+        dir,
+        allocator,
+        io,
+        .{ .memtable = .{ .memtable_size = 200 }, .wal = .{ .sync = true } },
+    );
     defer manager.deinit(allocator);
-
-    {
-        var sched = try Scheduler.new(allocator);
-        defer sched.deinit(allocator);
-
-        const leader = try sched.spawn(
-            success_put,
-            .{ &manager, allocator },
-            allocator,
-        );
-
-        const t1 = try sched.spawn(
-            wal_write_error_put,
-            .{ &manager, allocator },
-            allocator,
-        );
-
-        const t2 = try sched.spawn(
-            wal_write_error_put1,
-            .{ &manager, allocator },
-            allocator,
-        );
-
-        var plan = try SchedulerPlan.new(allocator);
-        defer plan.deinit(allocator);
-
-        // 1. Build transaction and release the mutex
-        try plan.add(
-            .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
-            allocator,
-        );
-        // 2. Take the mutex and wait for cv
-        try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
-        // 3. Take the mutex and wait for cv (queue length must be 2)
-        try plan.add(.{ .fiber = t2, .run = .{ .Sleep = .ConditionWait } }, allocator);
-        // 4. Commit first transaction
-        try plan.add(.{
-            .fiber = leader,
-            .run = .End,
-        }, allocator);
-        // 5. Fail while syncing the grouped transaction
-        try plan.add(.{
-            .fiber = t1,
-            .run = .End,
-            .inject_error = &.{.wal_sync},
-        }, allocator);
-        // 6. Continue follower
-        try plan.add(.{
-            .fiber = t2,
-            .run = .End,
-        }, allocator);
-
-        try sched.run_with_plan(plan, allocator);
-    }
-
     try std.testing.expectEqual(null, try manager.get(FailKey, allocator));
-    try sanitize_manager_after_run(&manager, allocator);
+    try sanitize_manager_after_run(dirname, io, allocator);
 
-    // They should be found on disk.
+    // They should be disk, since WAL sync failure causes memtable flush.
     {
         const value = (try manager.get(Success1Key, allocator)).?;
         defer allocator.free(value);
@@ -903,51 +927,30 @@ test "WAL sync failure fails the whole transaction" {
     }
 }
 
-test "Invalid argument in one request does not affect the whole group" {
-    const Scheduler = test_utils.Scheduler.Scheduler;
+fn inval_arg_group(dirname: []const u8, allocator: Allocator) !void {
+    const Scheduler = test_utils.Scheduler;
     const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
 
-    ei.init();
-    defer ei.clear();
-
     const io = std.testing.io;
-    var arena = std.heap.DebugAllocator(.{}){};
-    defer {
-        _ = arena.deinit();
-    }
-    const allocator = arena.allocator();
-
-    const dirname = "invalid_val";
-    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
-
     const dir = try openOrCreateDir(io, dirname);
-    defer {
-        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
-            @panic("failed to delete test db");
-        };
-    }
-
     var manager = try Manager.new(dir, allocator, io, .{ .memtable = .{ .memtable_size = 200 } });
     defer manager.deinit(allocator);
 
     {
-        var sched = try Scheduler.new(allocator);
-        defer sched.deinit(allocator);
-
-        const leader = try sched.spawn(
+        const leader = try Scheduler.spawn(
             success_put,
             .{ &manager, allocator },
             allocator,
         );
 
-        const t1 = try sched.spawn(
+        const t1 = try Scheduler.spawn(
             too_big,
             .{ &manager, allocator },
             allocator,
         );
 
-        const t2 = try sched.spawn(
-            success_put,
+        const t2 = try Scheduler.spawn(
+            success_put1,
             .{ &manager, allocator },
             allocator,
         );
@@ -980,96 +983,12 @@ test "Invalid argument in one request does not affect the whole group" {
             .run = .End,
         }, allocator);
 
-        try sched.run_with_plan(plan, allocator);
+        try Scheduler.run_with_plan(plan, allocator);
     }
-    try sanitize_manager_after_run(&manager, allocator);
 }
 
-test "Too large input is second in transaction" {
-    const Scheduler = test_utils.Scheduler.Scheduler;
-    const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
-
-    ei.init();
-    defer ei.clear();
-
-    const io = std.testing.io;
-    var arena = std.heap.DebugAllocator(.{}){};
-    defer {
-        _ = arena.deinit();
-    }
-    const allocator = arena.allocator();
-
-    const dirname = "too_large_second_in_transaction";
-    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
-
-    const dir = try openOrCreateDir(io, dirname);
-    defer {
-        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
-            @panic("failed to delete test db");
-        };
-    }
-
-    var manager = try Manager.new(dir, allocator, io, .{ .memtable = .{ .memtable_size = 200 } });
-    defer manager.deinit(allocator);
-
-    {
-        var sched = try Scheduler.new(allocator);
-        defer sched.deinit(allocator);
-
-        const leader = try sched.spawn(
-            success_put,
-            .{ &manager, allocator },
-            allocator,
-        );
-
-        const t1 = try sched.spawn(
-            success_put,
-            .{ &manager, allocator },
-            allocator,
-        );
-
-        const t2 = try sched.spawn(
-            too_big,
-            .{ &manager, allocator },
-            allocator,
-        );
-
-        var plan = try SchedulerPlan.new(allocator);
-        defer plan.deinit(allocator);
-
-        // 1. Build transaction and release the mutex
-        try plan.add(
-            .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
-            allocator,
-        );
-        // 2. Take the mutex and wait for cv
-        try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
-        // 3. Take the mutex and wait for cv (queue length must be 2)
-        try plan.add(.{ .fiber = t2, .run = .{ .Sleep = .ConditionWait } }, allocator);
-        // 4. Commit first transaction
-        try plan.add(.{
-            .fiber = leader,
-            .run = .End,
-        }, allocator);
-        // 5. Commit transaction with valid request followed by too large request
-        try plan.add(.{
-            .fiber = t1,
-            .run = .End,
-        }, allocator);
-        // 6. Continue failed follower
-        try plan.add(.{
-            .fiber = t2,
-            .run = .End,
-        }, allocator);
-
-        try sched.run_with_plan(plan, allocator);
-    }
-    try sanitize_manager_after_run(&manager, allocator);
-}
-
-test "CV wait fail removes write from the queue" {
-    const Scheduler = test_utils.Scheduler.Scheduler;
-    const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
+test "Invalid argument in one request does not affect the whole group" {
+    const Scheduler = test_utils.Scheduler;
 
     ei.init();
     defer ei.clear();
@@ -1084,60 +1003,208 @@ test "CV wait fail removes write from the queue" {
     const dirname = "invalid_val";
     std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
 
-    const dir = try openOrCreateDir(io, dirname);
     defer {
         std.Io.Dir.cwd().deleteTree(io, dirname) catch {
             @panic("failed to delete test db");
         };
     }
 
+    try Scheduler.run_with_scheduler(inval_arg_group, .{ dirname, allocator }, allocator);
+    try sanitize_manager_after_run(dirname, io, allocator);
+
+    // Check that second success key is also there
+    {
+        const dir = try openOrCreateDir(io, dirname);
+        var manager = try Manager.new(dir, allocator, io, .{ .memtable = .{ .memtable_size = 200 } });
+        defer manager.deinit(allocator);
+
+        const value = (try manager.get(Success1Key, allocator)).?;
+        defer allocator.free(value);
+        try std.testing.expectEqualSlices(u8, Success1Value, value);
+    }
+}
+
+fn too_large_second_in_transaction(dirname: []const u8, allocator: Allocator) !void {
+    const Scheduler = test_utils.Scheduler;
+    const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
+
+    const io = std.testing.io;
+    const dir = try openOrCreateDir(io, dirname);
     var manager = try Manager.new(dir, allocator, io, .{ .memtable = .{ .memtable_size = 200 } });
     defer manager.deinit(allocator);
 
-    {
-        var sched = try Scheduler.new(allocator);
-        defer sched.deinit(allocator);
+    const leader = try Scheduler.spawn(
+        success_put,
+        .{ &manager, allocator },
+        allocator,
+    );
 
-        const leader = try sched.spawn(
-            success_put,
-            .{ &manager, allocator },
-            allocator,
-        );
+    const t1 = try Scheduler.spawn(
+        success_put1,
+        .{ &manager, allocator },
+        allocator,
+    );
 
-        const t1 = try sched.spawn(
-            error_put,
-            .{ &manager, allocator },
-            allocator,
-        );
+    const t2 = try Scheduler.spawn(
+        too_big,
+        .{ &manager, allocator },
+        allocator,
+    );
 
-        var plan = try SchedulerPlan.new(allocator);
-        defer plan.deinit(allocator);
+    var plan = try SchedulerPlan.new(allocator);
+    defer plan.deinit(allocator);
 
-        // 1. Build transaction and release the mutex
-        try plan.add(
-            .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
-            allocator,
-        );
-        // 2. Take the mutex and wait for cv
-        try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
-        // 3. Run till the end
-        try plan.add(
-            .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
-            allocator,
-        );
-        // 4. Fail on cv
-        try plan.add(
-            .{
-                .fiber = leader,
-                .run = .{ .Sleep = .TransactionBuilt },
-                .inject_error = &.{.write_cv_wait},
-            },
-            allocator,
-        );
+    // 1. Build transaction and release the mutex
+    try plan.add(
+        .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
+        allocator,
+    );
+    // 2. Take the mutex and wait for cv
+    try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
+    // 3. Take the mutex and wait for cv (queue length must be 2)
+    try plan.add(.{ .fiber = t2, .run = .{ .Sleep = .ConditionWait } }, allocator);
+    // 4. Commit first transaction
+    try plan.add(.{
+        .fiber = leader,
+        .run = .End,
+    }, allocator);
+    // 5. Commit transaction with valid request followed by too large request
+    try plan.add(.{
+        .fiber = t1,
+        .run = .End,
+    }, allocator);
+    // 6. Continue failed follower
+    try plan.add(.{
+        .fiber = t2,
+        .run = .End,
+    }, allocator);
 
-        try sched.run_with_plan(plan, allocator);
+    try Scheduler.run_with_plan(plan, allocator);
+}
+
+test "Too large input is second in transaction" {
+    const Scheduler = test_utils.Scheduler;
+
+    ei.init();
+    defer ei.clear();
+
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
     }
-    try sanitize_manager_after_run(&manager, allocator);
+    const allocator = arena.allocator();
+
+    const dirname = "too_large_second_in_transaction";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    try Scheduler.run_with_scheduler(
+        too_large_second_in_transaction,
+        .{ dirname, allocator },
+        allocator,
+    );
+    try sanitize_manager_after_run(dirname, io, allocator);
+
+    // Check that second success key is also there
+    {
+        const dir = try openOrCreateDir(io, dirname);
+        var manager = try Manager.new(dir, allocator, io, .{ .memtable = .{ .memtable_size = 200 } });
+        defer manager.deinit(allocator);
+
+        const value = (try manager.get(Success1Key, allocator)).?;
+        defer allocator.free(value);
+        try std.testing.expectEqualSlices(u8, Success1Value, value);
+    }
+}
+
+fn cv_wait_fail_removes_write(dirname: []const u8, allocator: Allocator) !void {
+    const Scheduler = test_utils.Scheduler;
+    const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
+
+    const io = std.testing.io;
+    const dir = try openOrCreateDir(io, dirname);
+    var manager = try Manager.new(dir, allocator, io, .{ .memtable = .{ .memtable_size = 200 } });
+    defer manager.deinit(allocator);
+
+    const leader = try Scheduler.spawn(
+        success_put,
+        .{ &manager, allocator },
+        allocator,
+    );
+
+    const t1 = try Scheduler.spawn(
+        error_put,
+        .{ &manager, allocator },
+        allocator,
+    );
+
+    var plan = try SchedulerPlan.new(allocator);
+    defer plan.deinit(allocator);
+
+    // 1. Build transaction and release the mutex
+    try plan.add(
+        .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
+        allocator,
+    );
+    // 2. Take the mutex and wait for cv
+    try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
+    // 3. Run till the end
+    try plan.add(
+        .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
+        allocator,
+    );
+    // 4. Fail on cv
+    try plan.add(
+        .{
+            .fiber = leader,
+            .run = .{ .Sleep = .TransactionBuilt },
+            .inject_error = &.{.write_cv_wait},
+        },
+        allocator,
+    );
+
+    try Scheduler.run_with_plan(plan, allocator);
+}
+
+test "CV wait fail removes write from the queue" {
+    const Scheduler = test_utils.Scheduler;
+
+    ei.init();
+    defer ei.clear();
+
+    const io = std.testing.io;
+    var arena = std.heap.DebugAllocator(.{}){};
+    defer {
+        _ = arena.deinit();
+    }
+    const allocator = arena.allocator();
+
+    const dirname = "invalid_val";
+    std.Io.Dir.cwd().deleteTree(io, dirname) catch {};
+
+    defer {
+        std.Io.Dir.cwd().deleteTree(io, dirname) catch {
+            @panic("failed to delete test db");
+        };
+    }
+
+    try Scheduler.run_with_scheduler(cv_wait_fail_removes_write, .{ dirname, allocator }, allocator);
+    try sanitize_manager_after_run(dirname, io, allocator);
+
+    // Fail key must not be present
+    {
+        const dir = try openOrCreateDir(io, dirname);
+        var manager = try Manager.new(dir, allocator, io, .{ .memtable = .{ .memtable_size = 200 } });
+        defer manager.deinit(allocator);
+
+        try std.testing.expectEqual(null, try manager.get(FailKey, allocator));
+    }
 }
 
 test "Too big record for memtable infinity loop" {
@@ -1173,9 +1240,77 @@ test "Too big record for memtable infinity loop" {
     }
 }
 
-test "Failed WAL sync makes table broken" {
-    const Scheduler = test_utils.Scheduler.Scheduler;
+fn failed_wal_sync_makes_table_broken(dirname: []const u8, allocator: Allocator) !void {
+    const Scheduler = test_utils.Scheduler;
     const SchedulerPlan = test_utils.Scheduler.SchedulerPlan;
+
+    const io = std.testing.io;
+    const dir = try openOrCreateDir(io, dirname);
+    var manager = try Manager.new(dir, allocator, io, .{
+        .memtable = .{ .memtable_size = 200 },
+        .wal = .{ .sync = true },
+    });
+    defer manager.deinit(allocator);
+
+    try ei.enable(.memtable_flush, 1);
+
+    const leader = try Scheduler.spawn(
+        success_put,
+        .{ &manager, allocator },
+        allocator,
+    );
+
+    const t1 = try Scheduler.spawn(
+        success_put1,
+        .{ &manager, allocator },
+        allocator,
+    );
+
+    const t2 = try Scheduler.spawn(
+        success_put_2,
+        .{ &manager, allocator },
+        allocator,
+    );
+
+    var plan = try SchedulerPlan.new(allocator);
+    defer plan.deinit(allocator);
+
+    // 1. Build transaction and release the mutex
+    try plan.add(
+        .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
+        allocator,
+    );
+    // 2. Take the mutex and wait for cv
+    try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
+    // 3. Take the mutex and wait for cv (queue length must be 2)
+    try plan.add(.{ .fiber = t2, .run = .{ .Sleep = .ConditionWait } }, allocator);
+    // 4. Commit first transaction
+    try plan.add(.{
+        .fiber = leader,
+        .run = .End,
+    }, allocator);
+    // 5. Fail WAL sync; forced MemTable flush is already armed to fail.
+    try plan.add(.{
+        .fiber = t1,
+        .run = .End,
+        .inject_error = &.{ .wal_sync, .memtable_flush },
+    }, allocator);
+    // 6. Continue follower
+    try plan.add(.{
+        .fiber = t2,
+        .run = .End,
+    }, allocator);
+
+    try Scheduler.run_with_plan(plan, allocator);
+
+    try std.testing.expectEqual(ManagerState.Broken, manager.state);
+    try std.testing.expectError(error.Broken, manager.put("z", "z", allocator));
+    try std.testing.expectError(error.Broken, manager.remove("z", allocator));
+    try std.testing.expectError(error.Broken, manager.get(SuccessKey, allocator));
+}
+
+test "Failed WAL sync makes table broken" {
+    const Scheduler = test_utils.Scheduler;
 
     ei.init();
     defer ei.clear();
@@ -1196,75 +1331,7 @@ test "Failed WAL sync makes table broken" {
         };
     }
 
-    {
-        const dir = try openOrCreateDir(io, dirname);
-        var manager = try Manager.new(dir, allocator, io, .{
-            .memtable = .{ .memtable_size = 200 },
-            .wal = .{ .sync = true },
-        });
-        defer manager.deinit(allocator);
-
-        try ei.enable(.memtable_flush, 1);
-
-        {
-            var sched = try Scheduler.new(allocator);
-            defer sched.deinit(allocator);
-
-            const leader = try sched.spawn(
-                success_put,
-                .{ &manager, allocator },
-                allocator,
-            );
-
-            const t1 = try sched.spawn(
-                wal_write_error_put,
-                .{ &manager, allocator },
-                allocator,
-            );
-
-            const t2 = try sched.spawn(
-                wal_write_error_put1,
-                .{ &manager, allocator },
-                allocator,
-            );
-
-            var plan = try SchedulerPlan.new(allocator);
-            defer plan.deinit(allocator);
-
-            // 1. Build transaction and release the mutex
-            try plan.add(
-                .{ .fiber = leader, .run = .{ .Sleep = .TransactionBuilt } },
-                allocator,
-            );
-            // 2. Take the mutex and wait for cv
-            try plan.add(.{ .fiber = t1, .run = .{ .Sleep = .ConditionWait } }, allocator);
-            // 3. Take the mutex and wait for cv (queue length must be 2)
-            try plan.add(.{ .fiber = t2, .run = .{ .Sleep = .ConditionWait } }, allocator);
-            // 4. Commit first transaction
-            try plan.add(.{
-                .fiber = leader,
-                .run = .End,
-            }, allocator);
-            // 5. Fail WAL sync; forced MemTable flush is already armed to fail.
-            try plan.add(.{
-                .fiber = t1,
-                .run = .End,
-                .inject_error = &.{ .wal_sync, .memtable_flush },
-            }, allocator);
-            // 6. Continue follower
-            try plan.add(.{
-                .fiber = t2,
-                .run = .End,
-            }, allocator);
-
-            try sched.run_with_plan(plan, allocator);
-        }
-
-        try std.testing.expectEqual(ManagerState.Broken, manager.state);
-        try std.testing.expectError(error.Broken, manager.put("z", "z", allocator));
-        try std.testing.expectError(error.Broken, manager.remove("z", allocator));
-        try std.testing.expectError(error.Broken, manager.get(SuccessKey, allocator));
-    }
+    try Scheduler.run_with_scheduler(failed_wal_sync_makes_table_broken, .{ dirname, allocator }, allocator);
 
     const dir = try openOrCreateDir(io, dirname);
     var manager = try Manager.new(dir, allocator, io, .{});
@@ -1341,7 +1408,7 @@ test "SSTable merging actually happens" {
             .max_lvl0 = 1,
             .sstable_target_size = 1000,
             .fanout = 10,
-            .lvl1_byte_threshold = lvl1_threshold ,
+            .lvl1_byte_threshold = lvl1_threshold,
         } },
     );
     defer manager.deinit(allocator);

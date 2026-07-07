@@ -85,15 +85,14 @@ pub const Wal = struct {
     opts: WalOpts,
 
     fn file_name(alloc: Allocator, seq: FileSeq) ![]const u8 {
-        const res = std.fmt.allocPrint(alloc, "WAL{}.sst", .{seq.get()});
-        return res;
+        return try std.fmt.allocPrint(alloc, "WAL{}.sst", .{seq.get()});
     }
 
     pub fn open(storage: *Storage, seq: FileSeq, io: Io, alloc: Allocator) !Wal {
         return open_with_opts(storage, seq, .{}, io, alloc);
     }
 
-    pub fn open_with_opts(storage: *Storage, seq: FileSeq, opts: WalOpts, io: Io, alloc: Allocator) !Wal {
+    pub fn open_with_opts(storage: *Storage, seq: FileSeq, opts: WalOpts, io: Io, alloc: Allocator,) !Wal {
         const file = try storage.open_wal(seq, io, alloc);
 
         return .{ .file = BufferedFile.readonly(file), .opts = opts };

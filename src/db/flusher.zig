@@ -70,8 +70,8 @@ pub const Flusher = struct {
             &self.storage,
             self.alloc,
         );
-        table.deinit(self.alloc) catch @panic("Failed to deinit flushed MemTable");
 
+        table.deinit(self.alloc) catch @panic("Failed to deinit flushed MemTable");
         first.deinit(self.alloc);
         self.version.stat.inc(.memtable_flush);
     }

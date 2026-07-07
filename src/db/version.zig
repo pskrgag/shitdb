@@ -57,6 +57,8 @@ pub const Version = struct {
     opts: KeyValueOptions,
 
     const Self = @This();
+    const ManifestName = "MANIFEST";
+    const TmpManifestName = "MANIFEST.tmp";
 
     fn acquire_active_table(self: *Self, io: std.Io) Referenced(WalTable) {
         self.active_mutex.lockUncancelable(io);
@@ -198,19 +200,24 @@ pub const Version = struct {
 
     pub fn from_file(
         storage: *Storage,
-        path: []const u8,
         opts: KeyValueOptions,
         stat: *Statistics,
         sanitize: bool,
         io: std.Io,
         alloc: Allocator,
     ) !*Self {
-        var file = try storage.open_or_create_manifest(path, io);
-        errdefer file.close(io);
-
-        const file_stat = try file.stat(io);
-        const size = file_stat.size;
         const res = try alloc.create(Self);
+        var file = storage.open_or_create_manifest(ManifestName, io) catch |e| {
+            alloc.destroy(res);
+            return e;
+        };
+
+        const file_stat = file.stat(io) catch |e| {
+            alloc.destroy(res);
+            file.close(io);
+            return e;
+        };
+        const size = file_stat.size;
 
         res.* = .{
             .flusher = try Flusher.new(alloc, res, storage, io),
@@ -441,7 +448,13 @@ pub const Version = struct {
         return self.search_disk(key, storage, io, alloc);
     }
 
-    fn search_disk(self: *Self, key: []const u8, storage: *Storage, io: std.Io, alloc: Allocator) !?[]u8 {
+    fn search_disk(
+        self: *Self,
+        key: []const u8,
+        storage: *Storage,
+        io: std.Io,
+        alloc: Allocator,
+    ) !?[]u8 {
         self.apply_mutex.lockUncancelable(io);
         defer self.apply_mutex.unlock(io);
 
@@ -479,6 +492,42 @@ pub const Version = struct {
         return null;
     }
 
+    fn recreate_manifest(
+        storage: *Storage,
+        wals: []const FileSeq,
+        tables: []const FileMeta,
+        io: std.Io,
+        alloc: Allocator,
+    ) !std.Io.File {
+        const file = try storage.create_tmp_manifest(TmpManifestName, io);
+        errdefer {
+            file.close(io);
+            storage.unlink_file(TmpManifestName, io) catch {};
+        }
+
+        var serialized_records = try std.ArrayList(u8).initCapacity(alloc, 0);
+        defer serialized_records.deinit(alloc);
+
+        for (wals) |wal| {
+            const rec = manifest.ManifestRecord{ .AddWal = wal };
+            try rec.serialize_to(&serialized_records, alloc);
+        }
+
+        for (tables) |table| {
+            const rec = manifest.ManifestRecord{ .AddFile = table };
+            try rec.serialize_to(&serialized_records, alloc);
+        }
+
+        const offset = try file.length(io);
+
+        // NOTE: writePositionalAll sends all data directly to kernel. Sync makes it go to the disk
+        try file.writePositionalAll(io, serialized_records.items, offset);
+        try file.sync(io);
+
+        try storage.rename(TmpManifestName, ManifestName, io);
+        return file;
+    }
+
     fn replay(
         self: *Version,
         storage: *Storage,
@@ -511,9 +560,11 @@ pub const Version = struct {
                         if (wal.get() == f.file_seq.get()) {
                             const old_wal = wals.swapRemove(idx);
 
+                            std.debug.assert(old_wal.get() == wal.get());
+
                             // I don't really want to abort initialization in of WAL GC failure.
                             Wal.unlink(storage, old_wal, io, alloc) catch |e| {
-                                std.debug.print("Failed to delete old WAL {}", .{e});
+                                std.debug.print("Failed to delete old WAL {}\n", .{e});
                             };
                             break;
                         }
@@ -526,6 +577,9 @@ pub const Version = struct {
                 },
                 .AddWal => |wal| {
                     try wals.append(alloc, wal);
+                    if (self.next_file.load(.monotonic).get() <= wal.get()) {
+                        self.next_file.store(FileSeq.init(wal.get() + 1), .monotonic);
+                    }
                 },
                 .DeleteFile => |f| {
                     var found = false;
@@ -551,6 +605,18 @@ pub const Version = struct {
                 },
             }
         }
+
+        // Here we have up-to-date information about the state. Some manifest entries might be stale
+        // so here we dump actual state to the new manifest to reduce disk overhead.
+        const new = try Self.recreate_manifest(
+            storage,
+            wals.items,
+            self.tables.items,
+            io,
+            alloc,
+        );
+        self.file.close(io);
+        self.file = new;
 
         // Replay from active WALs
         for (wals.items) |wal| {
@@ -708,7 +774,14 @@ test "Version serialization" {
         };
     }
 
-    var version = try Version.from_file(&storage, "manifest", testing_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(
+        &storage,
+        testing_opts,
+        &stat,
+        false,
+        testing_io,
+        allocator,
+    );
     defer version.deinit(testing_io, allocator);
 
     {
@@ -918,7 +991,6 @@ test "Version apply persists edits that reopen can replay" {
     {
         var version = try Version.from_file(
             &storage,
-            "manifest",
             testing_opts,
             &stat,
             false,
@@ -948,7 +1020,6 @@ test "Version apply persists edits that reopen can replay" {
     {
         var reopened = try Version.from_file(
             &storage,
-            "manifest",
             testing_opts,
             &stat,
             false,
@@ -994,7 +1065,6 @@ test "lvl0 compaction merges overlapping lvl1 table" {
 
     var version = try Version.from_file(
         &storage,
-        "manifest",
         testing_opts,
         &stat,
         false,
@@ -1083,7 +1153,7 @@ test "lvl0 compaction keeps non-overlapping lvl1 table" {
         };
     }
 
-    var version = try Version.from_file(&storage, "manifest", testing_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(&storage, testing_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1171,7 +1241,6 @@ test "lvl0 compaction includes lvl1 table that shares boundary key" {
 
     var version = try Version.from_file(
         &storage,
-        "manifest",
         testing_opts,
         &stat,
         false,
@@ -1263,7 +1332,7 @@ test "lvl0 compaction physically deletes obsolete input files" {
         };
     }
 
-    var version = try Version.from_file(&storage, "manifest", testing_opts, &stat, false, testing_io, allocator);
+    var version = try Version.from_file(&storage, testing_opts, &stat, false, testing_io, allocator);
     defer version.deinit(testing_io, allocator);
 
     var edit = try VersionEdit.empty(allocator);
@@ -1351,7 +1420,6 @@ test "lvl0 compaction preserves non-overlapping lvl1 file on disk" {
 
     var version = try Version.from_file(
         &storage,
-        "manifest",
         testing_opts,
         &stat,
         false,
@@ -1442,7 +1510,6 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
     {
         var version = try Version.from_file(
             &storage,
-            "manifest",
             testing_opts,
             &stat,
             false,
@@ -1500,7 +1567,7 @@ test "lvl0 compaction manifest replay restores live tables and counts" {
     }
 
     {
-        var reopened = try Version.from_file(&storage, "manifest", testing_opts, &stat, false, testing_io, allocator);
+        var reopened = try Version.from_file(&storage, testing_opts, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 1), reopened.tables.items.len);
@@ -1540,7 +1607,6 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
     {
         var version = try Version.from_file(
             &storage,
-            "manifest",
             testing_opts,
             &stat,
             false,
@@ -1601,7 +1667,7 @@ test "lvl0 compaction replay keeps non-overlapping lvl1 table" {
     try std.testing.expect(storage.stats().sstable_size(1) > 0);
 
     {
-        var reopened = try Version.from_file(&storage, "manifest", testing_opts, &stat, false, testing_io, allocator);
+        var reopened = try Version.from_file(&storage, testing_opts, &stat, false, testing_io, allocator);
         defer reopened.deinit(testing_io, allocator);
 
         try std.testing.expectEqual(@as(usize, 2), reopened.tables.items.len);
@@ -1649,7 +1715,6 @@ test "Version updates storage stats on boot" {
 
         var version = try Version.from_file(
             &storage,
-            "manifest",
             testing_opts,
             &stat,
             false,
@@ -1720,7 +1785,6 @@ test "Version updates storage stats on boot" {
 
         var version = try Version.from_file(
             &storage,
-            "manifest",
             testing_opts,
             &stat,
             false,
