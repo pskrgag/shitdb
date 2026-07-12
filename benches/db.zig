@@ -280,7 +280,7 @@ pub fn add_benches(bench: *zbench.Benchmark) !void {
     });
 
     try bench.add(create_find_insert(
-        "DB get SSTable hit",
+        "DB get one SSTable hit",
         KeySize,
         ValueSize,
     ), get_existing, .{

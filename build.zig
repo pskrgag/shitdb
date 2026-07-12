@@ -17,6 +17,14 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const test_filter = b.option([]const u8, "test-filter", "Run only tests matching this filter");
     const test_filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{};
+    const db_test_filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{
+        "db.test.",
+        "db.manager.test.",
+        "db.version.test.",
+    };
+    const wal_test_filters: []const []const u8 = if (test_filter) |filter| &.{filter} else &.{
+        "wal.test.",
+    };
 
     const zbench_module = b.dependency("zbench", .{
         .target = target,
@@ -175,16 +183,23 @@ pub fn build(b: *std.Build) void {
     });
     const run_storage_tests = b.addRunArtifact(storage_tests);
 
+    const adt_tests = b.addTest(.{
+        .root_module = adt,
+        .filters = test_filters,
+        .use_llvm = tsan,
+    });
+    const run_adt_tests = b.addRunArtifact(adt_tests);
+
     const db_tests = b.addTest(.{
         .root_module = db,
-        .filters = test_filters,
+        .filters = db_test_filters,
         .use_llvm = tsan,
     });
     const run_db_tests = b.addRunArtifact(db_tests);
 
     const wal_tests = b.addTest(.{
         .root_module = wal,
-        .filters = test_filters,
+        .filters = wal_test_filters,
         .use_llvm = tsan,
     });
     const run_wal_tests = b.addRunArtifact(wal_tests);
@@ -219,6 +234,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_db_tests.step);
     test_step.dependOn(&run_iter_tests.step);
     test_step.dependOn(&run_storage_tests.step);
+    test_step.dependOn(&run_adt_tests.step);
     test_step.dependOn(&run_wal_tests.step);
     test_step.dependOn(&run_slab_tests.step);
     test_step.dependOn(&run_test_utils_tests.step);

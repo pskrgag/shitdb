@@ -46,7 +46,10 @@ pub fn Lfu(Key: type, Value: type) type {
 
         const Self = @This();
 
-        pub fn init(cap: usize, alloc: Allocator) Self {
+        pub fn init(cap: usize, alloc: Allocator) !Self {
+            if (cap == 0)
+                return error.InvalidArgument;
+
             return .{
                 .capacity = cap,
                 .nodes = NodeMap.init(alloc),
@@ -199,7 +202,7 @@ test "Basic" {
     const alloc = gpa.allocator();
 
     const cap = 10;
-    var lfu = Lfu(usize, usize).init(cap, alloc);
+    var lfu = try Lfu(usize, usize).init(cap, alloc);
     defer lfu.deinit(alloc);
 
     for (0..cap) |i| {
@@ -223,7 +226,7 @@ test "Remove min_freq update" {
     const alloc = gpa.allocator();
 
     const cap = 10;
-    var lfu = Lfu(usize, usize).init(cap, alloc);
+    var lfu = try Lfu(usize, usize).init(cap, alloc);
     defer lfu.deinit(alloc);
 
     try lfu.put(0, 0, alloc);
@@ -267,4 +270,66 @@ test "Remove min_freq update" {
         try std.testing.expect(lfu.remove(2, alloc));
         try std.testing.expectEqual(1, lfu.min_freq);
     }
+}
+
+test "Put existing key at capacity does not evict" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var lfu = try Lfu(usize, usize).init(2, alloc);
+    defer lfu.deinit(alloc);
+
+    try lfu.put(1, 10, alloc);
+    try lfu.put(2, 20, alloc);
+    try lfu.put(2, 200, alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), lfu.nodes.count());
+    try std.testing.expectEqual(@as(usize, 10), (try lfu.get(1, alloc)).?.*);
+    try std.testing.expectEqual(@as(usize, 200), (try lfu.get(2, alloc)).?.*);
+}
+
+test "Least recently used key breaks equal-frequency tie" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var lfu = try Lfu(usize, usize).init(2, alloc);
+    defer lfu.deinit(alloc);
+
+    try lfu.put(1, 10, alloc);
+    try lfu.put(2, 20, alloc);
+    _ = try lfu.get(1, alloc);
+    _ = try lfu.get(2, alloc);
+
+    try lfu.put(3, 30, alloc);
+
+    try std.testing.expectEqual(null, try lfu.get(1, alloc));
+    try std.testing.expectEqual(@as(usize, 20), (try lfu.get(2, alloc)).?.*);
+    try std.testing.expectEqual(@as(usize, 30), (try lfu.get(3, alloc)).?.*);
+}
+
+test "Remove sole key and insert again" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var lfu = try Lfu(usize, usize).init(1, alloc);
+    defer lfu.deinit(alloc);
+
+    try lfu.put(1, 10, alloc);
+    _ = try lfu.get(1, alloc);
+    try std.testing.expect(lfu.remove(1, alloc));
+    try std.testing.expect(!lfu.remove(1, alloc));
+
+    try lfu.put(2, 20, alloc);
+    try std.testing.expectEqual(@as(usize, 20), (try lfu.get(2, alloc)).?.*);
+}
+
+test "Zero-capacity is invalid" {
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    try std.testing.expectError(error.InvalidArgument, Lfu(usize, usize).init(0, alloc));
 }
