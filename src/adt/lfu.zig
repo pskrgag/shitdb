@@ -29,13 +29,14 @@ fn Node(Key: type, Value: type) type {
 pub fn Lfu(Key: type, Value: type) type {
     return struct {
         const NodeMap = HashMap(Key, *Node(Key, Value));
-        const FreqMap = HashMap(Key, *FreqList);
+        const FreqMap = HashMap(usize, *FreqList);
 
         nodes: NodeMap,
         freq: FreqMap,
         capacity: usize,
         min_freq: usize = 0,
         freq_nodes: List,
+        deinit_callback: ?*const fn (value: *Value) void,
 
         // To support removal, it's required to find next freqlist to update min_freq.
         const FreqList = struct {
@@ -44,9 +45,30 @@ pub fn Lfu(Key: type, Value: type) type {
             node: ListNode = .{},
         };
 
+        const Entry = struct {
+            key_ptr: *Key,
+            value_ptr: *Value,
+        };
+
+        pub const Iterator = struct {
+            iter: NodeMap.Iterator,
+
+            pub fn next(self: *Iterator) ?Entry {
+                if (self.iter.next()) |nxt| {
+                    return .{ .key_ptr = nxt.key_ptr, .value_ptr = &nxt.value_ptr.*.value };
+                } else {
+                    return null;
+                }
+            }
+        };
+
         const Self = @This();
 
-        pub fn init(cap: usize, alloc: Allocator) !Self {
+        pub fn init(
+            cap: usize,
+            deinit_callback: ?*const fn (value: *Value) void,
+            alloc: Allocator,
+        ) !Self {
             if (cap == 0)
                 return error.InvalidArgument;
 
@@ -55,6 +77,7 @@ pub fn Lfu(Key: type, Value: type) type {
                 .nodes = NodeMap.init(alloc),
                 .freq = FreqMap.init(alloc),
                 .freq_nodes = .{},
+                .deinit_callback = deinit_callback,
             };
         }
 
@@ -71,11 +94,13 @@ pub fn Lfu(Key: type, Value: type) type {
             }
         }
 
-        pub fn put(self: *Self, key: Key, value: Value, alloc: Allocator) !void {
+        pub fn put(self: *Self, key: Key, value: Value, alloc: Allocator) !*const Value {
             std.debug.assert(self.nodes.unmanaged.size <= self.capacity);
 
             if (self.nodes.get(key)) |k| {
+                self.deinit_value(&k.value);
                 k.value = value;
+                return &k.value;
             } else {
                 const node = try Node(Key, Value).new(key, value, alloc);
                 errdefer alloc.destroy(node);
@@ -91,6 +116,7 @@ pub fn Lfu(Key: type, Value: type) type {
                 }
 
                 try self.append_to_freq_list(0, null, node, alloc);
+                return &node.value;
             }
         }
 
@@ -99,11 +125,16 @@ pub fn Lfu(Key: type, Value: type) type {
                 _ = self.remove_from_list(k, alloc);
 
                 _ = self.nodes.remove(key);
+                self.deinit_value(&k.value);
                 alloc.destroy(k);
                 return true;
             } else {
                 return false;
             }
+        }
+
+        pub fn iterator(self: *Self) Iterator {
+            return .{ .iter = self.nodes.iterator() };
         }
 
         pub fn deinit(self: *Self, alloc: Allocator) void {
@@ -117,6 +148,7 @@ pub fn Lfu(Key: type, Value: type) type {
 
             var n_iter = self.nodes.iterator();
             while (n_iter.next()) |lst| {
+                self.deinit_value(&lst.value_ptr.*.value);
                 alloc.destroy(lst.value_ptr.*);
             }
             self.nodes.deinit();
@@ -184,6 +216,11 @@ pub fn Lfu(Key: type, Value: type) type {
             return prev;
         }
 
+        fn deinit_value(self: *Self, value: *Value) void {
+            if (self.deinit_callback) |callback|
+                callback(value);
+        }
+
         fn evict_one(self: *Self, alloc: Allocator) void {
             const last_list = self.freq.get(self.min_freq).?;
             const first: *Node(Key, Value) = @fieldParentPtr("node", last_list.list.first.?);
@@ -191,6 +228,7 @@ pub fn Lfu(Key: type, Value: type) type {
 
             std.debug.assert(res);
             _ = self.remove_from_list(first, alloc);
+            self.deinit_value(&first.value);
             alloc.destroy(first);
         }
     };
@@ -202,11 +240,11 @@ test "Basic" {
     const alloc = gpa.allocator();
 
     const cap = 10;
-    var lfu = try Lfu(usize, usize).init(cap, alloc);
+    var lfu = try Lfu(usize, usize).init(cap, null, alloc);
     defer lfu.deinit(alloc);
 
     for (0..cap) |i| {
-        try lfu.put(i, i, alloc);
+        try std.testing.expectEqual((try lfu.put(i, i, alloc)).*, i);
     }
 
     for (0..cap) |i| {
@@ -215,7 +253,7 @@ test "Basic" {
 
     // 0th one is the oldest, so it should be evicted.
     {
-        try lfu.put(11, 11, alloc);
+        try std.testing.expectEqual((try lfu.put(11, 11, alloc)).*, 11);
         try std.testing.expectEqual(try lfu.get(0, alloc), null);
     }
 }
@@ -226,11 +264,11 @@ test "Remove min_freq update" {
     const alloc = gpa.allocator();
 
     const cap = 10;
-    var lfu = try Lfu(usize, usize).init(cap, alloc);
+    var lfu = try Lfu(usize, usize).init(cap, null, alloc);
     defer lfu.deinit(alloc);
 
-    try lfu.put(0, 0, alloc);
-    try lfu.put(1, 1, alloc);
+    try std.testing.expectEqual((try lfu.put(0, 0, alloc)).*, 0);
+    try std.testing.expectEqual((try lfu.put(1, 1, alloc)).*, 1);
 
     try std.testing.expectEqual(lfu.min_freq, 0);
 
@@ -251,7 +289,7 @@ test "Remove min_freq update" {
     }
 
     {
-        try lfu.put(2, 2, alloc);
+        try std.testing.expectEqual((try lfu.put(2, 2, alloc)).*, 2);
         try std.testing.expectEqual(lfu.min_freq, 0);
 
         try std.testing.expectEqual((try lfu.get(1, alloc)).?.*, 1);
@@ -261,8 +299,8 @@ test "Remove min_freq update" {
     }
 
     {
-        try lfu.put(2, 2, alloc);
-        try lfu.put(3, 3, alloc);
+        try std.testing.expectEqual((try lfu.put(2, 2, alloc)).*, 2);
+        try std.testing.expectEqual((try lfu.put(3, 3, alloc)).*, 3);
 
         try std.testing.expectEqual(0, lfu.min_freq);
         try std.testing.expectEqual((try lfu.get(3, alloc)).?.*, 3);
@@ -277,12 +315,12 @@ test "Put existing key at capacity does not evict" {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var lfu = try Lfu(usize, usize).init(2, alloc);
+    var lfu = try Lfu(usize, usize).init(2, null, alloc);
     defer lfu.deinit(alloc);
 
-    try lfu.put(1, 10, alloc);
-    try lfu.put(2, 20, alloc);
-    try lfu.put(2, 200, alloc);
+    try std.testing.expectEqual((try lfu.put(1, 10, alloc)).*, 10);
+    try std.testing.expectEqual((try lfu.put(2, 20, alloc)).*, 20);
+    try std.testing.expectEqual((try lfu.put(2, 200, alloc)).*, 200);
 
     try std.testing.expectEqual(@as(usize, 2), lfu.nodes.count());
     try std.testing.expectEqual(@as(usize, 10), (try lfu.get(1, alloc)).?.*);
@@ -294,19 +332,50 @@ test "Least recently used key breaks equal-frequency tie" {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var lfu = try Lfu(usize, usize).init(2, alloc);
+    var lfu = try Lfu(usize, usize).init(2, null, alloc);
     defer lfu.deinit(alloc);
 
-    try lfu.put(1, 10, alloc);
-    try lfu.put(2, 20, alloc);
+    try std.testing.expectEqual((try lfu.put(1, 10, alloc)).*, 10);
+    try std.testing.expectEqual((try lfu.put(2, 20, alloc)).*, 20);
     _ = try lfu.get(1, alloc);
     _ = try lfu.get(2, alloc);
 
-    try lfu.put(3, 30, alloc);
+    try std.testing.expectEqual((try lfu.put(3, 30, alloc)).*, 30);
 
     try std.testing.expectEqual(null, try lfu.get(1, alloc));
     try std.testing.expectEqual(@as(usize, 20), (try lfu.get(2, alloc)).?.*);
     try std.testing.expectEqual(@as(usize, 30), (try lfu.get(3, alloc)).?.*);
+}
+
+test "Deinit callback runs for all discarded values" {
+    const Value = struct {
+        deinit_count: *usize,
+
+        fn deinit(self: *@This()) void {
+            self.deinit_count.* += 1;
+        }
+    };
+
+    var gpa = std.heap.DebugAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var deinit_count: usize = 0;
+    var lfu = try Lfu(usize, Value).init(2, Value.deinit, alloc);
+
+    _ = try lfu.put(1, .{ .deinit_count = &deinit_count }, alloc);
+    _ = try lfu.put(1, .{ .deinit_count = &deinit_count }, alloc);
+    try std.testing.expectEqual(@as(usize, 1), deinit_count);
+
+    _ = try lfu.put(2, .{ .deinit_count = &deinit_count }, alloc);
+    _ = try lfu.put(3, .{ .deinit_count = &deinit_count }, alloc);
+    try std.testing.expectEqual(@as(usize, 2), deinit_count);
+
+    try std.testing.expect(lfu.remove(2, alloc));
+    try std.testing.expectEqual(@as(usize, 3), deinit_count);
+
+    lfu.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4), deinit_count);
 }
 
 test "Remove sole key and insert again" {
@@ -314,15 +383,15 @@ test "Remove sole key and insert again" {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var lfu = try Lfu(usize, usize).init(1, alloc);
+    var lfu = try Lfu(usize, usize).init(1, null, alloc);
     defer lfu.deinit(alloc);
 
-    try lfu.put(1, 10, alloc);
+    try std.testing.expectEqual((try lfu.put(1, 10, alloc)).*, 10);
     _ = try lfu.get(1, alloc);
     try std.testing.expect(lfu.remove(1, alloc));
     try std.testing.expect(!lfu.remove(1, alloc));
 
-    try lfu.put(2, 20, alloc);
+    try std.testing.expectEqual((try lfu.put(2, 20, alloc)).*, 20);
     try std.testing.expectEqual(@as(usize, 20), (try lfu.get(2, alloc)).?.*);
 }
 
@@ -331,5 +400,5 @@ test "Zero-capacity is invalid" {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    try std.testing.expectError(error.InvalidArgument, Lfu(usize, usize).init(0, alloc));
+    try std.testing.expectError(error.InvalidArgument, Lfu(usize, usize).init(0, null, alloc));
 }

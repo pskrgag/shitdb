@@ -28,6 +28,7 @@ const KeyValueOptions = @import("manager.zig").KeyValueOptions;
 const Storage = @import("storage").storage.Storage;
 const RefCounted = @import("sync").refcount.RefCounted;
 const Referenced = @import("sync").refcount.Referenced;
+const SSTableCache = @import("sstable_cache.zig").SSTableCache;
 
 pub const ActiveTable = RefCounted(WalTable);
 
@@ -55,6 +56,8 @@ pub const Version = struct {
     active: ?ActiveTable,
     // Options
     opts: KeyValueOptions,
+    // Sstable cache
+    sstable_cache: SSTableCache,
 
     const Self = @This();
     const ManifestName = "MANIFEST";
@@ -95,6 +98,9 @@ pub const Version = struct {
 
         // it's n^2, but len(deleted_files) should be small
         for (edit.deleted_files.items) |file| {
+            // Remove files from the cache, since they were merged.
+            _ = self.sstable_cache.remove(file.file, alloc);
+
             for (self.tables.items, 0..) |f, i| {
                 if (f.file_seq.get() == file.file.get()) {
                     var res = self.tables.swapRemove(i);
@@ -230,6 +236,7 @@ pub const Version = struct {
             .stat = stat,
             .opts = opts,
             .active = null,
+            .sstable_cache = try SSTableCache.init(alloc),
         };
         errdefer res.deinit(io, alloc);
 
@@ -478,8 +485,7 @@ pub const Version = struct {
         std.mem.sort(FileMeta, candidates.items, {}, FileMeta.less_than);
 
         for (candidates.items) |table| {
-            var ss = try SSTable.open(storage, table, io, alloc);
-            defer ss.deinit(io);
+            var ss = try self.sstable_cache.open(storage, table, io, alloc);
             const value = try ss.find_value(key, alloc);
 
             switch (value) {
@@ -681,6 +687,7 @@ pub const Version = struct {
 
         self.tables.deinit(alloc);
         self.file.close(io);
+        self.sstable_cache.deinit(alloc);
         alloc.destroy(self);
     }
 };

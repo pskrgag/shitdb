@@ -560,7 +560,7 @@ pub const SSTable = struct {
     }
 
     /// Finds value in SSTable
-    pub fn find_value(self: *Self, key: []const u8, alloc: Allocator) !GetResult {
+    pub fn find_value(self: *const Self, key: []const u8, alloc: Allocator) !GetResult {
         const meta_block = try self.meta();
         const index = self.mmap.data[meta_block.index_offset .. meta_block.index_offset + meta_block.index_size];
 
@@ -715,6 +715,7 @@ pub const SSTable = struct {
     /// Closes SSTable
     pub fn deinit(self: *Self, io: std.Io) void {
         self.file.close(io);
+        self.mmap.deinit();
     }
 };
 
